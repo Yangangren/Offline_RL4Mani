@@ -121,3 +121,7 @@ venv.bak/
 
 # private macros
 macros_private.py
+rollouts/
+trained_models/
+datasets/
+robomimic/exps/
