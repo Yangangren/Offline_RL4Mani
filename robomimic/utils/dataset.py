@@ -40,6 +40,11 @@ class SequenceDataset(torch.utils.data.Dataset):
         load_next_obs=True,
         lang=None,
         demo_limit=None,
+        sample_label=0.0,
+        hazard_label=0.0,
+        demo_start_only=False,
+        sample_start_offset=0,
+        dataset_key_shapes=None,
     ):
         """
         Dataset class for fetching sequences of experience.
@@ -112,6 +117,14 @@ class SequenceDataset(torch.utils.data.Dataset):
         self._lang_emb = None
         if lang is not None:
             self._lang_emb = LangUtils.get_lang_emb(self.lang)
+        self.sample_label = float(sample_label)
+        self.hazard_label = float(hazard_label)
+        self.demo_start_only = bool(demo_start_only)
+        self.sample_start_offset = int(sample_start_offset)
+        self.dataset_key_shapes = {
+            key: ((int(shape),) if np.isscalar(shape) else tuple(shape))
+            for key, shape in (dataset_key_shapes or {}).items()
+        }
 
         # get all keys that needs to be fetched
         self.obs_keys = tuple(obs_keys)
@@ -222,11 +235,11 @@ class SequenceDataset(torch.utils.data.Dataset):
             self._demo_id_to_start_indices[ep] = self.total_num_sequences
             self._demo_id_to_demo_length[ep] = demo_length
 
-            num_sequences = demo_length
+            num_sequences = 1 if self.demo_start_only else demo_length
             # determine actual number of sequences taking into account whether to pad for frame_stack and seq_length
-            if not self.pad_frame_stack:
+            if not self.pad_frame_stack and not self.demo_start_only:
                 num_sequences -= (self.n_frame_stack - 1)
-            if not self.pad_seq_length:
+            if not self.pad_seq_length and not self.demo_start_only:
                 num_sequences -= (self.seq_length - 1)
 
             if self.pad_seq_length:
@@ -325,7 +338,11 @@ class SequenceDataset(torch.utils.data.Dataset):
                 if k in hdf5_file["data/{}".format(ep)]:
                     all_data[ep][k] = hdf5_file["data/{}/{}".format(ep, k)][()].astype('float32')
                 else:
-                    all_data[ep][k] = np.zeros((all_data[ep]["attrs"]["num_samples"], 1), dtype=np.float32)
+                    trailing_shape = self.dataset_key_shapes.get(k, (1,))
+                    all_data[ep][k] = np.zeros(
+                        (all_data[ep]["attrs"]["num_samples"], *trailing_shape),
+                        dtype=np.float32,
+                    )
 
             if "model_file" in hdf5_file["data/{}".format(ep)].attrs:
                 all_data[ep]["attrs"]["model_file"] = hdf5_file["data/{}".format(ep)].attrs["model_file"]
@@ -406,7 +423,7 @@ class SequenceDataset(torch.utils.data.Dataset):
                 action_stats, self.action_config)
         return self.action_normalization_stats
 
-    def get_dataset_for_ep(self, ep, key):
+    def get_dataset_for_ep(self, ep, key, seq_begin_index=None, seq_end_index=None):
         """
         Helper utility to get a dataset for a specific demonstration.
         Takes into account whether the dataset has been loaded into memory.
@@ -430,10 +447,38 @@ class SequenceDataset(torch.utils.data.Dataset):
                 ret = self.hdf5_cache[ep][key1][key2]
             else:
                 ret = self.hdf5_cache[ep][key]
+            if seq_begin_index is not None or seq_end_index is not None:
+                ret = ret[seq_begin_index:seq_end_index]
         else:
-            # read from file
+            # Read from file and materialize the result immediately. Returning
+            # live h5py.Dataset objects is brittle in long RGB-DP runs: HDF5
+            # object-id wrapping can fail after many lazy opens, and padding /
+            # collation should only ever see numpy arrays.
             hd5key = "data/{}/{}".format(ep, key)
-            ret = self.hdf5_file[hd5key]
+            try:
+                dataset = self.hdf5_file[hd5key]
+            except AttributeError as exc:
+                # Rare h5py internal state corruption has shown up as
+                # "'NoneType' object has no attribute 'rpartition'" inside
+                # h5py.h5i.wrap_identifier. Reopen once and retry.
+                if "rpartition" not in str(exc):
+                    raise
+                self.close_and_delete_hdf5_handle()
+                dataset = self.hdf5_file[hd5key]
+            except KeyError:
+                trailing_shape = self.dataset_key_shapes.get(key, (1,))
+                length = self._demo_id_to_demo_length[ep]
+                begin = 0 if seq_begin_index is None else seq_begin_index
+                end = length if seq_end_index is None else seq_end_index
+                return np.zeros(
+                    (end - begin, *trailing_shape),
+                    dtype=np.float32,
+                )
+            if seq_begin_index is None and seq_end_index is None:
+                ret = dataset[()]
+            else:
+                ret = dataset[seq_begin_index:seq_end_index]
+            ret = np.asarray(ret)
         return ret
 
     def __getitem__(self, index):
@@ -458,7 +503,12 @@ class SequenceDataset(torch.utils.data.Dataset):
 
         # start at offset index if not padding for frame stacking
         demo_index_offset = 0 if self.pad_frame_stack else (self.n_frame_stack - 1)
-        index_in_demo = index - demo_start_index + demo_index_offset
+        index_in_demo = (
+            index
+            - demo_start_index
+            + demo_index_offset
+            + (self.sample_start_offset if self.demo_start_only else 0)
+        )
 
         # end at offset index if not padding for seq length
         demo_length_offset = 0 if self.pad_seq_length else (self.seq_length - 1)
@@ -525,6 +575,8 @@ class SequenceDataset(torch.utils.data.Dataset):
 
         # also return the sampled index
         meta["index"] = index
+        meta["anti_failure"] = np.float32(self.sample_label)
+        meta["hazard_failure"] = np.float32(self.hazard_label)
 
         # language embedding
         if self._lang_emb is not None:
@@ -570,8 +622,12 @@ class SequenceDataset(torch.utils.data.Dataset):
         # fetch observation from the dataset file
         seq = dict()
         for k in keys:
-            data = self.get_dataset_for_ep(demo_id, k)
-            seq[k] = data[seq_begin_index: seq_end_index]
+            seq[k] = self.get_dataset_for_ep(
+                demo_id,
+                k,
+                seq_begin_index=seq_begin_index,
+                seq_end_index=seq_end_index,
+            )
 
         seq = TensorUtils.pad_sequence(seq, padding=(seq_begin_pad, seq_end_pad), pad_same=True)
         pad_mask = np.array([0] * seq_begin_pad + [1] * (seq_end_index - seq_begin_index) + [0] * seq_end_pad)

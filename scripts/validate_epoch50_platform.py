@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -46,9 +47,12 @@ COMMON_ENV = {
 }
 
 
-def process_env() -> dict[str, str]:
+def process_env(cache_suffix: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.update(COMMON_ENV)
+    if cache_suffix is not None:
+        env["PYTHONPYCACHEPREFIX"] = f"/tmp/robomimic_clean_pycache_{cache_suffix}"
+    env["PYTHONNOUSERSITE"] = "1"
     return env
 
 
@@ -88,6 +92,7 @@ def evaluate(
         log_path = output_dir / f"eval_seed_{seed}.log"
         cmd = [
             str(PYTHON),
+            "-B",
             "-m",
             "robomimic.scripts.run_trained_agent",
             "--agent",
@@ -108,6 +113,11 @@ def evaluate(
                 pass
         if stats is None:
             for attempt in range(max_retries + 1):
+                cache_suffix = f"eval_seed_{seed}_attempt_{attempt + 1}"
+                shutil.rmtree(
+                    f"/tmp/robomimic_clean_pycache_{cache_suffix}",
+                    ignore_errors=True,
+                )
                 print(
                     f"\n[evaluate seed={seed}, attempt={attempt + 1}] "
                     f"{' '.join(cmd)}",
@@ -116,7 +126,7 @@ def evaluate(
                 proc = subprocess.run(
                     cmd,
                     cwd=ROOT,
-                    env=process_env(),
+                    env=process_env(cache_suffix=cache_suffix),
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,

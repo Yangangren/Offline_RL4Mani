@@ -254,13 +254,23 @@ def backprop_for_loss(net, optim, loss, max_grad_norm=None, retain_graph=False):
     optim.zero_grad()
     loss.backward(retain_graph=retain_graph)
 
+    # Optimizers already retain concrete parameter lists. Reuse them instead
+    # of reconstructing ``net.parameters()`` generators multiple times per
+    # update.
+    parameters = []
+    for group_index in range(len(optim.param_groups)):
+        group_parameters = optim.param_groups[group_index]["params"]
+        for parameter_index in range(len(group_parameters)):
+            parameters.append(group_parameters[parameter_index])
+
     # gradient clipping
     if max_grad_norm is not None:
-        torch.nn.utils.clip_grad_norm_(net.parameters(), max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
 
     # compute grad norms
     grad_norms = 0.
-    for p in net.parameters():
+    for parameter_index in range(len(parameters)):
+        p = parameters[parameter_index]
         # only clip gradients for parameters for which requires_grad is True
         if p.grad is not None:
             grad_norms += p.grad.data.norm(2).pow(2).item()

@@ -3,6 +3,7 @@ A collection of utilities for working with nested tensor structures consisting
 of numpy arrays and torch tensors.
 """
 import collections
+import builtins
 import numpy as np
 import torch
 
@@ -768,13 +769,13 @@ def pad_sequence_single(seq, padding, batched=False, pad_same=True, pad_values=N
     Returns:
         padded sequence (np.ndarray or torch.Tensor)
     """
-    assert isinstance(seq, (np.ndarray, torch.Tensor))
+    assert builtins.isinstance(seq, (np.ndarray, torch.Tensor))
     assert pad_same or pad_values is not None
     if pad_values is not None:
-        assert isinstance(pad_values, float)
-    repeat_func = np.repeat if isinstance(seq, np.ndarray) else torch.repeat_interleave
-    concat_func = np.concatenate if isinstance(seq, np.ndarray) else torch.cat
-    ones_like_func = np.ones_like if isinstance(seq, np.ndarray) else torch.ones_like
+        assert builtins.isinstance(pad_values, float)
+    repeat_func = np.repeat if builtins.isinstance(seq, np.ndarray) else torch.repeat_interleave
+    concat_func = np.concatenate if builtins.isinstance(seq, np.ndarray) else torch.cat
+    ones_like_func = np.ones_like if builtins.isinstance(seq, np.ndarray) else torch.ones_like
     seq_dim = 1 if batched else 0
 
     begin_pad = []

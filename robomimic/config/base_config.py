@@ -202,6 +202,10 @@ class BaseConfig(Config):
             "rewards", 
             "dones",
         )
+        # Optional trailing shapes for dataset keys that are present only in
+        # some members of a multi-dataset training mixture. Missing keys are
+        # materialized as zeros with these shapes so batches remain collatable.
+        self.train.dataset_key_shapes = {}
 
         # list of action keys to use for prediction - each should correspond to a key in self.train.action_config.
         # Importantly, the order matters - these keys will be concatenated into a single action vector.

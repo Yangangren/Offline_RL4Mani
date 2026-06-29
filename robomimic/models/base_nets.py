@@ -12,9 +12,13 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms
-from torchvision import models as vision_models
-from torchvision import transforms
+try:
+    from torchvision import transforms
+    from torchvision import models as vision_models
+except Exception as e:
+    transforms = None
+    vision_models = None
+    _TORCHVISION_IMPORT_ERROR = e
 
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.obs_utils as ObsUtils
@@ -523,6 +527,13 @@ class ResNet18Conv(ConvBase):
                 (a convolution where input channels are modified to encode spatial pixel location)
         """
         super(ResNet18Conv, self).__init__()
+        global vision_models
+        if vision_models is None:
+            # Retry an optional module-level import at the point RGB support is
+            # actually required, and surface the real torchvision error if it
+            # remains unavailable.
+            from torchvision import models as vision_models_retry
+            vision_models = vision_models_retry
         net = vision_models.resnet18(weights=(vision_models.ResNet18_Weights.DEFAULT if pretrained else None))
 
         if input_coord_conv:

@@ -21,7 +21,6 @@ import torch.distributions as D
 from robomimic.utils.python_utils import extract_class_init_kwargs_from_dict
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.obs_utils as ObsUtils
-import robomimic.utils.lang_utils as LangUtils
 from robomimic.models.base_nets import Module, Sequential, MLP, RNN_Base, ResNet18Conv, SpatialSoftmax, \
     FeatureAggregator
 from robomimic.models.obs_core import VisualCore, Randomizer, VisualCoreLanguageConditioned
@@ -240,7 +239,7 @@ class ObservationEncoder(Module):
                 rgb_inds.append(ind)
                 if (self.obs_nets[k] is not None) and isinstance(self.obs_nets[k], VisualCoreLanguageConditioned):
                     rgb_inds_need_lang_cond.append(ind)
-            elif k == LangUtils.LANG_EMB_OBS_KEY:
+            elif k == "lang_emb":
                 lang_inds.append(ind)
                 lang_keys.append(k)
         assert len(lang_inds) <= 1
@@ -326,7 +325,7 @@ class ObservationEncoder(Module):
             for rand in self.obs_randomizers[k]:
                 if rand is not None:
                     feat_shape = rand.output_shape_out(feat_shape)
-            if not ((k == LangUtils.LANG_EMB_OBS_KEY) and skip_lang_dim):
+            if not ((k == "lang_emb") and skip_lang_dim):
                 feat_dim += int(np.prod(feat_shape))
         return [feat_dim]
 

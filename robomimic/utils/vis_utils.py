@@ -3,9 +3,7 @@ This file contains utility functions for visualizing image observations in the t
 These functions can be a useful debugging tool.
 """
 import numpy as np
-import matplotlib.pyplot as plt
 import os
-import matplotlib.cm as cm
 
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.obs_utils as ObsUtils
@@ -68,6 +66,11 @@ def visualize_image_randomizer(original_image, randomized_image, randomizer_name
         None
     """
 
+    # Matplotlib is an optional debugging dependency. Import it only when this
+    # interactive visualization is requested so headless training and rollout
+    # evaluation do not fail while importing model definitions.
+    import matplotlib.pyplot as plt
+
     B, N, H, W, C = randomized_image.shape
 
     # Create a grid of subplots with B rows and N+1 columns (1 for the original image, N for the randomized images)
@@ -98,6 +101,9 @@ def depth_to_rgb(depth_map, depth_min=None, depth_max=None):
     """
     Convert depth map to rgb array by computing normalized depth values in [0, 1].
     """
+    # Keep Matplotlib optional for callers that never visualize depth.
+    import matplotlib.cm as cm
+
     # normalize depth map into [0, 1]
     if depth_min is None:
         depth_min = depth_map.min()

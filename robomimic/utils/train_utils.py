@@ -173,6 +173,7 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
         obs_keys=obs_keys,
         action_keys=config.train.action_keys,
         dataset_keys=config.train.dataset_keys,
+        dataset_key_shapes=config.train.dataset_key_shapes,
         action_config=config.train.action_config,
         load_next_obs=config.train.hdf5_load_next_obs, # whether to load next observations (s') from dataset
         frame_stack=config.train.frame_stack,
@@ -190,6 +191,18 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
     ds_kwargs["hdf5_path"] = [ds_cfg["path"] for ds_cfg in config.train.data]
     ds_kwargs["filter_by_attribute"] = [ds_cfg.get("filter_key", filter_by_attribute) for ds_cfg in config.train.data]
     ds_kwargs["demo_limit"] = [ds_cfg.get("demo_limit", None) for ds_cfg in config.train.data]
+    ds_kwargs["sample_label"] = [
+        float(ds_cfg.get("anti_failure", False)) for ds_cfg in config.train.data
+    ]
+    ds_kwargs["hazard_label"] = [
+        float(ds_cfg.get("hazard_failure", False)) for ds_cfg in config.train.data
+    ]
+    ds_kwargs["demo_start_only"] = [
+        ds_cfg.get("demo_start_only", False) for ds_cfg in config.train.data
+    ]
+    ds_kwargs["sample_start_offset"] = [
+        ds_cfg.get("sample_start_offset", 0) for ds_cfg in config.train.data
+    ]
     ds_weights = [ds_cfg.get("weight", 1.0) for ds_cfg in config.train.data]
 
     meta_ds_kwargs = dict()
@@ -236,7 +249,15 @@ def get_dataset(
         
         ds_kwargs_copy = deepcopy(ds_kwargs)
 
-        keys = ["hdf5_path", "filter_by_attribute", "demo_limit"]
+        keys = [
+            "hdf5_path",
+            "filter_by_attribute",
+            "demo_limit",
+            "sample_label",
+            "hazard_label",
+            "demo_start_only",
+            "sample_start_offset",
+        ]
 
         for k in keys:
             ds_kwargs_copy[k] = ds_kwargs[k][i]

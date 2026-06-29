@@ -22,8 +22,14 @@ from robomimic.models.base_nets import *
 from robomimic.utils.vis_utils import visualize_image_randomizer
 from robomimic.macros import VISUALIZE_RANDOMIZER
 
-import torchvision.transforms.functional as TVF
-from torchvision.transforms import Lambda, Compose
+try:
+    import torchvision.transforms.functional as TVF
+    from torchvision.transforms import Lambda, Compose
+except Exception as e:
+    TVF = None
+    Lambda = None
+    Compose = None
+    _TORCHVISION_IMPORT_ERROR = e
 
 """
 ================================================

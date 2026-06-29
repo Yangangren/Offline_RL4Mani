@@ -58,6 +58,36 @@ class DiffusionPolicyConfig(BaseConfig):
         # EMA parameters
         self.algo.ema.enabled = True
         self.algo.ema.power = 0.75
+
+        # Optional offline anti-imitation objective. Samples from datasets
+        # marked ``anti_failure: true`` are pushed a finite denoising-energy
+        # margin above a frozen copy of the initialization policy.
+        self.algo.reference_margin.enabled = False
+        self.algo.reference_margin.margin = 0.05
+        self.algo.reference_margin.failure_weight = 0.02
+        self.algo.reference_margin.reference_weight = 0.25
+        self.algo.reference_margin.warmup_steps = 250
+        self.algo.reference_margin.ramp_steps = 500
+        self.algo.reference_margin.normalized_margin = True
+        self.algo.reference_margin.initialize_from_ema = True
+
+        # Optional failure-aware policy constraint. High-risk rollout chunks
+        # are not imitation targets. Instead, a frozen causal prefix-risk model
+        # scores actions sampled from the current and initialization policies.
+        # The current policy is penalized only when it does not reduce positive
+        # incremental action risk by the requested log-odds margin.
+        self.algo.hazard_constraint.enabled = False
+        self.algo.hazard_constraint.checkpoint = None
+        self.algo.hazard_constraint.margin = 0.1
+        self.algo.hazard_constraint.weight = 0.05
+        self.algo.hazard_constraint.positive_reference_weight = 0.05
+        self.algo.hazard_constraint.negative_reference_weight = 0.1
+        self.algo.hazard_constraint.warmup_steps = 250
+        self.algo.hazard_constraint.ramp_steps = 500
+        self.algo.hazard_constraint.sampling_steps = 10
+        self.algo.hazard_constraint.action_samples = 2
+        self.algo.hazard_constraint.action_start_index = 1
+        self.algo.hazard_constraint.initialize_from_ema = True
         
         # Noise Scheduler
         ## DDPM

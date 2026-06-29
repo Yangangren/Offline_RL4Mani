@@ -12,17 +12,33 @@ import urllib.request
 import numpy as np
 from collections import OrderedDict
 from tqdm import tqdm
-from huggingface_hub import hf_hub_download
 
 import torch
 
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.torch_utils as TorchUtils
-import robomimic.utils.lang_utils as LangUtils
 from robomimic.config import config_factory
 from robomimic.algo import algo_factory
 from robomimic.algo import RolloutPolicy
+
+
+def _get_lang_utils():
+    # Keep optional language / transformers dependencies out of normal local
+    # checkpoint evaluation. Import them only when a language observation key
+    # is actually present in the dataset config.
+    import robomimic.utils.lang_utils as LangUtils
+
+    return LangUtils
+
+
+def _hf_hub_download(*args, **kwargs):
+    # HuggingFace is only needed by dataset download utilities. Avoid importing
+    # it at module import time, since local rollout evaluation does not need it
+    # and the dependency chain is brittle in this environment.
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(*args, **kwargs)
 
 
 def create_hdf5_filter_key(hdf5_path, demo_keys, key_name):
@@ -160,7 +176,8 @@ def get_shape_metadata_from_dataset(dataset_config, action_keys, all_obs_keys=No
         all_obs_keys = [k for k in demo["obs"]]
 
     for k in sorted(all_obs_keys):
-        if k == LangUtils.LANG_EMB_OBS_KEY:
+        if k == "lang_emb":
+            LangUtils = _get_lang_utils()
             # NOTE: currently supporting fixed language embedding per dataset
             ## that is fetched from dataset config and not from file
             assert "lang" in dataset_config, "Expected 'lang' key in dataset config."
@@ -403,6 +420,10 @@ def policy_from_checkpoint(device=None, ckpt_path=None, ckpt_dict=None, verbose=
 
     # shape meta from model dict to get info needed to create model
     shape_meta = ckpt_dict["shape_metadata"]
+    # Multi-dataset training stores one metadata entry per dataset. For rollout
+    # evaluation the observation/action spaces are identical, so use the first.
+    if isinstance(shape_meta, list):
+        shape_meta = shape_meta[0]
 
     # maybe restore observation normalization stats
     obs_normalization_stats = ckpt_dict.get("obs_normalization_stats", None)
@@ -471,6 +492,10 @@ def env_from_checkpoint(ckpt_path=None, ckpt_dict=None, env_name=None, render=Fa
     # metadata from model dict to get info needed to create environment
     env_meta = ckpt_dict["env_metadata"]
     shape_meta = ckpt_dict["shape_metadata"]
+    if isinstance(env_meta, list):
+        env_meta = env_meta[0]
+    if isinstance(shape_meta, list):
+        shape_meta = shape_meta[0]
 
     # create env from saved metadata
     env = EnvUtils.create_env_from_metadata(
@@ -576,5 +601,5 @@ def download_file_from_hf(repo_id, filename, download_dir, check_overwrite=True)
             assert user_response.lower() in {"yes", "y"}, f"Did not receive confirmation. Aborting download."
 
         # note: fpath is a pointer, so we need to look up the actual path on disk and then move it
-        fpath = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", cache_dir=td)
+        fpath = _hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", cache_dir=td)
         shutil.move(os.path.realpath(fpath), file_to_write)
