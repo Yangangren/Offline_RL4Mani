@@ -78,6 +78,126 @@ def normalize(
     return features.astype(np.float32), actions.astype(np.float32)
 
 
+def success_action_indices_by_step(
+    steps: np.ndarray,
+    labels: np.ndarray,
+    offsets: np.ndarray,
+) -> tuple[dict[int, np.ndarray], np.ndarray]:
+    grouped: dict[int, list[int]] = {}
+    global_indices = []
+    for episode in np.flatnonzero(labels < 0.5):
+        sl = slice(offsets[episode], offsets[episode + 1])
+        episode_indices_local = np.arange(sl.start, sl.stop, dtype=np.int64)
+        global_indices.extend(episode_indices_local.tolist())
+        for index in episode_indices_local:
+            grouped.setdefault(int(steps[index]), []).append(int(index))
+    by_step = {step: np.asarray(indices, dtype=np.int64) for step, indices in grouped.items()}
+    return by_step, np.asarray(global_indices, dtype=np.int64)
+
+
+def sample_success_reference_actions(
+    *,
+    actions: np.ndarray,
+    steps: np.ndarray,
+    offsets: np.ndarray,
+    episodes: np.ndarray,
+    lengths: torch.Tensor,
+    by_step: dict[int, np.ndarray],
+    all_success_indices: np.ndarray,
+    num_negatives: int,
+    rng: np.random.Generator,
+    device: torch.device,
+) -> torch.Tensor:
+    lengths_np = lengths.detach().cpu().numpy().astype(np.int64)
+    max_length = int(lengths_np.max())
+    reference_actions = np.zeros(
+        (len(episodes), max_length, num_negatives, actions.shape[1], actions.shape[2]),
+        dtype=np.float32,
+    )
+    if len(all_success_indices) == 0:
+        raise RuntimeError("cannot build action contrast references without success chunks")
+    for row, episode in enumerate(episodes):
+        start = int(offsets[int(episode)])
+        for time_index in range(int(lengths_np[row])):
+            chunk_index = start + time_index
+            pool = by_step.get(int(steps[chunk_index]), all_success_indices)
+            if len(pool) == 0:
+                pool = all_success_indices
+            sampled = rng.choice(pool, size=num_negatives, replace=True)
+            reference_actions[row, time_index] = actions[sampled]
+    return torch.from_numpy(reference_actions).to(device)
+
+
+def build_matched_success_indices(
+    *,
+    features: np.ndarray,
+    steps: np.ndarray,
+    labels: np.ndarray,
+    offsets: np.ndarray,
+    top_k: int,
+    step_window: int,
+    device: torch.device,
+) -> np.ndarray:
+    success_indices = []
+    for episode in np.flatnonzero(labels < 0.5):
+        success_indices.extend(range(int(offsets[episode]), int(offsets[episode + 1])))
+    success_indices = np.asarray(success_indices, dtype=np.int64)
+    if len(success_indices) == 0:
+        raise RuntimeError("cannot build matched action references without success chunks")
+
+    result = np.empty((len(features), top_k), dtype=np.int64)
+    feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=device)
+    success_steps = steps[success_indices]
+    all_success_tensor = torch.as_tensor(success_indices, dtype=torch.long, device=device)
+    unique_steps = np.unique(steps)
+    for step_value in unique_steps:
+        query_indices = np.flatnonzero(steps == step_value).astype(np.int64)
+        candidate_mask = np.abs(success_steps - int(step_value)) <= step_window
+        candidate_indices = success_indices[candidate_mask]
+        if len(candidate_indices) == 0:
+            candidate_indices = success_indices
+        candidate_tensor = torch.as_tensor(candidate_indices, dtype=torch.long, device=device)
+        query_tensor = torch.as_tensor(query_indices, dtype=torch.long, device=device)
+        query_features = F.normalize(feature_tensor[query_tensor], dim=-1)
+        candidate_features = F.normalize(feature_tensor[candidate_tensor], dim=-1)
+        similarity = query_features @ candidate_features.T
+        selected_k = min(top_k, int(candidate_tensor.numel()))
+        nearest = torch.topk(similarity, k=selected_k, dim=1).indices
+        matched = candidate_tensor[nearest].detach().cpu().numpy()
+        if selected_k < top_k:
+            pad = np.repeat(matched[:, -1:], top_k - selected_k, axis=1)
+            matched = np.concatenate([matched, pad], axis=1)
+        result[query_indices] = matched
+    return result
+
+
+def sample_matched_reference_actions(
+    *,
+    actions: np.ndarray,
+    offsets: np.ndarray,
+    episodes: np.ndarray,
+    lengths: torch.Tensor,
+    matched_indices: np.ndarray,
+    num_negatives: int,
+    rng: np.random.Generator,
+    device: torch.device,
+) -> torch.Tensor:
+    lengths_np = lengths.detach().cpu().numpy().astype(np.int64)
+    max_length = int(lengths_np.max())
+    reference_actions = np.zeros(
+        (len(episodes), max_length, num_negatives, actions.shape[1], actions.shape[2]),
+        dtype=np.float32,
+    )
+    for row, episode in enumerate(episodes):
+        start = int(offsets[int(episode)])
+        for time_index in range(int(lengths_np[row])):
+            chunk_index = start + time_index
+            pool = matched_indices[chunk_index]
+            selected = rng.choice(pool, size=num_negatives, replace=True)
+            reference_actions[row, time_index] = actions[selected]
+    return torch.from_numpy(reference_actions).to(device)
+
+
 def padded_episode_batch(
     *,
     features: np.ndarray,
@@ -130,8 +250,85 @@ def episode_normalized_bce(
     return ((elementwise * mask).sum(dim=1) / mask.sum(dim=1)).mean()
 
 
+def noisy_or_episode_probability(
+    probabilities: np.ndarray,
+    offsets: np.ndarray,
+    episodes: np.ndarray,
+) -> np.ndarray:
+    result = np.empty(len(episodes), dtype=np.float32)
+    for row, episode in enumerate(episodes):
+        sl = slice(offsets[episode], offsets[episode + 1])
+        chunk_probs = np.clip(probabilities[sl], 1e-6, 1.0 - 1e-6)
+        result[row] = 1.0 - float(np.prod(1.0 - chunk_probs))
+    return result
+
+
+def noisy_or_episode_bce(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Multiple-instance episode BCE.
+
+    A successful rollout is a negative bag, so every valid chunk should have
+    low failure probability. A failed rollout is a positive bag, so at least
+    one chunk should have high failure probability. This avoids assigning the
+    failure label to every prefix-action chunk in a failed trajectory.
+    """
+    valid_log_not_fail = F.logsigmoid(-logits) * mask
+    log_not_fail = valid_log_not_fail.sum(dim=1)
+    not_fail_prob = torch.exp(log_not_fail).clamp(1e-6, 1.0 - 1e-6)
+    fail_prob = 1.0 - not_fail_prob
+    loss = -(
+        labels * torch.log(fail_prob.clamp_min(1e-6))
+        + (1.0 - labels) * torch.log(not_fail_prob.clamp_min(1e-6))
+    )
+    return loss.mean()
+
+
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1)
+
+
+def masked_corr_square(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    selected = mask.bool()
+    if int(selected.sum().detach().cpu()) < 2:
+        return first.new_zeros(())
+    x = first[selected]
+    y = second[selected]
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = torch.sqrt((x.square().sum() * y.square().sum()).clamp_min(1e-8))
+    return ((x * y).sum() / denom).square()
+
+
+def temporal_risk_weights(
+    state_probability: torch.Tensor,
+    lengths: torch.Tensor,
+    mask: torch.Tensor,
+    labels: torch.Tensor,
+    stride: int,
+    min_increase: float,
+    normalize: bool,
+) -> torch.Tensor:
+    batch_size, horizon = state_probability.shape
+    positions = torch.arange(horizon, device=state_probability.device)[None, :]
+    last = (lengths.to(state_probability.device) - 1).clamp_min(0)[:, None]
+    future_positions = torch.minimum(positions + int(stride), last).long()
+    future = torch.gather(state_probability, dim=1, index=future_positions)
+    increase = (future - state_probability - float(min_increase)).clamp_min(0.0)
+    failure_mask = mask & (labels[:, None] > 0.5)
+    weights = increase * failure_mask.float()
+    if normalize:
+        per_episode_sum = weights.sum(dim=1, keepdim=True)
+        valid_failure = per_episode_sum > 1e-8
+        normalized = weights / per_episode_sum.clamp_min(1e-8)
+        weights = torch.where(valid_failure, normalized, weights)
+    return weights
 
 
 def compute_loss(
@@ -141,16 +338,52 @@ def compute_loss(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     output = model(batch["features"], batch["actions"])
     mask = batch["mask"]
-    state_loss = episode_normalized_bce(
-        output["state_logit"],
-        batch["labels"],
-        mask,
-    )
-    action_loss = episode_normalized_bce(
-        output["action_logit"],
-        batch["labels"],
-        mask,
-    )
+    labels = batch["labels"]
+    zero = output["state_logit"].new_zeros(())
+    stage = getattr(args, "training_stage", "joint")
+
+    if args.objective == "per_chunk_bce":
+        state_loss = episode_normalized_bce(
+            output["state_logit"],
+            labels,
+            mask,
+        )
+        action_loss = episode_normalized_bce(
+            output["action_logit"],
+            labels,
+            mask,
+        )
+    elif args.objective == "noisy_or_mil":
+        state_loss = noisy_or_episode_bce(
+            output["state_logit"],
+            labels,
+            mask,
+        )
+        action_loss = noisy_or_episode_bce(
+            output["action_logit"],
+            labels,
+            mask,
+        )
+    elif args.objective in ("two_stage_residual", "two_stage_action_contrast", "two_stage_matched_action_contrast", "two_stage_temporal_safe_anchor"):
+        if stage == "state":
+            state_loss = noisy_or_episode_bce(
+                output["state_logit"],
+                labels,
+                mask,
+            )
+            action_loss = zero
+        elif stage == "residual":
+            state_loss = zero
+            action_loss = noisy_or_episode_bce(
+                output["action_logit"],
+                labels,
+                mask,
+            )
+        else:
+            raise ValueError(f"unknown two-stage training stage: {stage}")
+    else:
+        raise ValueError(f"unknown objective: {args.objective}")
+
     residual_l1 = masked_mean(output["action_delta"].abs(), mask)
 
     permutation = torch.randperm(len(mask), device=mask.device)
@@ -167,19 +400,128 @@ def compute_loss(
         (probability[:, 1:] - probability[:, :-1]).abs(),
         adjacent_mask,
     )
-    total = (
-        args.state_weight * state_loss
-        + args.action_weight * action_loss
-        + args.residual_l1_weight * residual_l1
-        + args.shuffled_residual_weight * shuffled_residual
-        + args.smoothness_weight * smoothness
+    success_mask = mask & (labels[:, None] < 0.5)
+    success_residual = masked_mean(output["action_delta"].square(), success_mask)
+    residual_decorrelation = masked_corr_square(
+        output["action_delta"],
+        output["state_logit"].detach(),
+        mask,
     )
+    contrast_loss = zero
+    if (
+        args.objective in ("two_stage_action_contrast", "two_stage_matched_action_contrast")
+        and stage == "residual"
+        and "reference_actions" in batch
+    ):
+        reference_actions = batch["reference_actions"]
+        num_negatives = int(reference_actions.shape[2])
+        batch_size, horizon, hidden_dim = output["context"].shape
+        reference_context = (
+            output["context"]
+            .detach()
+            .unsqueeze(2)
+            .expand(batch_size, horizon, num_negatives, hidden_dim)
+            .reshape(batch_size, horizon * num_negatives, hidden_dim)
+        )
+        flat_reference_actions = reference_actions.reshape(
+            batch_size,
+            horizon * num_negatives,
+            reference_actions.shape[-2],
+            reference_actions.shape[-1],
+        )
+        reference_delta = model.action_delta(
+            reference_context,
+            flat_reference_actions,
+        ).reshape(batch_size, horizon, num_negatives)
+        margin_violation = F.relu(
+            args.contrast_margin
+            - (output["action_delta"].unsqueeze(-1) - reference_delta)
+        ).mean(dim=-1)
+        failure_rows = labels > 0.5
+        failure_mask = mask & failure_rows[:, None]
+        if torch.any(failure_rows):
+            if args.contrast_weighting == "uniform":
+                weights = failure_mask.float() / failure_mask.float().sum(
+                    dim=1,
+                    keepdim=True,
+                ).clamp_min(1.0)
+            elif args.contrast_weighting == "delta_softmax":
+                logits_for_weights = output["action_delta"].detach() / args.contrast_temperature
+                logits_for_weights = logits_for_weights.masked_fill(~failure_mask, -1e9)
+                weights = torch.softmax(logits_for_weights, dim=1) * failure_rows[:, None].float()
+            else:
+                logits_for_weights = output["action_logit"].detach() / args.contrast_temperature
+                logits_for_weights = logits_for_weights.masked_fill(~failure_mask, -1e9)
+                weights = torch.softmax(logits_for_weights, dim=1) * failure_rows[:, None].float()
+            contrast_loss = (margin_violation * weights).sum() / failure_rows.float().sum().clamp_min(1.0)
+
+    temporal_safe_anchor = zero
+    temporal_risk_loss = zero
+    temporal_weight_mean = zero
+    temporal_weight_sum = zero
+    temporal_active_fraction = zero
+    if args.objective == "two_stage_temporal_safe_anchor" and stage == "residual":
+        success_safe_mask = mask & (labels[:, None] < 0.5)
+        temporal_safe_anchor = masked_mean(
+            F.relu(output["action_delta"] - args.safe_anchor_epsilon).square(),
+            success_safe_mask,
+        )
+        state_probability = torch.sigmoid(output["state_logit"].detach())
+        risk_weights = temporal_risk_weights(
+            state_probability=state_probability,
+            lengths=batch["lengths"],
+            mask=mask,
+            labels=labels,
+            stride=args.temporal_stride,
+            min_increase=args.temporal_min_increase,
+            normalize=args.temporal_normalize_weights,
+        )
+        temporal_weight_sum = risk_weights.sum()
+        temporal_weight_mean = risk_weights.sum() / mask.sum().clamp_min(1)
+        temporal_active_fraction = (risk_weights > 0).float().sum() / mask.sum().clamp_min(1)
+        temporal_risk_loss = (
+            risk_weights
+            * F.relu(args.temporal_risk_margin - output["action_delta"]).square()
+        ).sum() / risk_weights.sum().clamp_min(1e-8)
+
+    if args.objective in ("two_stage_residual", "two_stage_action_contrast", "two_stage_matched_action_contrast", "two_stage_temporal_safe_anchor") and stage == "state":
+        total = args.state_weight * state_loss
+    else:
+        total = (
+            args.state_weight * state_loss
+            + args.action_weight * action_loss
+            + args.residual_l1_weight * residual_l1
+            + args.shuffled_residual_weight * shuffled_residual
+            + args.smoothness_weight * smoothness
+        )
+        if args.objective in ("two_stage_residual", "two_stage_action_contrast", "two_stage_matched_action_contrast", "two_stage_temporal_safe_anchor"):
+            total = (
+                total
+                + args.success_residual_weight * success_residual
+                + args.decorrelation_weight * residual_decorrelation
+                + args.contrast_weight * contrast_loss
+            )
+            if args.objective == "two_stage_temporal_safe_anchor":
+                total = (
+                    total
+                    + args.safe_anchor_weight * temporal_safe_anchor
+                    + args.temporal_risk_weight * temporal_risk_loss
+                )
     return total, {
+        "stage": stage,
         "state_loss": float(state_loss.detach()),
         "action_loss": float(action_loss.detach()),
         "residual_l1": float(residual_l1.detach()),
         "shuffled_residual": float(shuffled_residual.detach()),
         "smoothness": float(smoothness.detach()),
+        "success_residual": float(success_residual.detach()),
+        "residual_decorrelation": float(residual_decorrelation.detach()),
+        "contrast_loss": float(contrast_loss.detach()),
+        "temporal_safe_anchor": float(temporal_safe_anchor.detach()),
+        "temporal_risk_loss": float(temporal_risk_loss.detach()),
+        "temporal_weight_mean": float(temporal_weight_mean.detach()),
+        "temporal_weight_sum": float(temporal_weight_sum.detach()),
+        "temporal_active_fraction": float(temporal_active_fraction.detach()),
     }
 
 
@@ -266,9 +608,21 @@ def outcome_metrics(
         [offsets[episode + 1] - 1 for episode in episodes],
         dtype=np.int64,
     )
+    bag_state_scores = noisy_or_episode_probability(
+        state_scores,
+        offsets,
+        episodes,
+    )
+    bag_action_scores = noisy_or_episode_probability(
+        action_scores,
+        offsets,
+        episodes,
+    )
     return {
         "num_episodes": int(len(episodes)),
         "num_failure_episodes": int(np.sum(labels[episodes])),
+        "bag_state_noisy_or": binary_metrics(labels[episodes], bag_state_scores),
+        "bag_action_noisy_or": binary_metrics(labels[episodes], bag_action_scores),
         "prefix_state": binary_metrics(chunk_labels, state_scores[indices]),
         "prefix_action_conditioned": binary_metrics(
             chunk_labels,
@@ -317,6 +671,38 @@ def persistent_onset(signal: np.ndarray, persistence: int) -> int | None:
             == persistence
         )
     return int(locations[0]) if len(locations) else None
+
+
+def set_state_modules_trainable(model: CausalPrefixRisk, trainable: bool) -> None:
+    for module in (model.obs_projection, model.prefix_encoder, model.state_head):
+        for parameter in module.parameters():
+            parameter.requires_grad_(trainable)
+
+
+def set_action_modules_trainable(model: CausalPrefixRisk, trainable: bool) -> None:
+    for module in (model.action_encoder, model.action_residual):
+        for parameter in module.parameters():
+            parameter.requires_grad_(trainable)
+
+
+def make_optimizer_and_scheduler(
+    model: CausalPrefixRisk,
+    args,
+    stage_steps: int,
+) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.CosineAnnealingLR]:
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable:
+        raise RuntimeError("no trainable parameters for current stage")
+    optimizer = torch.optim.AdamW(
+        trainable,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(int(stage_steps), 1),
+    )
+    return optimizer, scheduler
 
 
 def score_separation(
@@ -490,22 +876,94 @@ def train(args) -> dict:
         action_hidden_dim=args.action_hidden_dim,
         dropout=args.dropout,
     ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.total_steps,
-    )
+    if args.objective in ("noisy_or_mil", "two_stage_residual", "two_stage_action_contrast", "two_stage_matched_action_contrast", "two_stage_temporal_safe_anchor"):
+        with torch.no_grad():
+            model.state_head[-1].bias.fill_(args.initial_state_logit_bias)
+            model.action_residual[-1].bias.fill_(
+                args.initial_action_delta_bias
+            )
+
+    if args.objective in ("two_stage_residual", "two_stage_action_contrast", "two_stage_matched_action_contrast", "two_stage_temporal_safe_anchor"):
+        args.stage1_steps = min(max(int(args.stage1_steps), 1), args.total_steps - 1)
+        current_stage = "state"
+        args.training_stage = current_stage
+        set_state_modules_trainable(model, True)
+        set_action_modules_trainable(model, False)
+        optimizer, scheduler = make_optimizer_and_scheduler(
+            model,
+            args,
+            args.stage1_steps,
+        )
+    else:
+        current_stage = "joint"
+        args.training_stage = current_stage
+        set_state_modules_trainable(model, True)
+        set_action_modules_trainable(model, True)
+        optimizer, scheduler = make_optimizer_and_scheduler(
+            model,
+            args,
+            args.total_steps,
+        )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     best_path = args.output_dir / "best.pt"
     best_quality = (-float("inf"), -float("inf"))
     history = []
     all_episodes = np.arange(len(labels), dtype=np.int64)
+    success_by_step, all_success_action_indices = success_action_indices_by_step(
+        steps,
+        labels,
+        offsets,
+    )
+    matched_success_indices = None
+    if args.objective == "two_stage_matched_action_contrast":
+        print(
+            json.dumps(
+                {
+                    "event": "build_matched_success_indices",
+                    "top_k": args.match_topk,
+                    "step_window": args.match_step_window,
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
+        matched_success_indices = build_matched_success_indices(
+            features=features,
+            steps=steps,
+            labels=labels,
+            offsets=offsets,
+            top_k=args.match_topk,
+            step_window=args.match_step_window,
+            device=device,
+        )
     for step in range(1, args.total_steps + 1):
+        if (
+            args.objective in ("two_stage_residual", "two_stage_action_contrast", "two_stage_matched_action_contrast", "two_stage_temporal_safe_anchor")
+            and current_stage == "state"
+            and step > args.stage1_steps
+        ):
+            current_stage = "residual"
+            args.training_stage = current_stage
+            set_state_modules_trainable(model, False)
+            set_action_modules_trainable(model, True)
+            optimizer, scheduler = make_optimizer_and_scheduler(
+                model,
+                args,
+                args.total_steps - args.stage1_steps,
+            )
+            print(
+                json.dumps(
+                    {
+                        "event": "switch_to_residual_stage",
+                        "step": step,
+                        "frozen_state_modules": True,
+                    },
+                    indent=2,
+                ),
+                flush=True,
+            )
+        args.training_stage = current_stage
         model.train()
         episodes = balanced_episode_batch(
             labels,
@@ -521,6 +979,34 @@ def train(args) -> dict:
             episodes=episodes,
             device=device,
         )
+        if current_stage == "residual" and args.objective in (
+            "two_stage_action_contrast",
+            "two_stage_matched_action_contrast",
+        ):
+            if args.objective == "two_stage_matched_action_contrast":
+                batch["reference_actions"] = sample_matched_reference_actions(
+                    actions=actions,
+                    offsets=offsets,
+                    episodes=episodes,
+                    lengths=batch["lengths"],
+                    matched_indices=matched_success_indices,
+                    num_negatives=args.contrast_negatives,
+                    rng=rng,
+                    device=device,
+                )
+            else:
+                batch["reference_actions"] = sample_success_reference_actions(
+                    actions=actions,
+                    steps=steps,
+                    offsets=offsets,
+                    episodes=episodes,
+                    lengths=batch["lengths"],
+                    by_step=success_by_step,
+                    all_success_indices=all_success_action_indices,
+                    num_negatives=args.contrast_negatives,
+                    rng=rng,
+                    device=device,
+                )
         optimizer.zero_grad(set_to_none=True)
         loss, components = compute_loss(model, batch, args)
         loss.backward()
@@ -554,17 +1040,24 @@ def train(args) -> dict:
                 "loss": float(loss.detach()),
                 "grad_norm": float(grad_norm),
                 "lr": optimizer.param_groups[0]["lr"],
+                "training_stage": current_stage,
                 **components,
                 "validation": validation,
             }
             history.append(record)
             print(json.dumps(record, indent=2), flush=True)
             action_validation = validation["prefix_action_conditioned"]
+            if args.objective in ("noisy_or_mil", "two_stage_residual", "two_stage_action_contrast", "two_stage_matched_action_contrast", "two_stage_temporal_safe_anchor"):
+                action_validation = validation["bag_action_noisy_or"]
             quality = (
                 action_validation["roc_auc"],
                 -action_validation["binary_cross_entropy"],
             )
-            if math.isfinite(quality[0]) and quality > best_quality:
+            allow_checkpoint = not (
+                args.objective in ("two_stage_residual", "two_stage_action_contrast", "two_stage_matched_action_contrast", "two_stage_temporal_safe_anchor")
+                and current_stage != "residual"
+            )
+            if allow_checkpoint and math.isfinite(quality[0]) and quality > best_quality:
                 best_quality = quality
                 torch.save(
                     {
@@ -693,6 +1186,8 @@ def train(args) -> dict:
         "num_episodes": int(len(labels)),
         "num_failure_episodes": int(np.sum(labels)),
         "num_chunks": int(len(features)),
+        "objective": args.objective,
+        "stage1_steps": int(args.stage1_steps) if args.objective in ("two_stage_residual", "two_stage_action_contrast", "two_stage_matched_action_contrast", "two_stage_temporal_safe_anchor") else None,
         "best_step": int(checkpoint["best_step"]),
         "thresholds": thresholds,
         "metrics": metrics,
@@ -727,9 +1222,48 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--state-weight", type=float, default=1.0)
     parser.add_argument("--action-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--objective",
+        choices=(
+            "per_chunk_bce",
+            "noisy_or_mil",
+            "two_stage_residual",
+            "two_stage_action_contrast",
+            "two_stage_matched_action_contrast",
+            "two_stage_temporal_safe_anchor",
+        ),
+        default="per_chunk_bce",
+    )
+    parser.add_argument("--stage1-steps", type=int, default=500)
+    parser.add_argument("--initial-state-logit-bias", type=float, default=-5.0)
+    parser.add_argument("--initial-action-delta-bias", type=float, default=0.0)
     parser.add_argument("--residual-l1-weight", type=float, default=0.01)
     parser.add_argument("--shuffled-residual-weight", type=float, default=0.02)
     parser.add_argument("--smoothness-weight", type=float, default=0.02)
+    parser.add_argument("--success-residual-weight", type=float, default=0.1)
+    parser.add_argument("--decorrelation-weight", type=float, default=0.1)
+    parser.add_argument("--contrast-weight", type=float, default=0.0)
+    parser.add_argument("--contrast-margin", type=float, default=0.05)
+    parser.add_argument("--contrast-negatives", type=int, default=4)
+    parser.add_argument("--contrast-temperature", type=float, default=0.5)
+    parser.add_argument(
+        "--contrast-weighting",
+        choices=("action_softmax", "delta_softmax", "uniform"),
+        default="action_softmax",
+    )
+    parser.add_argument("--match-topk", type=int, default=16)
+    parser.add_argument("--match-step-window", type=int, default=16)
+    parser.add_argument("--safe-anchor-weight", type=float, default=0.1)
+    parser.add_argument("--safe-anchor-epsilon", type=float, default=0.0)
+    parser.add_argument("--temporal-risk-weight", type=float, default=0.5)
+    parser.add_argument("--temporal-risk-margin", type=float, default=0.05)
+    parser.add_argument("--temporal-stride", type=int, default=1)
+    parser.add_argument("--temporal-min-increase", type=float, default=0.0)
+    parser.add_argument(
+        "--temporal-normalize-weights",
+        action="store_true",
+        help="Normalize temporal risk weights within each failed episode.",
+    )
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--eval-batch-size", type=int, default=64)

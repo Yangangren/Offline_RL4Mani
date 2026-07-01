@@ -20,7 +20,12 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PYTHON = Path("/home/ryan/miniconda3/envs/robomimic_clean/bin/python")
+PYTHON = Path(
+    os.environ.get(
+        "ROBOMIMIC_PYTHON",
+        "/home/ryan/miniconda3/envs/robomimic_stable/bin/python",
+    )
+)
 COMMON_ENV = {
     "MPLCONFIGDIR": "/tmp/matplotlib",
     "MUJOCO_GL": "egl",
@@ -30,6 +35,8 @@ COMMON_ENV = {
     "PYTHONNOUSERSITE": "1",
     "TORCH_COMPILE_DISABLE": "1",
     "TORCHDYNAMO_DISABLE": "1",
+    # Reduce huge per-epoch checkpoint serialization for large RGB-DP models.
+    "ROBOMIMIC_SAVE_LATEST_EVERY_N_EPOCHS": "10",
 }
 
 

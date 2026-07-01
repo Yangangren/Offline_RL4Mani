@@ -24,7 +24,12 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PYTHON = Path("/home/ryan/miniconda3/envs/robomimic_clean/bin/python")
+PYTHON = Path(
+    os.environ.get(
+        "ROBOMIMIC_PYTHON",
+        "/home/ryan/miniconda3/envs/robomimic_stable/bin/python",
+    )
+)
 DEFAULT_CHECKPOINT = (
     ROOT
     / "trained_models/lift_ph_lowdim_bc_full_20260626_session"
@@ -38,10 +43,15 @@ COMMON_ENV = {
     "MUJOCO_GL": "egl",
     "PYOPENGL_PLATFORM": "egl",
     "NUMBA_DISABLE_JIT": "1",
+    "PYTHONFAULTHANDLER": "1",
     "PYTHONDONTWRITEBYTECODE": "1",
-    # This environment previously showed intermittent corruption in its
-    # in-place __pycache__ files. Redirect lookups to an isolated cache tree.
-    "PYTHONPYCACHEPREFIX": "/tmp/robomimic_clean_pycache",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONUNBUFFERED": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    # Redirect lookups to an isolated cache tree.
+    "PYTHONPYCACHEPREFIX": "/tmp/robomimic_pycache",
     "TORCH_COMPILE_DISABLE": "1",
     "TORCHDYNAMO_DISABLE": "1",
 }
@@ -51,9 +61,28 @@ def process_env(cache_suffix: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.update(COMMON_ENV)
     if cache_suffix is not None:
-        env["PYTHONPYCACHEPREFIX"] = f"/tmp/robomimic_clean_pycache_{cache_suffix}"
-    env["PYTHONNOUSERSITE"] = "1"
+        env["PYTHONPYCACHEPREFIX"] = f"/tmp/robomimic_pycache_{cache_suffix}"
     return env
+
+
+class TeeLogger:
+    """Write evaluator progress to both terminal and a per-seed log file."""
+
+    def __init__(self, path: Path, mode: str = "w"):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = self.path.open(mode, buffering=1)
+
+    def write(self, text: str) -> None:
+        print(text, end="", flush=True)
+        self.file.write(text)
+        self.file.flush()
+
+    def line(self, text: str = "") -> None:
+        self.write(text + "\n")
+
+    def close(self) -> None:
+        self.file.close()
 
 
 def parse_rollout_stats(text: str) -> dict[str, float]:
@@ -65,6 +94,17 @@ def parse_rollout_stats(text: str) -> dict[str, float]:
     if match is None:
         raise RuntimeError("could not parse Average Rollout Stats JSON")
     return json.loads(match.group(0))
+
+
+def infer_num_rollouts(stats: dict[str, float]) -> int | None:
+    for key in ("Num_Rollouts", "Requested_Rollouts"):
+        if key in stats:
+            return int(round(float(stats[key])))
+    success_rate = float(stats.get("Success_Rate", float("nan")))
+    num_success = float(stats.get("Num_Success", float("nan")))
+    if np.isfinite(success_rate) and success_rate > 0.0 and np.isfinite(num_success):
+        return int(round(num_success / success_rate))
+    return None
 
 
 def wilson_interval(successes: int, total: int, z: float = 1.959963984540054) -> tuple[float, float]:
@@ -85,63 +125,40 @@ def evaluate(
     horizon: int,
     max_retries: int,
     force: bool,
+    chunk_size: int,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     runs = []
     for seed in seeds:
         log_path = output_dir / f"eval_seed_{seed}.log"
-        cmd = [
-            str(PYTHON),
-            "-B",
-            "-m",
-            "robomimic.scripts.run_trained_agent",
-            "--agent",
-            str(checkpoint),
-            "--n_rollouts",
-            str(n_rollouts),
-            "--horizon",
-            str(horizon),
-            "--seed",
-            str(seed),
-        ]
         stats = None
         if log_path.exists() and not force:
             try:
                 stats = parse_rollout_stats(log_path.read_text())
-                print(f"\n[resume seed={seed}] using completed {log_path}", flush=True)
+                logged_rollouts = infer_num_rollouts(stats)
+                if logged_rollouts != n_rollouts:
+                    print(
+                        f"\n[resume seed={seed}] ignoring {log_path}: "
+                        f"logged_rollouts={logged_rollouts}, requested={n_rollouts}",
+                        flush=True,
+                    )
+                    stats = None
+                else:
+                    print(f"\n[resume seed={seed}] using completed {log_path}", flush=True)
             except RuntimeError:
                 pass
         if stats is None:
-            for attempt in range(max_retries + 1):
-                cache_suffix = f"eval_seed_{seed}_attempt_{attempt + 1}"
-                shutil.rmtree(
-                    f"/tmp/robomimic_clean_pycache_{cache_suffix}",
-                    ignore_errors=True,
-                )
-                print(
-                    f"\n[evaluate seed={seed}, attempt={attempt + 1}] "
-                    f"{' '.join(cmd)}",
-                    flush=True,
-                )
-                proc = subprocess.run(
-                    cmd,
-                    cwd=ROOT,
-                    env=process_env(cache_suffix=cache_suffix),
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                )
-                log_path.write_text(proc.stdout)
-                if proc.returncode == 0:
-                    stats = parse_rollout_stats(proc.stdout)
-                    break
-                print(
-                    f"seed={seed} attempt={attempt + 1} failed before completion:\n"
-                    + "\n".join(proc.stdout.splitlines()[-20:]),
-                    flush=True,
-                )
+            stats = evaluate_seed(
+                checkpoint=checkpoint,
+                seed=seed,
+                n_rollouts=n_rollouts,
+                horizon=horizon,
+                max_retries=max_retries,
+                log_path=log_path,
+                chunk_size=chunk_size,
+            )
             if stats is None:
-                raise subprocess.CalledProcessError(proc.returncode, cmd)
+                raise RuntimeError(f"seed {seed} failed before completion")
         num_success = int(round(float(stats["Num_Success"])))
         run = {
             "seed": seed,
@@ -200,6 +217,176 @@ def evaluate(
     print(f"\n{json.dumps(summary, indent=4)}")
     print(f"\nWrote {output_path}")
     return summary
+
+
+def aggregate_stats(chunk_stats: list[tuple[int, dict[str, float]]]) -> dict[str, float]:
+    total_rollouts = sum(count for count, _ in chunk_stats)
+    total_success = sum(float(stats["Num_Success"]) for _, stats in chunk_stats)
+    mean_return = sum(count * float(stats["Return"]) for count, stats in chunk_stats) / total_rollouts
+    mean_horizon = sum(count * float(stats["Horizon"]) for count, stats in chunk_stats) / total_rollouts
+    return {
+        "Num_Rollouts": float(total_rollouts),
+        "Return": mean_return,
+        "Horizon": mean_horizon,
+        "Success_Rate": total_success / total_rollouts,
+        "Num_Success": total_success,
+    }
+
+
+def rollout_command(checkpoint: Path, n_rollouts: int, horizon: int, seed: int) -> list[str]:
+    return [
+        str(PYTHON),
+        "-B",
+        "-m",
+        "robomimic.scripts.run_trained_agent",
+        "--agent",
+        str(checkpoint),
+        "--n_rollouts",
+        str(n_rollouts),
+        "--horizon",
+        str(horizon),
+        "--seed",
+        str(seed),
+    ]
+
+
+def run_rollout_subprocess(
+    *,
+    checkpoint: Path,
+    n_rollouts: int,
+    horizon: int,
+    seed: int,
+    cache_suffix: str,
+    max_retries: int,
+    logger: TeeLogger | None = None,
+) -> tuple[dict[str, float], str]:
+    cmd = rollout_command(checkpoint, n_rollouts, horizon, seed)
+    last_proc = None
+
+    def emit(text: str) -> None:
+        if logger is None:
+            print(text, end="", flush=True)
+        else:
+            logger.write(text)
+
+    for attempt in range(max_retries + 1):
+        attempt_suffix = f"{cache_suffix}_attempt_{attempt + 1}"
+        shutil.rmtree(
+            f"/tmp/robomimic_pycache_{attempt_suffix}",
+            ignore_errors=True,
+        )
+        emit(
+            f"\n[evaluate subprocess seed={seed}, n={n_rollouts}, "
+            f"attempt={attempt + 1}] {' '.join(cmd)}\n"
+        )
+        proc = subprocess.Popen(
+            cmd,
+            cwd=ROOT,
+            env=process_env(cache_suffix=attempt_suffix),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        output_parts = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            output_parts.append(line)
+            emit(line)
+        proc.wait()
+        proc.stdout.close()
+        proc.stdout = None
+        last_proc = proc
+        stdout = "".join(output_parts)
+        if proc.returncode == 0:
+            return parse_rollout_stats(stdout), stdout
+        emit(
+            f"subprocess seed={seed} n={n_rollouts} attempt={attempt + 1} "
+            f"failed with returncode={proc.returncode}:\n"
+            + "\n".join(stdout.splitlines()[-30:])
+            + "\n"
+        )
+    raise subprocess.CalledProcessError(
+        last_proc.returncode,
+        cmd,
+        output=stdout,
+    )
+
+
+def evaluate_seed(
+    *,
+    checkpoint: Path,
+    seed: int,
+    n_rollouts: int,
+    horizon: int,
+    max_retries: int,
+    log_path: Path,
+    chunk_size: int,
+) -> dict[str, float]:
+    logger = TeeLogger(log_path, mode="w")
+    logger.line(
+        f"[eval seed={seed}] checkpoint={checkpoint} "
+        f"n_rollouts={n_rollouts} chunk_size={chunk_size} horizon={horizon}"
+    )
+    if chunk_size <= 0 or chunk_size >= n_rollouts:
+        try:
+            stats, _ = run_rollout_subprocess(
+                checkpoint=checkpoint,
+                n_rollouts=n_rollouts,
+                horizon=horizon,
+                seed=seed,
+                cache_suffix=f"eval_seed_{seed}",
+                max_retries=max_retries,
+                logger=logger,
+            )
+            return stats
+        finally:
+            logger.close()
+
+    remaining = n_rollouts
+    chunk_index = 0
+    chunk_stats = []
+    try:
+        while remaining > 0:
+            count = min(chunk_size, remaining)
+            # Use independent deterministic seeds per chunk. This preserves the
+            # requested total number of rollouts without keeping one MuJoCo /
+            # PyTorch process alive for all rollouts.
+            chunk_seed = seed * 100000 + chunk_index
+            completed_before = n_rollouts - remaining
+            logger.line(
+                f"\n===== chunk {chunk_index} seed={chunk_seed} "
+                f"n_rollouts={count} progress={completed_before}/{n_rollouts} ====="
+            )
+            stats, _ = run_rollout_subprocess(
+                checkpoint=checkpoint,
+                n_rollouts=count,
+                horizon=horizon,
+                seed=chunk_seed,
+                cache_suffix=f"eval_seed_{seed}_chunk_{chunk_index}",
+                max_retries=max_retries,
+                logger=logger,
+            )
+            chunk_stats.append((count, stats))
+            remaining -= count
+            chunk_index += 1
+            partial = aggregate_stats(chunk_stats)
+            logger.line(
+                f"\n===== partial aggregated result after "
+                f"{n_rollouts - remaining}/{n_rollouts} rollouts ====="
+            )
+            logger.line("Average Rollout Stats")
+            logger.line(json.dumps(partial, indent=4))
+
+        stats = aggregate_stats(chunk_stats)
+        logger.line(
+            "\n===== aggregated chunked result =====\n"
+            "Average Rollout Stats\n"
+            f"{json.dumps(stats, indent=4)}"
+        )
+        return stats
+    finally:
+        logger.close()
 
 
 def decode_mask(dataset: h5py.File, key: str) -> list[str]:
@@ -327,6 +514,15 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     parser.add_argument("--n-rollouts", type=int, default=100)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=0,
+        help=(
+            "Split each seed evaluation into fresh subprocess chunks. "
+            "Use 0 to run all rollouts for a seed in one process."
+        ),
+    )
     parser.add_argument("--horizon", type=int, default=400)
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument(
@@ -355,6 +551,7 @@ def main() -> None:
             horizon=args.horizon,
             max_retries=args.max_retries,
             force=args.force,
+            chunk_size=args.chunk_size,
         )
     if not args.evaluate_only:
         render_samples(

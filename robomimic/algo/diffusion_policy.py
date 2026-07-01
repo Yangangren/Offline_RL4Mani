@@ -286,10 +286,21 @@ class DiffusionPolicyUNet(PolicyAlgo):
         # check if actions are normalized to [-1,1]
         if not self.action_check_done:
             actions = input_batch["actions"]
-            in_range = (-1 <= actions) & (actions <= 1)
-            all_in_range = torch.all(in_range).item()
-            if not all_in_range:
-                raise ValueError("'actions' must be in range [-1,1] for Diffusion Policy! Check if hdf5_normalize_action is enabled.")
+            # Some rollout datasets store actions with tiny float32 numerical
+            # overshoot, e.g. 1.0000139. Treat that as a serialization /
+            # conversion artifact and clamp it, while still catching genuinely
+            # unnormalized actions.
+            tolerance = 1e-3
+            action_min = torch.min(actions).item()
+            action_max = torch.max(actions).item()
+            if action_min < -1.0 - tolerance or action_max > 1.0 + tolerance:
+                raise ValueError(
+                    "'actions' must be in range [-1,1] for Diffusion Policy! "
+                    "Check if hdf5_normalize_action is enabled. "
+                    f"Got min={action_min:.6f}, max={action_max:.6f}."
+                )
+            if action_min < -1.0 or action_max > 1.0:
+                input_batch["actions"] = actions.clamp(-1.0, 1.0)
             self.action_check_done = True
         
         return TensorUtils.to_device(TensorUtils.to_float(input_batch), self.device)

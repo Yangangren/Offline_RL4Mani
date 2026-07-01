@@ -423,34 +423,59 @@ def train(config, device, resume=False):
         )
 
         # Save model checkpoints based on conditions (success rate, validation loss, etc)
-        if should_save_ckpt:    
+        saved_epoch_ckpt_path = None
+        if should_save_ckpt:
+            saved_epoch_ckpt_path = os.path.join(ckpt_dir, epoch_ckpt_name + ".pth")
             TrainUtils.save_model(
                 model=model,
                 config=config,
                 env_meta=env_meta_list[0] if len(env_meta_list)==1 else env_meta_list,
                 shape_meta=shape_meta_list[0] if len(shape_meta_list)==1 else shape_meta_list,
                 variable_state=variable_state,
-                ckpt_path=os.path.join(ckpt_dir, epoch_ckpt_name + ".pth"),
+                ckpt_path=saved_epoch_ckpt_path,
                 obs_normalization_stats=obs_normalization_stats,
                 action_normalization_stats=action_normalization_stats,
             )
 
-        # always save latest model for resume functionality
-        print("\nsaving latest model at {}...\n".format(latest_model_path))
-        TrainUtils.save_model(
-            model=model,
-            config=config,
-            env_meta=env_meta_list[0] if len(env_meta_list)==1 else env_meta_list,
-            shape_meta=shape_meta_list[0] if len(shape_meta_list)==1 else shape_meta_list,
-            variable_state=variable_state,
-            ckpt_path=latest_model_path,
-            obs_normalization_stats=obs_normalization_stats,
-            action_normalization_stats=action_normalization_stats,
+        # Save latest model for resume functionality. The original robomimic loop
+        # serializes a full checkpoint every epoch. For large RGB diffusion
+        # policies this is a 1GB+ torch.save per epoch, which is both slow and
+        # fragile in our current torch / Python environment. Allow a coarser
+        # cadence through ROBOMIMIC_SAVE_LATEST_EVERY_N_EPOCHS. Milestone epochs
+        # still save normally, and when a milestone checkpoint was just written
+        # we copy it to last.pth instead of serializing the same tensors twice.
+        latest_save_every = int(os.environ.get("ROBOMIMIC_SAVE_LATEST_EVERY_N_EPOCHS", "1"))
+        should_save_latest = (
+            latest_save_every <= 1
+            or epoch % latest_save_every == 0
+            or epoch == config.train.num_epochs
+            or saved_epoch_ckpt_path is not None
         )
+        if should_save_latest:
+            print("\nsaving latest model at {}...\n".format(latest_model_path))
+            if saved_epoch_ckpt_path is not None and os.path.exists(saved_epoch_ckpt_path):
+                shutil.copyfile(saved_epoch_ckpt_path, latest_model_path)
+                print("copied checkpoint to {}".format(latest_model_path))
+            else:
+                TrainUtils.save_model(
+                    model=model,
+                    config=config,
+                    env_meta=env_meta_list[0] if len(env_meta_list)==1 else env_meta_list,
+                    shape_meta=shape_meta_list[0] if len(shape_meta_list)==1 else shape_meta_list,
+                    variable_state=variable_state,
+                    ckpt_path=latest_model_path,
+                    obs_normalization_stats=obs_normalization_stats,
+                    action_normalization_stats=action_normalization_stats,
+                )
 
-        # keep a backup model in case last.pth is malformed (e.g. job died last time during saving)
-        shutil.copyfile(latest_model_path, latest_model_backup_path)
-        print("\nsaved backup of latest model at {}\n".format(latest_model_backup_path))
+            # keep a backup model in case last.pth is malformed (e.g. job died last time during saving)
+            shutil.copyfile(latest_model_path, latest_model_backup_path)
+            print("\nsaved backup of latest model at {}\n".format(latest_model_backup_path))
+        else:
+            print(
+                "\nskipping latest checkpoint at epoch {} "
+                "(ROBOMIMIC_SAVE_LATEST_EVERY_N_EPOCHS={})\n".format(epoch, latest_save_every)
+            )
 
         # Finally, log memory usage in MB
         process = psutil.Process(os.getpid())

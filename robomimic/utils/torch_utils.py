@@ -4,6 +4,25 @@ This file contains some PyTorch utilities.
 import numpy as np
 import math
 import torch
+
+# PyTorch 2.x decorates optimizer internals with torch._dynamo guards. In this
+# environment those guards can lazily import torch._dynamo / distributed tensor
+# code and fail with duplicate operator-registration errors, even though this
+# project never uses torch.compile. Patch the internal decorator to a no-op
+# before importing torch.optim so AdamW construction stays on the eager path.
+try:
+    import torch._compile as _torch_compile
+
+    def _robomimic_no_dynamo(fn=None, recursive=True):
+        if fn is None:
+            return lambda wrapped: wrapped
+        return fn
+
+    _torch_compile._disable_dynamo = _robomimic_no_dynamo
+    torch._disable_dynamo = _robomimic_no_dynamo
+except Exception:
+    pass
+
 import torch.optim as optim
 import torch.nn.functional as F
 
