@@ -116,6 +116,17 @@ class FrameStackWrapper(EnvWrapper):
         # keep track of last @num_frames observations for each obs key
         self.obs_history = None
 
+    def _safe_obs_frame(self, value):
+        """Return an owned, contiguous ndarray for frame history storage.
+
+        Some robosuite / MuJoCo observations can be views backed by C extension
+        memory. With newer NumPy builds these occasionally trigger
+        "C subclassed NumPy array / non-standard allocation" errors when the
+        frame stack stores views such as obs[k][None]. Keeping owned base NumPy
+        arrays in the deque makes rollout evaluation much more robust.
+        """
+        return np.ascontiguousarray(np.asarray(value)).copy()
+
     def _get_initial_obs_history(self, init_obs):
         """
         Helper method to get observation history from the initial observation, by
@@ -127,8 +138,9 @@ class FrameStackWrapper(EnvWrapper):
         """
         obs_history = {}
         for k in init_obs:
+            frame = self._safe_obs_frame(init_obs[k])
             obs_history[k] = deque(
-                [init_obs[k][None] for _ in range(self.num_frames)], 
+                [frame[None].copy() for _ in range(self.num_frames)], 
                 maxlen=self.num_frames,
             )
         return obs_history
@@ -140,7 +152,7 @@ class FrameStackWrapper(EnvWrapper):
         @self.num_frames.
         """
         # concatenate all frames per key so we return a numpy array per key
-        return { k : np.concatenate(self.obs_history[k], axis=0) for k in self.obs_history }
+        return { k : np.ascontiguousarray(np.concatenate(self.obs_history[k], axis=0)).copy() for k in self.obs_history }
 
     def cache_obs_history(self):
         self.obs_history_cache = deepcopy(self.obs_history)
@@ -201,19 +213,22 @@ class FrameStackWrapper(EnvWrapper):
         self.update_obs(obs, action=action, reset=False)
         # update frame history
         for k in obs:
-            # make sure to have leading dim of 1 for easy concatenation
-            self.obs_history[k].append(obs[k][None])
+            # make sure to have leading dim of 1 for easy concatenation.
+            # Store an owned contiguous array rather than a view into simulator
+            # memory; this avoids intermittent NumPy C-ABI crashes.
+            frame = self._safe_obs_frame(obs[k])
+            self.obs_history[k].append(np.expand_dims(frame, axis=0).copy(order="C"))
         obs_ret = self._get_stacked_obs_from_history()
         return obs_ret, r, done, info
 
     def update_obs(self, obs, action=None, reset=False):
-        obs["timesteps"] = np.array([self.timestep])
+        obs["timesteps"] = np.asarray([self.timestep]).copy()
         
         if reset:
-            obs["actions"] = np.zeros(self.env.action_dimension)
+            obs["actions"] = np.zeros(self.env.action_dimension).copy()
         else:
             self.timestep += 1
-            obs["actions"] = action[: self.env.action_dimension]
+            obs["actions"] = np.asarray(action[: self.env.action_dimension]).copy()
 
     def _to_string(self):
         """Info to pretty print."""
