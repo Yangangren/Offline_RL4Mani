@@ -62,6 +62,24 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class MLPBackbone(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: tuple[int, ...], dropout: float = 0.0):
+        super().__init__()
+        layers: list[nn.Module] = []
+        last = int(input_dim)
+        for hidden in hidden_dims:
+            hidden = int(hidden)
+            layers.extend([nn.Linear(last, hidden), nn.LayerNorm(hidden), nn.SiLU()])
+            if dropout > 0:
+                layers.append(nn.Dropout(float(dropout)))
+            last = hidden
+        self.net = nn.Sequential(*layers) if layers else nn.Identity()
+        self.output_dim = last
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class ChunkIQLCritic(nn.Module):
     def __init__(
         self,
@@ -70,22 +88,39 @@ class ChunkIQLCritic(nn.Module):
         chunk_horizon: int,
         hidden_dims: tuple[int, ...],
         dropout: float,
+        aux_next_pred: bool = False,
     ):
         super().__init__()
         self.feature_dim = int(feature_dim)
         self.action_dim = int(action_dim)
         self.chunk_horizon = int(chunk_horizon)
+        self.aux_next_pred = bool(aux_next_pred)
         flat_action_dim = self.action_dim * self.chunk_horizon
         q_input = self.feature_dim + flat_action_dim
-        self.q1 = MLP(q_input, hidden_dims, dropout=dropout)
-        self.q2 = MLP(q_input, hidden_dims, dropout=dropout)
+        if self.aux_next_pred:
+            self.sa_trunk = MLPBackbone(q_input, hidden_dims, dropout=dropout)
+            self.q1_head = nn.Linear(self.sa_trunk.output_dim, 1)
+            self.q2_head = nn.Linear(self.sa_trunk.output_dim, 1)
+            self.next_pred_head = nn.Linear(self.sa_trunk.output_dim, self.feature_dim)
+        else:
+            self.q1 = MLP(q_input, hidden_dims, dropout=dropout)
+            self.q2 = MLP(q_input, hidden_dims, dropout=dropout)
         self.v = MLP(self.feature_dim, hidden_dims, dropout=dropout)
 
     def flatten_action(self, actions: torch.Tensor) -> torch.Tensor:
         return actions.reshape(actions.shape[0], self.chunk_horizon * self.action_dim)
 
+    def sa_features(self, obs_features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        if not self.aux_next_pred:
+            raise RuntimeError("state-action trunk is only available when aux_next_pred=True")
+        x = torch.cat([obs_features, self.flatten_action(actions)], dim=-1)
+        return self.sa_trunk(x)
+
     def q_values(self, obs_features: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = torch.cat([obs_features, self.flatten_action(actions)], dim=-1)
+        if self.aux_next_pred:
+            h = self.sa_trunk(x)
+            return self.q1_head(h), self.q2_head(h)
         return self.q1(x), self.q2(x)
 
     def q_min(self, obs_features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -94,6 +129,9 @@ class ChunkIQLCritic(nn.Module):
 
     def value(self, obs_features: torch.Tensor) -> torch.Tensor:
         return self.v(obs_features)
+
+    def next_prediction(self, obs_features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        return self.next_pred_head(self.sa_features(obs_features, actions))
 
 
 class FeatureDataset(torch.utils.data.Dataset):
@@ -156,6 +194,14 @@ def q_regression_loss(q: torch.Tensor, target: torch.Tensor, use_huber: bool) ->
     if use_huber:
         return F.smooth_l1_loss(q, target)
     return F.mse_loss(q, target)
+
+
+def next_prediction_target(batch: dict[str, torch.Tensor], mode: str) -> torch.Tensor:
+    if mode == "delta":
+        return batch["next_obs"] - batch["obs"]
+    if mode == "next":
+        return batch["next_obs"]
+    raise ValueError(f"unknown aux_next_pred_mode={mode}")
 
 
 def binary_roc_auc(labels: np.ndarray, scores: np.ndarray) -> float | None:
@@ -315,6 +361,8 @@ def compute_iql_losses(
     gamma: float,
     expectile: float,
     use_huber: bool,
+    aux_next_pred_weight: float = 0.0,
+    aux_next_pred_mode: str = "delta",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     obs = batch["obs"]
     next_obs = batch["next_obs"]
@@ -333,16 +381,27 @@ def compute_iql_losses(
     q1, q2 = critic.q_values(obs, actions)
     q1_loss = q_regression_loss(q1, q_backup, use_huber)
     q2_loss = q_regression_loss(q2, q_backup, use_huber)
-    loss = q1_loss + q2_loss + v_loss
+    iql_loss = q1_loss + q2_loss + v_loss
+    next_pred_loss = q1.new_tensor(0.0)
+    next_pred_weighted_loss = q1.new_tensor(0.0)
+    if float(aux_next_pred_weight) > 0.0:
+        pred_next = critic.next_prediction(obs, actions)
+        target_next = next_prediction_target(batch, aux_next_pred_mode).detach()
+        next_pred_loss = F.mse_loss(pred_next, target_next)
+        next_pred_weighted_loss = float(aux_next_pred_weight) * next_pred_loss
+    loss = iql_loss + next_pred_weighted_loss
 
     with torch.no_grad():
         q_min = torch.minimum(q1, q2)
         adv = q_for_v - v
     info = {
         "critic_loss": loss.detach(),
+        "iql_loss": iql_loss.detach(),
         "q1_loss": q1_loss.detach(),
         "q2_loss": q2_loss.detach(),
         "v_loss": v_loss.detach(),
+        "next_pred_loss": next_pred_loss.detach(),
+        "next_pred_weighted_loss": next_pred_weighted_loss.detach(),
         "q_mean": q_min.mean().detach(),
         "v_mean": v.mean().detach(),
         "adv_mean": adv.mean().detach(),
@@ -481,6 +540,8 @@ def evaluate_split(
     gamma: float,
     expectile: float,
     use_huber: bool,
+    aux_next_pred_weight: float = 0.0,
+    aux_next_pred_mode: str = "delta",
 ) -> dict[str, float | None]:
     loader = make_loader(dataset, batch_size=batch_size, shuffle=False, seed=0)
     critic.eval()
@@ -491,11 +552,20 @@ def evaluate_split(
     success = []
     dones = []
     critic_losses = []
+    iql_losses = []
+    next_pred_losses = []
     actor_losses = []
     for batch in loader:
         batch = batch_to_device(batch, device)
-        critic_loss, _ = compute_iql_losses(
-            critic, critic, batch, gamma=gamma, expectile=expectile, use_huber=use_huber
+        critic_loss, critic_info = compute_iql_losses(
+            critic,
+            critic,
+            batch,
+            gamma=gamma,
+            expectile=expectile,
+            use_huber=use_huber,
+            aux_next_pred_weight=aux_next_pred_weight,
+            aux_next_pred_mode=aux_next_pred_mode,
         )
         actor_loss, _ = actor_bc_loss(actor, scheduler, batch["obs"], batch["actions"])
         q = critic.q_min(batch["obs"], batch["actions"]).reshape(-1)
@@ -506,6 +576,8 @@ def evaluate_split(
         success.append(batch["success"].cpu().numpy())
         dones.append(batch["dones"].cpu().numpy())
         critic_losses.append(float(critic_loss.cpu()))
+        iql_losses.append(float(critic_info["iql_loss"].cpu()))
+        next_pred_losses.append(float(critic_info["next_pred_loss"].cpu()))
         actor_losses.append(float(actor_loss.cpu()))
     q_np = np.concatenate(q_values)
     v_np = np.concatenate(v_values)
@@ -516,6 +588,8 @@ def evaluate_split(
     return {
         "num_samples": int(len(q_np)),
         "critic_loss": float(np.mean(critic_losses)),
+        "iql_loss": float(np.mean(iql_losses)),
+        "next_pred_loss": float(np.mean(next_pred_losses)),
         "actor_bc_loss": float(np.mean(actor_losses)),
         "q_mean": float(np.mean(q_np)),
         "v_mean": float(np.mean(v_np)),
@@ -564,6 +638,9 @@ def save_checkpoint(
         "action_mean": data["action_mean"].astype(np.float32),
         "action_std": data["action_std"].astype(np.float32),
         "normalize_actions": bool(args.normalize_actions),
+        "aux_next_pred_enabled": bool(float(args.aux_next_pred_weight) > 0.0),
+        "aux_next_pred_mode": str(args.aux_next_pred_mode),
+        "aux_next_pred_weight": float(args.aux_next_pred_weight),
         "features": str(args.features),
         "pretrained_dp_checkpoint": str(data["checkpoint"].astype(str).item()),
         "step": int(step),
@@ -891,6 +968,11 @@ def write_partial_summary(args: argparse.Namespace, data: dict[str, np.ndarray],
         "feature_dim": int(feature_dim),
         "action_dim": int(action_dim),
         "gamma": float(gamma),
+        "aux_next_pred": {
+            "enabled": bool(float(args.aux_next_pred_weight) > 0.0),
+            "weight": float(args.aux_next_pred_weight),
+            "mode": str(args.aux_next_pred_mode),
+        },
         "best": best,
         "last_completed_eval_step": int(history[-1]["step"]) if history else None,
         "history": history,
@@ -955,6 +1037,7 @@ def train(args: argparse.Namespace) -> dict:
         chunk_horizon=1,
         hidden_dims=tuple(args.critic_hidden_dims),
         dropout=args.critic_dropout,
+        aux_next_pred=bool(float(args.aux_next_pred_weight) > 0.0),
     ).to(device)
     target_critic = copy.deepcopy(critic).to(device)
     target_critic.eval()
@@ -1025,6 +1108,8 @@ def train(args: argparse.Namespace) -> dict:
             gamma=gamma,
             expectile=args.expectile,
             use_huber=args.use_huber,
+            aux_next_pred_weight=args.aux_next_pred_weight,
+            aux_next_pred_mode=args.aux_next_pred_mode,
         )
         critic_loss.backward()
         critic_grad = torch.nn.utils.clip_grad_norm_(critic.parameters(), args.grad_clip)
@@ -1066,6 +1151,8 @@ def train(args: argparse.Namespace) -> dict:
                 gamma=gamma,
                 expectile=args.expectile,
                 use_huber=args.use_huber,
+                aux_next_pred_weight=args.aux_next_pred_weight,
+                aux_next_pred_mode=args.aux_next_pred_mode,
             )
             test_metrics = evaluate_split(
                 critic,
@@ -1077,6 +1164,8 @@ def train(args: argparse.Namespace) -> dict:
                 gamma=gamma,
                 expectile=args.expectile,
                 use_huber=args.use_huber,
+                aux_next_pred_weight=args.aux_next_pred_weight,
+                aux_next_pred_mode=args.aux_next_pred_mode,
             )
             record = {"step": step, "val": val_metrics, "test": test_metrics}
             history.append(record)
@@ -1225,6 +1314,8 @@ def train(args: argparse.Namespace) -> dict:
             gamma=gamma,
             expectile=args.expectile,
             use_huber=args.use_huber,
+            aux_next_pred_weight=args.aux_next_pred_weight,
+            aux_next_pred_mode=args.aux_next_pred_mode,
         )
         for split in ("train", "val", "test")
     }
@@ -1258,6 +1349,11 @@ def train(args: argparse.Namespace) -> dict:
         "feature_dim": feature_dim,
         "action_dim": action_dim,
         "gamma": gamma,
+        "aux_next_pred": {
+            "enabled": bool(float(args.aux_next_pred_weight) > 0.0),
+            "weight": float(args.aux_next_pred_weight),
+            "mode": str(args.aux_next_pred_mode),
+        },
         "best": best,
         "final_metrics": final_metrics,
         "history": history,
@@ -1301,6 +1397,18 @@ def main() -> None:
     parser.add_argument("--normalize-actions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-huber", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--grad-clip", type=float, default=10.0)
+    parser.add_argument(
+        "--aux-next-pred-weight",
+        type=float,
+        default=0.0,
+        help="Weight for optional critic next-latent prediction loss. 0 keeps the standard IDQL critic.",
+    )
+    parser.add_argument(
+        "--aux-next-pred-mode",
+        choices=("delta", "next"),
+        default="delta",
+        help="Auxiliary target: z_{t+1}-z_t or absolute z_{t+1}.",
+    )
     parser.add_argument("--num-diffusion-steps", type=int, default=100)
     parser.add_argument("--beta-schedule", type=str, default="squaredcos_cap_v2")
     parser.add_argument("--clip-sample", action=argparse.BooleanOptionalAction, default=True)

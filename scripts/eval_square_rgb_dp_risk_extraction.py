@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Evaluate risk-guided extraction from a frozen Square RGB DiffusionPolicy.
+"""Evaluate outcome-guided extraction from a frozen Square RGB DiffusionPolicy.
 
 At each DP decision boundary, this policy samples N full 16-slot trajectories
 from the frozen pretrained DiffusionPolicy, scores them with a learned causal
-prefix-risk model, and executes the least-risky future action chunk.
+prefix outcome model, and executes the selected future action chunk.
 
-This is intentionally not IDQL: the risk model was trained from rollout-level
+This is intentionally not IDQL: the outcome model was trained from rollout-level
 success / failure outcomes, not Bellman backups. It is a deployment-time
-candidate selector:
+candidate selector. For the original failure-risk model:
 
     a* = argmin_a positive_action_risk(o_{<=t}, a)
+
+For a turned-over success model:
+
+    a* = argmax_a positive_action_advantage(o_{<=t}, a)
 
 The DP prior still matters because all candidates come from the frozen DP.
 """
@@ -33,7 +37,7 @@ import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 from robomimic.envs.env_base import EnvBase
 from robomimic.envs.wrappers import EnvWrapper
-from robomimic.models.prefix_risk_nets import CausalPrefixRisk
+from robomimic.models.prefix_risk_nets import CausalPrefixRisk, make_causal_prefix_model
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +52,13 @@ DEFAULT_RISK = (
     / "epoch190_two_stage_temporal_safe_anchor/best.pt"
 )
 DEFAULT_OUTPUT = ROOT / "rollouts/square_rgb_dp/risk_extraction_eval"
+
+
+def resolve_checkpoint_path(path_like) -> Path:
+    path = Path(path_like)
+    if path.is_absolute():
+        return path
+    return (ROOT / path).resolve()
 
 
 def clone_obs(obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -127,6 +138,7 @@ class RiskGuidedDPPolicy:
         selection: str,
         softmin_temperature: float,
         risk_threshold: float | None,
+        score_gap_threshold: float,
         execute_horizon: int,
         action_start_index: int,
         max_prefix_len: int,
@@ -141,6 +153,7 @@ class RiskGuidedDPPolicy:
         self.selection = selection
         self.softmin_temperature = float(softmin_temperature)
         self.risk_threshold = risk_threshold
+        self.score_gap_threshold = max(float(score_gap_threshold), 0.0)
         self.prediction_horizon = int(risk_checkpoint["prediction_horizon"])
         self.action_dim = int(risk_checkpoint["action_dim"])
         self.execute_horizon = (
@@ -157,6 +170,10 @@ class RiskGuidedDPPolicy:
         self.action_queue: deque[torch.Tensor] = deque()
         self.previous_ob: dict | None = None
         self.prefix_features: list[torch.Tensor] = []
+        ckpt_args = risk_checkpoint.get("args", {})
+        self.target_outcome = str(ckpt_args.get("target_outcome", "failure"))
+        if self.target_outcome not in ("failure", "success"):
+            raise ValueError(f"unknown risk target_outcome={self.target_outcome}")
 
         device = self.algo.device
         stats = risk_checkpoint["stats"]
@@ -180,9 +197,9 @@ class RiskGuidedDPPolicy:
             raise ValueError("risk normalizers contain non-positive std values")
 
         policy_prediction_horizon = int(self.algo.algo_config.horizon.prediction_horizon)
-        if policy_prediction_horizon != self.prediction_horizon:
+        if self.prediction_horizon > policy_prediction_horizon:
             raise ValueError(
-                "risk model and policy prediction horizons differ: "
+                "risk model action horizon cannot exceed policy prediction horizon: "
                 f"risk={self.prediction_horizon}, policy={policy_prediction_horizon}"
             )
         if self.algo.ac_dim != self.action_dim:
@@ -201,6 +218,13 @@ class RiskGuidedDPPolicy:
         self.last_action_probs: np.ndarray | None = None
         self.last_action_deltas: np.ndarray | None = None
         self.last_positive_action_risks: np.ndarray | None = None
+        self.last_positive_action_advantages: np.ndarray | None = None
+        self.last_score_gap: float | None = None
+        self.last_score_std: float | None = None
+        self.last_action_delta_std: float | None = None
+        self.last_action_prob_std: float | None = None
+        self.last_candidate_action_std: float | None = None
+        self.last_candidate_action_pairwise_l2: float | None = None
         self.last_selected_index: int | None = None
         self.last_threshold_fallback: bool | None = None
 
@@ -216,6 +240,13 @@ class RiskGuidedDPPolicy:
         self.last_action_probs = None
         self.last_action_deltas = None
         self.last_positive_action_risks = None
+        self.last_positive_action_advantages = None
+        self.last_score_gap = None
+        self.last_score_std = None
+        self.last_action_delta_std = None
+        self.last_action_prob_std = None
+        self.last_candidate_action_std = None
+        self.last_candidate_action_pairwise_l2 = None
         self.last_selected_index = None
         self.last_threshold_fallback = None
 
@@ -321,13 +352,24 @@ class RiskGuidedDPPolicy:
         ).squeeze(1)
         action_logit = state_logit.detach().repeat(action_delta.shape[0]) + action_delta
         action_probability = torch.sigmoid(action_logit)
-        positive_action_risk = torch.relu(action_delta)
-        state_probability = torch.sigmoid(state_logit.reshape(()))
+        if self.target_outcome == "failure":
+            positive_action_risk = torch.relu(action_delta)
+            positive_action_advantage = torch.relu(-action_delta)
+            action_advantage_logodds = -action_delta
+        elif self.target_outcome == "success":
+            positive_action_risk = torch.relu(-action_delta)
+            positive_action_advantage = torch.relu(action_delta)
+            action_advantage_logodds = action_delta
 
+        state_probability = torch.sigmoid(state_logit.reshape(()))
         if self.score_mode == "positive_action_risk":
             scores = positive_action_risk
+        elif self.score_mode == "positive_action_advantage":
+            scores = positive_action_advantage
         elif self.score_mode == "action_delta_logodds":
             scores = action_delta
+        elif self.score_mode == "action_advantage_logodds":
+            scores = action_advantage_logodds
         elif self.score_mode == "action_logit":
             scores = action_logit
         elif self.score_mode == "action_probability":
@@ -342,15 +384,34 @@ class RiskGuidedDPPolicy:
             "action_logit": action_logit,
             "action_probability": action_probability,
             "positive_action_risk": positive_action_risk,
+            "positive_action_advantage": positive_action_advantage,
+            "action_advantage_logodds": action_advantage_logodds,
         }
 
     def choose_index(self, scores: torch.Tensor) -> tuple[int, bool]:
         if len(scores) == 1:
             return 0, False
         if self.selection in ("argmin", "greedy"):
-            return int(torch.argmin(scores).item()), False
+            selected = int(torch.argmin(scores).item())
+            if self.score_gap_threshold > 0.0 and selected != 0:
+                native = float(scores[0].detach().cpu())
+                best = float(scores[selected].detach().cpu())
+                if native - best < self.score_gap_threshold:
+                    return 0, True
+            return selected, False
+        if self.selection == "argmax":
+            selected = int(torch.argmax(scores).item())
+            if self.score_gap_threshold > 0.0 and selected != 0:
+                native = float(scores[0].detach().cpu())
+                best = float(scores[selected].detach().cpu())
+                if best - native < self.score_gap_threshold:
+                    return 0, True
+            return selected, False
         if self.selection == "softmin":
             probs = torch.softmax(-scores / max(self.softmin_temperature, 1e-6), dim=0)
+            return int(torch.multinomial(probs, num_samples=1).item()), False
+        if self.selection == "softmax":
+            probs = torch.softmax(scores / max(self.softmin_temperature, 1e-6), dim=0)
             return int(torch.multinomial(probs, num_samples=1).item()), False
         if self.selection == "threshold_fallback":
             if self.risk_threshold is None:
@@ -378,6 +439,34 @@ class RiskGuidedDPPolicy:
             self.last_positive_action_risks = (
                 risk["positive_action_risk"].detach().cpu().numpy()
             )
+            self.last_positive_action_advantages = (
+                risk["positive_action_advantage"].detach().cpu().numpy()
+            )
+            self.last_score_std = float(np.std(self.last_scores))
+            self.last_action_delta_std = float(np.std(self.last_action_deltas))
+            self.last_action_prob_std = float(np.std(self.last_action_probs))
+            native_score = float(self.last_scores[0])
+            selected_score = float(self.last_scores[selected])
+            if self.selection in ("argmin", "greedy", "threshold_fallback"):
+                self.last_score_gap = native_score - selected_score
+            else:
+                self.last_score_gap = selected_score - native_score
+            executed_candidates = candidates[
+                :,
+                self.action_start_index : self.action_start_index + self.execute_horizon,
+                :,
+            ]
+            self.last_candidate_action_std = float(
+                executed_candidates.std(dim=0, unbiased=False).mean().detach().cpu()
+            )
+            if executed_candidates.shape[0] > 1:
+                flat_candidates = executed_candidates.reshape(executed_candidates.shape[0], -1)
+                distances = torch.pdist(flat_candidates, p=2)
+                self.last_candidate_action_pairwise_l2 = float(
+                    distances.mean().detach().cpu()
+                )
+            else:
+                self.last_candidate_action_pairwise_l2 = 0.0
             self.last_selected_index = int(selected)
             self.last_threshold_fallback = bool(fallback)
 
@@ -389,26 +478,60 @@ class RiskGuidedDPPolicy:
         return action.detach().cpu().numpy()[0].copy()
 
 
-def load_risk_policy(policy_path: Path, risk_path: Path, device: torch.device, args) -> RiskGuidedDPPolicy:
-    dp_policy, _ = FileUtils.policy_from_checkpoint(
-        ckpt_path=str(policy_path),
+def load_dp_policy_for_rollout(policy_path: Path, device: torch.device):
+    """Load either a normal robomimic policy checkpoint or our hybrid actor checkpoint."""
+
+    raw_checkpoint = FileUtils.load_dict_from_checkpoint(str(policy_path))
+    if bool(raw_checkpoint.get("hybrid_dp_chunk_actor_iql", False)):
+        base_checkpoint_value = raw_checkpoint.get(
+            "pretrained_dp_checkpoint",
+            raw_checkpoint.get("args", {}).get("checkpoint"),
+        )
+        if base_checkpoint_value is None:
+            raise RuntimeError(
+                "hybrid DP chunk actor checkpoint is missing pretrained_dp_checkpoint"
+            )
+        base_checkpoint = resolve_checkpoint_path(base_checkpoint_value)
+        dp_policy, base_ckpt = FileUtils.policy_from_checkpoint(
+            ckpt_path=str(base_checkpoint),
+            device=device,
+            verbose=False,
+        )
+        dp_policy.policy.deserialize(raw_checkpoint["actor_model"], load_optimizers=False)
+        dp_policy.policy.set_eval()
+        return dp_policy, base_ckpt, raw_checkpoint
+
+    dp_policy, ckpt_dict = FileUtils.policy_from_checkpoint(
+        ckpt_dict=raw_checkpoint,
         device=device,
         verbose=False,
     )
+    return dp_policy, ckpt_dict, raw_checkpoint
+
+
+def load_risk_policy(policy_path: Path, risk_path: Path, device: torch.device, args):
+    dp_policy, env_ckpt, policy_checkpoint = load_dp_policy_for_rollout(
+        policy_path,
+        device,
+    )
     checkpoint = torch.load(risk_path, map_location=device, weights_only=False)
     ckpt_args = checkpoint["args"]
-    risk_model = CausalPrefixRisk(
+    risk_model = make_causal_prefix_model(
+        model_arch=str(ckpt_args.get("model_arch", "v1")),
         feature_dim=int(checkpoint["feature_dim"]),
         prediction_horizon=int(checkpoint["prediction_horizon"]),
         action_dim=int(checkpoint["action_dim"]),
         hidden_dim=int(ckpt_args["hidden_dim"]),
         action_hidden_dim=int(ckpt_args["action_hidden_dim"]),
         dropout=float(ckpt_args["dropout"]),
+        action_num_heads=int(ckpt_args.get("action_num_heads", 4)),
+        action_conv_layers=int(ckpt_args.get("action_conv_layers", 2)),
+        prefix_conv_layers=int(ckpt_args.get("prefix_conv_layers", 1)),
     ).to(device)
     risk_model.load_state_dict(checkpoint["model"])
     risk_model.eval()
     risk_model.requires_grad_(False)
-    return RiskGuidedDPPolicy(
+    guided_policy = RiskGuidedDPPolicy(
         dp_policy=dp_policy,
         risk_checkpoint=checkpoint,
         risk_model=risk_model,
@@ -418,10 +541,12 @@ def load_risk_policy(policy_path: Path, risk_path: Path, device: torch.device, a
         selection=args.selection,
         softmin_temperature=args.softmin_temperature,
         risk_threshold=args.risk_threshold,
+        score_gap_threshold=args.score_gap_threshold,
         execute_horizon=args.execute_horizon,
         action_start_index=args.action_start_index,
         max_prefix_len=args.max_prefix_len,
     )
+    return guided_policy, env_ckpt, policy_checkpoint
 
 
 def rollout(
@@ -454,6 +579,13 @@ def rollout(
         action_delta_selected=[],
         action_prob_selected=[],
         positive_risk_selected=[],
+        positive_advantage_selected=[],
+        score_gap=[],
+        score_std=[],
+        action_delta_std=[],
+        action_prob_std=[],
+        candidate_action_std=[],
+        candidate_action_pairwise_l2=[],
         selected_index=[],
         threshold_fallback=[],
         initial_state_dict=state_dict,
@@ -496,6 +628,13 @@ def rollout(
                 traj["action_delta_selected"].append(np.nan)
                 traj["action_prob_selected"].append(np.nan)
                 traj["positive_risk_selected"].append(np.nan)
+                traj["positive_advantage_selected"].append(np.nan)
+                traj["score_gap"].append(np.nan)
+                traj["score_std"].append(np.nan)
+                traj["action_delta_std"].append(np.nan)
+                traj["action_prob_std"].append(np.nan)
+                traj["candidate_action_std"].append(np.nan)
+                traj["candidate_action_pairwise_l2"].append(np.nan)
                 traj["selected_index"].append(-1)
                 traj["threshold_fallback"].append(False)
             else:
@@ -512,6 +651,17 @@ def rollout(
                 )
                 traj["positive_risk_selected"].append(
                     float(policy.last_positive_action_risks[selected])
+                )
+                traj["positive_advantage_selected"].append(
+                    float(policy.last_positive_action_advantages[selected])
+                )
+                traj["score_gap"].append(float(policy.last_score_gap))
+                traj["score_std"].append(float(policy.last_score_std))
+                traj["action_delta_std"].append(float(policy.last_action_delta_std))
+                traj["action_prob_std"].append(float(policy.last_action_prob_std))
+                traj["candidate_action_std"].append(float(policy.last_candidate_action_std))
+                traj["candidate_action_pairwise_l2"].append(
+                    float(policy.last_candidate_action_pairwise_l2)
                 )
                 traj["selected_index"].append(int(selected))
                 traj["threshold_fallback"].append(bool(policy.last_threshold_fallback))
@@ -560,14 +710,21 @@ def wilson(successes: int, total: int, z: float = 1.959963984540054) -> list[flo
     return [center - radius, center + radius]
 
 
+def score_gap_suffix(score_gap_threshold: float) -> str:
+    if float(score_gap_threshold) <= 0.0:
+        return ""
+    value = f"{float(score_gap_threshold):.6g}".replace("-", "m").replace(".", "p")
+    return f"_gap{value}"
+
+
 def evaluate(args) -> dict:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
-    policy = load_risk_policy(args.policy, args.risk, device, args)
-    _, ckpt_dict = FileUtils.policy_from_checkpoint(
-        ckpt_path=str(args.policy),
-        device=device,
-        verbose=False,
+    policy, ckpt_dict, policy_checkpoint = load_risk_policy(
+        args.policy,
+        args.risk,
+        device,
+        args,
     )
     env, _ = FileUtils.env_from_checkpoint(
         ckpt_dict=ckpt_dict,
@@ -589,6 +746,18 @@ def evaluate(args) -> dict:
         args.dataset_path.parent.mkdir(parents=True, exist_ok=True)
         dataset_writer = h5py.File(args.dataset_path, "w")
         data_group = dataset_writer.create_group("data")
+    diagnostic_keys = (
+        "score_gap",
+        "score_std",
+        "action_delta_std",
+        "action_prob_std",
+        "candidate_action_std",
+        "candidate_action_pairwise_l2",
+        "positive_advantage_selected",
+        "action_delta_selected",
+        "action_prob_selected",
+    )
+    diagnostic_values = {key: [] for key in diagnostic_keys}
 
     for i in range(args.n_rollouts):
         writer = None
@@ -606,6 +775,11 @@ def evaluate(args) -> dict:
         if writer is not None:
             writer.close()
         stats.append(rollout_stats)
+        for key in diagnostic_keys:
+            values = np.asarray(traj[key], dtype=np.float64)
+            values = values[np.isfinite(values)]
+            if len(values):
+                diagnostic_values[key].append(values)
         print(
             f"rollout={i} success={rollout_stats['Success_Rate']:.0f} "
             f"return={rollout_stats['Return']:.3f} horizon={rollout_stats['Horizon']}",
@@ -627,6 +801,13 @@ def evaluate(args) -> dict:
                 "action_delta_selected",
                 "action_prob_selected",
                 "positive_risk_selected",
+                "positive_advantage_selected",
+                "score_gap",
+                "score_std",
+                "action_delta_std",
+                "action_prob_std",
+                "candidate_action_std",
+                "candidate_action_pairwise_l2",
                 "selected_index",
                 "threshold_fallback",
             ):
@@ -643,9 +824,36 @@ def evaluate(args) -> dict:
 
     avg = aggregate(stats)
     successes = int(round(avg["Num_Success"]))
+    candidate_diagnostics = {}
+    for key, chunks in diagnostic_values.items():
+        if not chunks:
+            candidate_diagnostics[key] = {
+                "count": 0,
+                "mean": float("nan"),
+                "std": float("nan"),
+                "q10": float("nan"),
+                "median": float("nan"),
+                "q90": float("nan"),
+            }
+            continue
+        values = np.concatenate(chunks)
+        candidate_diagnostics[key] = {
+            "count": int(len(values)),
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+            "q10": float(np.quantile(values, 0.1)),
+            "median": float(np.quantile(values, 0.5)),
+            "q90": float(np.quantile(values, 0.9)),
+        }
     summary = {
         "policy": str(args.policy),
+        "policy_checkpoint_kind": (
+            "hybrid_dp_chunk_actor_iql"
+            if bool(policy_checkpoint.get("hybrid_dp_chunk_actor_iql", False))
+            else "robomimic_policy"
+        ),
         "risk": str(args.risk),
+        "risk_target_outcome": str(policy.risk_checkpoint.get("args", {}).get("target_outcome", "failure")),
         "risk_best_step": int(policy.risk_checkpoint.get("best_step", -1)),
         "risk_best_quality": list(policy.risk_checkpoint.get("best_quality", [])),
         "num_candidates": args.num_candidates,
@@ -654,9 +862,13 @@ def evaluate(args) -> dict:
         "selection": args.selection,
         "softmin_temperature": args.softmin_temperature,
         "risk_threshold": args.risk_threshold,
+        "score_gap_threshold": args.score_gap_threshold,
         "action_start_index": int(policy.action_start_index),
         "execute_horizon": int(policy.execute_horizon),
         "prediction_horizon": int(policy.prediction_horizon),
+        "risk_prediction_horizon": int(policy.prediction_horizon),
+        "policy_prediction_horizon": int(policy.algo.algo_config.horizon.prediction_horizon),
+        "target_outcome": str(policy.target_outcome),
         "max_prefix_len": int(policy.max_prefix_len),
         "risk_normalization": {
             "feature_dim": int(policy.feature_mean.numel()),
@@ -670,11 +882,13 @@ def evaluate(args) -> dict:
         "n_rollouts": args.n_rollouts,
         "horizon": args.horizon,
         "average_rollout_stats": avg,
+        "candidate_diagnostics": candidate_diagnostics,
         "wilson_95_interval": wilson(successes, args.n_rollouts),
         "rollouts": stats,
     }
     path = args.output_dir / (
-        f"risk_eval_{args.score_mode}_{args.selection}_N{args.num_candidates}_seed{args.seed}.json"
+        f"risk_eval_{args.score_mode}_{args.selection}_N{args.num_candidates}"
+        f"{score_gap_suffix(args.score_gap_threshold)}_seed{args.seed}.json"
     )
     path.write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2), flush=True)
@@ -704,7 +918,9 @@ def main() -> None:
         "--score-mode",
         choices=(
             "positive_action_risk",
+            "positive_action_advantage",
             "action_delta_logodds",
+            "action_advantage_logodds",
             "action_logit",
             "action_probability",
         ),
@@ -712,11 +928,22 @@ def main() -> None:
     )
     parser.add_argument(
         "--selection",
-        choices=("argmin", "greedy", "softmin", "threshold_fallback"),
+        choices=("argmin", "argmax", "greedy", "softmin", "softmax", "threshold_fallback"),
         default="argmin",
     )
     parser.add_argument("--softmin-temperature", type=float, default=1.0)
     parser.add_argument("--risk-threshold", type=float, default=None)
+    parser.add_argument(
+        "--score-gap-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Conservative fallback for argmax/argmin selection. Candidate 0 is "
+            "kept unless the selected candidate improves the score over candidate "
+            "0 by at least this margin. For argmax improvement is best-native; "
+            "for argmin improvement is native-best."
+        ),
+    )
     parser.add_argument("--max-prefix-len", type=int, default=0)
     parser.add_argument("--dataset-path", type=Path, default=None)
     parser.add_argument("--video-dir", type=Path, default=None)

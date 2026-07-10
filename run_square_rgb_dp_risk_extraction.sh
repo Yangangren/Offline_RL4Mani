@@ -21,16 +21,16 @@ export PYTHONFAULTHANDLER=1
 PYTHON=${ROBOMIMIC_PYTHON:-/home/ryan/miniconda3/envs/robomimic_stable/bin/python}
 export ROBOMIMIC_PYTHON="$PYTHON"
 
-POLICY=${POLICY:-trained_models/square_rgb_dp/square_ph_rgb_dp_official_s1/20260629231002/last.pth}
+POLICY=${POLICY:-trained_models/square_rgb_dp_idql_visual/default_reward_dp_chunk_actor_iql/best_success_auc.pt}
 RISK=${RISK:-trained_models/square_rgb_dp_causal_prefix_risk/epoch190_two_stage_temporal_safe_anchor/best.pt}
 OUTPUT_DIR=${OUTPUT_DIR:-rollouts/square_rgb_dp/risk_extraction_eval}
 
-NUM_CANDIDATES=${NUM_CANDIDATES:-"1 4 8 16"}
-SCORE_MODES=${SCORE_MODES:-"positive_action_risk"}
-SELECTIONS=${SELECTIONS:-"argmin"}
+NUM_CANDIDATES=${NUM_CANDIDATES:-"4 8"}
+SCORE_MODES=${SCORE_MODES:-"action_probability"}
+SELECTIONS=${SELECTIONS:-"argmax"}
 SEEDS=${SEEDS:-"0 1 2 3 4"}
 N_ROLLOUTS=${N_ROLLOUTS:-50}
-ROLLOUTS_PER_CHUNK=${ROLLOUTS_PER_CHUNK:-1}
+ROLLOUTS_PER_CHUNK=${ROLLOUTS_PER_CHUNK:-10}
 HORIZON=${HORIZON:-400}
 CANDIDATE_BATCH_SIZE=${CANDIDATE_BATCH_SIZE:-16}
 EXECUTE_HORIZON=${EXECUTE_HORIZON:-8}
@@ -38,6 +38,7 @@ ACTION_START_INDEX=${ACTION_START_INDEX:--1}
 MAX_PREFIX_LEN=${MAX_PREFIX_LEN:-0}
 MAX_RETRIES=${MAX_RETRIES:-3}
 RISK_THRESHOLD=${RISK_THRESHOLD:-}
+SCORE_GAP_THRESHOLD=${SCORE_GAP_THRESHOLD:-0.02}
 FORCE=${FORCE:-0}
 
 STAGE=${1:-grid}
@@ -52,22 +53,13 @@ common_args=(
   --execute-horizon "$EXECUTE_HORIZON"
   --action-start-index "$ACTION_START_INDEX"
   --max-prefix-len "$MAX_PREFIX_LEN"
+  --score-gap-threshold "$SCORE_GAP_THRESHOLD"
 )
 if [[ -n "$RISK_THRESHOLD" ]]; then
   common_args+=(--risk-threshold "$RISK_THRESHOLD")
 fi
 
 case "$STAGE" in
-  smoke)
-    "$PYTHON" -B scripts/eval_square_rgb_dp_risk_extraction.py \
-      "${common_args[@]}" \
-      --n-rollouts "${SMOKE_ROLLOUTS:-2}" \
-      --seed "${SMOKE_SEED:-0}" \
-      --num-candidates "${SMOKE_NUM_CANDIDATES:-2}" \
-      --score-mode "${SMOKE_SCORE_MODE:-positive_action_risk}" \
-      --selection "${SMOKE_SELECTION:-argmin}"
-    ;;
-
   single)
     "$PYTHON" -B scripts/eval_square_rgb_dp_risk_extraction.py \
       "${common_args[@]}" \
@@ -100,7 +92,8 @@ case "$STAGE" in
     echo "Examples:" >&2
     echo "  $0 smoke" >&2
     echo "  N_ROLLOUTS=50 SEEDS='0 1 2 3 4' NUM_CANDIDATES='1 4 8 16' $0 grid" >&2
-    echo "  SCORE_MODES='positive_action_risk action_delta_logodds' $0 grid" >&2
+    echo "  SCORE_MODES='positive_action_risk' SELECTIONS='argmin' $0 grid" >&2
+    echo "  SCORE_MODES='action_probability positive_action_advantage action_advantage_logodds' SELECTIONS='argmax' $0 grid" >&2
     exit 2
     ;;
 esac

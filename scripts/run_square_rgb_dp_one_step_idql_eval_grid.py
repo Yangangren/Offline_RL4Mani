@@ -98,13 +98,24 @@ def aggregate_rollouts(rollouts: list[dict]) -> dict[str, float]:
     returns = np.asarray([float(x["Return"]) for x in rollouts], dtype=np.float64)
     horizons = np.asarray([float(x["Horizon"]) for x in rollouts], dtype=np.float64)
     successes = np.asarray([float(x["Success_Rate"]) for x in rollouts], dtype=np.float64)
-    return {
+    result = {
         "Num_Rollouts": int(len(rollouts)),
         "Return": float(np.mean(returns)),
         "Horizon": float(np.mean(horizons)),
         "Success_Rate": float(np.mean(successes)),
         "Num_Success": float(np.sum(successes)),
     }
+    base_keys = set(result.keys())
+    extra_keys = sorted({key for item in rollouts for key in item.keys()} - base_keys)
+    for key in extra_keys:
+        values = []
+        for item in rollouts:
+            value = item.get(key)
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
+                values.append(float(value))
+        if values:
+            result[key] = float(np.mean(values))
+    return result
 
 
 def eval_command(
@@ -331,6 +342,11 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
                     "num_rollouts": int(stats["Num_Rollouts"]),
                     "mean_return": float(stats["Return"]),
                     "mean_horizon": float(stats["Horizon"]),
+                    "q_selected_mean": stats.get("Q_Selected_Mean"),
+                    "q_margin_mean": stats.get("Q_Margin_Mean"),
+                    "q_range_mean": stats.get("Q_Range_Mean"),
+                    "selected_index_mean": stats.get("Selected_Index_Mean"),
+                    "selected_index_first_fraction": stats.get("Selected_Index_First_Fraction"),
                     "json": str(args.output_dir / f"one_step_idql_N{n}_seed{r['seed']}.json"),
                     "log": r.get("log", ""),
                 }
@@ -365,6 +381,11 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
                 "wilson_95_interval": [ci_low, ci_high],
                 "mean_return": float(stats["Return"]),
                 "mean_horizon": float(stats["Horizon"]),
+                "q_selected_mean": stats.get("Q_Selected_Mean"),
+                "q_margin_mean": stats.get("Q_Margin_Mean"),
+                "q_range_mean": stats.get("Q_Range_Mean"),
+                "selected_index_mean": stats.get("Selected_Index_Mean"),
+                "selected_index_first_fraction": stats.get("Selected_Index_First_Fraction"),
                 "seed_success_rate_mean": float(np.mean(rates)) if len(rates) else float("nan"),
                 "seed_success_rate_std": float(np.std(rates, ddof=1)) if len(rates) > 1 else 0.0,
                 "seeds": seed_runs,
@@ -406,7 +427,16 @@ def main() -> None:
     parser.add_argument("--candidate-batch-size", type=int, default=16)
     parser.add_argument("--num-inference-steps", type=int, default=100)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    parser.add_argument("--actor-source", choices=("idql_target_one_step_mlp", "idql_one_step_mlp"), default="idql_target_one_step_mlp")
+    parser.add_argument(
+        "--actor-source",
+        choices=(
+            "idql_target_one_step_mlp",
+            "idql_one_step_mlp",
+            "pretrained_dp_first_action",
+            "hybrid_dp_chunk_actor",
+        ),
+        default="idql_target_one_step_mlp",
+    )
     parser.add_argument("--critic-source", choices=("target", "online"), default="target")
     parser.add_argument("--selection", choices=("argmax", "greedy", "softmax", "advantage_softmax"), default="argmax")
     parser.add_argument("--softmax-temperature", type=float, default=1.0)

@@ -121,6 +121,7 @@ def eval_command(
     selection: str,
     softmin_temperature: float,
     risk_threshold: float | None,
+    score_gap_threshold: float,
     execute_horizon: int,
     action_start_index: int,
     max_prefix_len: int,
@@ -153,6 +154,8 @@ def eval_command(
         selection,
         "--softmin-temperature",
         str(softmin_temperature),
+        "--score-gap-threshold",
+        str(score_gap_threshold),
         "--execute-horizon",
         str(execute_horizon),
         "--action-start-index",
@@ -171,9 +174,14 @@ def result_json_path(
     selection: str,
     num_candidates: int,
     seed: int,
+    score_gap_threshold: float = 0.0,
 ) -> Path:
+    gap_suffix = ""
+    if float(score_gap_threshold) > 0.0:
+        gap = f"{float(score_gap_threshold):.6g}".replace("-", "m").replace(".", "p")
+        gap_suffix = f"_gap{gap}"
     return output_dir / (
-        f"risk_eval_{score_mode}_{selection}_N{num_candidates}_seed{seed}.json"
+        f"risk_eval_{score_mode}_{selection}_N{num_candidates}{gap_suffix}_seed{seed}.json"
     )
 
 
@@ -192,7 +200,11 @@ def run_chunk(
     chunk_dir = (
         args.output_dir
         / "chunks"
-        / f"{score_mode}_{selection}_N{num_candidates}_seed{seed}_chunk{chunk_index:03d}"
+        / (
+            f"{score_mode}_{selection}_N{num_candidates}"
+            f"{('_gap' + f'{float(args.score_gap_threshold):.6g}'.replace('-', 'm').replace('.', 'p')) if float(args.score_gap_threshold) > 0.0 else ''}"
+            f"_seed{seed}_chunk{chunk_index:03d}"
+        )
     )
     chunk_json = result_json_path(
         chunk_dir,
@@ -200,6 +212,7 @@ def run_chunk(
         selection,
         num_candidates,
         chunk_seed,
+        args.score_gap_threshold,
     )
     if chunk_json.exists() and not args.force:
         logger.line(f"[resume chunk] {chunk_json}")
@@ -209,6 +222,7 @@ def run_chunk(
     for attempt in range(1, args.max_retries + 1):
         cache_suffix = (
             f"{score_mode}_{selection}_N{num_candidates}_s{seed}_"
+            f"gap{float(args.score_gap_threshold):.6g}_"
             f"c{chunk_index}_a{attempt}_{os.getpid()}"
         )
         shutil.rmtree(f"/tmp/robomimic_risk_eval_pycache_{cache_suffix}", ignore_errors=True)
@@ -226,6 +240,7 @@ def run_chunk(
             selection=selection,
             softmin_temperature=args.softmin_temperature,
             risk_threshold=args.risk_threshold,
+            score_gap_threshold=args.score_gap_threshold,
             execute_horizon=args.execute_horizon,
             action_start_index=args.action_start_index,
             max_prefix_len=args.max_prefix_len,
@@ -281,6 +296,7 @@ def run_pair(
         selection,
         num_candidates,
         seed,
+        args.score_gap_threshold,
     )
     if final_json.exists() and not args.force:
         try:
@@ -295,7 +311,11 @@ def run_pair(
     log_path = (
         args.output_dir
         / "logs"
-        / f"risk_eval_{score_mode}_{selection}_N{num_candidates}_seed{seed}.log"
+        / (
+            f"risk_eval_{score_mode}_{selection}_N{num_candidates}"
+            f"{('_gap' + f'{float(args.score_gap_threshold):.6g}'.replace('-', 'm').replace('.', 'p')) if float(args.score_gap_threshold) > 0.0 else ''}"
+            f"_seed{seed}.log"
+        )
     )
     logger = TeeLogger(log_path, mode="w")
     logger.line(
@@ -343,11 +363,16 @@ def run_pair(
                         result_json_path(
                             args.output_dir
                             / "chunks"
-                            / f"{score_mode}_{selection}_N{num_candidates}_seed{seed}_chunk{chunk_index:03d}",
+                            / (
+                                f"{score_mode}_{selection}_N{num_candidates}"
+                                f"{('_gap' + f'{float(args.score_gap_threshold):.6g}'.replace('-', 'm').replace('.', 'p')) if float(args.score_gap_threshold) > 0.0 else ''}"
+                                f"_seed{seed}_chunk{chunk_index:03d}"
+                            ),
                             score_mode,
                             selection,
                             num_candidates,
                             chunk_seed,
+                            args.score_gap_threshold,
                         )
                     ),
                     "average_rollout_stats": chunk.get("average_rollout_stats", {}),
@@ -370,6 +395,7 @@ def run_pair(
         "selection": selection,
         "num_candidates": num_candidates,
         "risk_threshold": args.risk_threshold,
+        "score_gap_threshold": args.score_gap_threshold,
         "seed": seed,
         "n_rollouts": args.n_rollouts,
         "horizon": args.horizon,
@@ -506,6 +532,7 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
         "requested_action_start_index": args.action_start_index,
         "resolved_action_start_indices": resolved_action_start_indices,
         "risk_threshold": args.risk_threshold,
+        "score_gap_threshold": args.score_gap_threshold,
         "num_candidates": args.num_candidates,
         "score_modes": args.score_modes,
         "selections": args.selections,
@@ -536,7 +563,9 @@ def main() -> None:
         nargs="+",
         choices=(
             "positive_action_risk",
+            "positive_action_advantage",
             "action_delta_logodds",
+            "action_advantage_logodds",
             "action_logit",
             "action_probability",
         ),
@@ -545,7 +574,7 @@ def main() -> None:
     parser.add_argument(
         "--selections",
         nargs="+",
-        choices=("argmin", "greedy", "softmin", "threshold_fallback"),
+        choices=("argmin", "argmax", "greedy", "softmin", "softmax", "threshold_fallback"),
         default=["argmin"],
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
@@ -560,6 +589,7 @@ def main() -> None:
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--softmin-temperature", type=float, default=1.0)
     parser.add_argument("--risk-threshold", type=float, default=None)
+    parser.add_argument("--score-gap-threshold", type=float, default=0.0)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 

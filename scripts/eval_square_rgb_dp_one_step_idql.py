@@ -71,6 +71,26 @@ def encode_current_obs(policy, prepared_obs: dict[str, torch.Tensor]) -> torch.T
     return features
 
 
+def clone_policy_obs_encoder(policy):
+    algo = policy.policy
+    nets = algo.ema.averaged_model if algo.ema is not None else algo.nets
+    return deepcopy(nets["policy"]["obs_encoder"])
+
+
+@torch.no_grad()
+def encode_current_obs_with_encoder(policy, obs_encoder, prepared_obs: dict[str, torch.Tensor]) -> torch.Tensor:
+    algo = policy.policy
+    obs = obs_for_encoder(algo, prepared_obs)
+    features = TensorUtils.time_distributed(
+        {"obs": obs, "goal": None},
+        obs_encoder,
+        inputs_as_kwargs=True,
+    )
+    if features.ndim == 3:
+        features = features.flatten(start_dim=1)
+    return features
+
+
 class OneStepIDQLPolicy:
     def __init__(
         self,
@@ -79,6 +99,8 @@ class OneStepIDQLPolicy:
         actor: OneStepDiffusionActor,
         checkpoint: dict,
         *,
+        actor_obs_encoder=None,
+        critic_obs_encoder=None,
         num_candidates: int,
         candidate_batch_size: int,
         num_inference_steps: int,
@@ -92,6 +114,12 @@ class OneStepIDQLPolicy:
         self.critic = critic
         self.actor = actor
         self.checkpoint = checkpoint
+        self.actor_obs_encoder = actor_obs_encoder
+        self.critic_obs_encoder = critic_obs_encoder
+        if self.actor_obs_encoder is not None:
+            self.actor_obs_encoder.eval().requires_grad_(False)
+        if self.critic_obs_encoder is not None:
+            self.critic_obs_encoder.eval().requires_grad_(False)
         self.num_candidates = int(num_candidates)
         self.candidate_batch_size = int(candidate_batch_size)
         self.num_inference_steps = int(num_inference_steps)
@@ -182,8 +210,12 @@ class OneStepIDQLPolicy:
         # One-step IDQL evaluation: every call corresponds to exactly one
         # environment action and the caller immediately executes env.step(action).
         prepared_obs = self.dp_policy._prepare_observation(ob, batched_ob=False)
-        obs_feature = encode_current_obs(self.dp_policy, prepared_obs)
-        norm_actions, raw_actions = self.sample_candidates(obs_feature)
+        actor_feature = (
+            encode_current_obs_with_encoder(self.dp_policy, self.actor_obs_encoder, prepared_obs)
+            if self.actor_obs_encoder is not None
+            else encode_current_obs(self.dp_policy, prepared_obs)
+        )
+        norm_actions, raw_actions = self.sample_candidates(actor_feature)
 
         if not self.critic_used:
             # N=1 is the trained diffusion actor only. No critic is queried and
@@ -194,10 +226,15 @@ class OneStepIDQLPolicy:
             self.last_selected_index = 0
             selected_action = raw_actions[0]
         else:
-            obs_batch = obs_feature.repeat(norm_actions.shape[0], 1)
+            critic_feature = (
+                encode_current_obs_with_encoder(self.dp_policy, self.critic_obs_encoder, prepared_obs)
+                if self.critic_obs_encoder is not None
+                else actor_feature
+            )
+            obs_batch = critic_feature.repeat(norm_actions.shape[0], 1)
             critic_actions = norm_actions[:, None, :]
             q = self.critic.q_min(obs_batch, critic_actions).reshape(-1)
-            v = self.critic.value(obs_feature).reshape(())
+            v = self.critic.value(critic_feature).reshape(())
             selected = self.choose_index(q, v)
             self.last_q = q.detach().cpu().numpy()
             self.last_v = float(v.detach().cpu())
@@ -209,7 +246,7 @@ class OneStepIDQLPolicy:
 
 
 class PretrainedDPFirstActionIDQLPolicy:
-    """Paper-faithful one-step IDQL extraction using pretrained DP as actor.
+    """Ablation mode that uses pretrained DP as the action proposal actor.
 
     The actor sampler is the original RGB DiffusionPolicy checkpoint. It samples
     full DP trajectories, but this policy only exposes the first action as the
@@ -224,6 +261,7 @@ class PretrainedDPFirstActionIDQLPolicy:
         critic: ChunkIQLCritic,
         checkpoint: dict,
         *,
+        critic_obs_encoder=None,
         num_candidates: int,
         candidate_batch_size: int,
         selection: str,
@@ -234,6 +272,9 @@ class PretrainedDPFirstActionIDQLPolicy:
         self.algo = dp_policy.policy
         self.critic = critic
         self.checkpoint = checkpoint
+        self.critic_obs_encoder = critic_obs_encoder
+        if self.critic_obs_encoder is not None:
+            self.critic_obs_encoder.eval().requires_grad_(False)
         self.num_candidates = int(num_candidates)
         self.candidate_batch_size = int(candidate_batch_size)
         self.selection = selection
@@ -310,7 +351,11 @@ class PretrainedDPFirstActionIDQLPolicy:
             self.last_selected_index = 0
             selected_action = raw_actions[0]
         else:
-            obs_feature = encode_current_obs(self.dp_policy, prepared_obs)
+            obs_feature = (
+                encode_current_obs_with_encoder(self.dp_policy, self.critic_obs_encoder, prepared_obs)
+                if self.critic_obs_encoder is not None
+                else encode_current_obs(self.dp_policy, prepared_obs)
+            )
             obs_batch = obs_feature.repeat(raw_actions.shape[0], 1)
             norm_actions = self.normalize_for_critic(raw_actions)
             critic_actions = norm_actions[:, None, :]
@@ -332,23 +377,95 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
     dp_policy, _ = FileUtils.policy_from_checkpoint(
         ckpt_path=str(dp_checkpoint), device=device, verbose=False
     )
+
+    hybrid_dp_chunk_actor_iql = bool(checkpoint.get("hybrid_dp_chunk_actor_iql", False))
+    if args.actor_source == "hybrid_dp_chunk_actor":
+        if not hybrid_dp_chunk_actor_iql:
+            raise ValueError(
+                "actor_source=hybrid_dp_chunk_actor requires a checkpoint from "
+                "train_square_rgb_dp_chunk_actor_iql.py"
+            )
+        dp_policy.policy.deserialize(checkpoint["actor_model"], load_optimizers=False)
+        dp_policy.policy.set_eval()
+        checkpoint["eval_actor_key"] = "actor_model.ema" if dp_policy.policy.ema is not None else "actor_model.nets"
+    elif hybrid_dp_chunk_actor_iql and args.actor_source != "pretrained_dp_first_action":
+        raise ValueError(
+            "hybrid DP-chunk actor checkpoint should be evaluated with "
+            "actor_source=hybrid_dp_chunk_actor or pretrained_dp_first_action"
+        )
+    checkpoint_args = dict(checkpoint.get("args", {}))
+    aux_next_pred_enabled = bool(
+        checkpoint.get(
+            "aux_next_pred_enabled",
+            float(checkpoint_args.get("aux_next_pred_weight", 0.0) or 0.0) > 0.0,
+        )
+    )
+    checkpoint["aux_next_pred_enabled"] = aux_next_pred_enabled
+    checkpoint["aux_next_pred_weight"] = float(
+        checkpoint.get("aux_next_pred_weight", checkpoint_args.get("aux_next_pred_weight", 0.0)) or 0.0
+    )
+    checkpoint["aux_next_pred_mode"] = str(
+        checkpoint.get("aux_next_pred_mode", checkpoint_args.get("aux_next_pred_mode", "delta"))
+    )
+    visual_critic_idql = bool(checkpoint.get("visual_critic_idql", False) or hybrid_dp_chunk_actor_iql)
+    checkpoint["visual_critic_idql"] = visual_critic_idql
+    checkpoint["hybrid_dp_chunk_actor_iql"] = hybrid_dp_chunk_actor_iql
+    actor_obs_encoder = None
+    critic_obs_encoder = None
+    if visual_critic_idql:
+        if "actor_encoder" in checkpoint:
+            actor_obs_encoder = clone_policy_obs_encoder(dp_policy).to(device)
+            actor_obs_encoder.load_state_dict(checkpoint["actor_encoder"])
+            actor_obs_encoder.eval().requires_grad_(False)
+            checkpoint["eval_actor_encoder_key"] = "actor_encoder"
+        elif hybrid_dp_chunk_actor_iql:
+            checkpoint["eval_actor_encoder_key"] = "actor_model.ema_or_nets.policy.obs_encoder"
+
+        if args.critic_source == "target":
+            if "target_critic_encoder" in checkpoint:
+                critic_encoder_key = "target_critic_encoder"
+            else:
+                raise ValueError(
+                    "target critic encoder does not exist!"
+                )
+        else:
+            critic_encoder_key = "critic_encoder"
+
+        critic_obs_encoder = clone_policy_obs_encoder(dp_policy).to(device)
+        critic_obs_encoder.load_state_dict(checkpoint[critic_encoder_key])
+        critic_obs_encoder.eval().requires_grad_(False)
+        checkpoint["eval_critic_encoder_key"] = critic_encoder_key
     critic = ChunkIQLCritic(
         feature_dim=int(checkpoint["feature_dim"]),
         action_dim=int(checkpoint["action_dim"]),
         chunk_horizon=1,
-        hidden_dims=tuple(int(x) for x in checkpoint["args"]["critic_hidden_dims"]),
-        dropout=float(checkpoint["args"].get("critic_dropout", 0.0)),
+        hidden_dims=tuple(int(x) for x in checkpoint_args["critic_hidden_dims"]),
+        dropout=float(checkpoint_args.get("critic_dropout", 0.0)),
+        aux_next_pred=aux_next_pred_enabled,
     ).to(device)
-    critic_key = "target_critic" if args.critic_source == "target" and "target_critic" in checkpoint else "critic"
+
+    if args.critic_source == "target":
+        if "target_critic" in checkpoint:
+            critic_key = "target_critic"
+        else:
+            raise ValueError(
+                "target critic does not exist!"
+            )
+    else:
+        critic_key = "critic"
+
     critic.load_state_dict(checkpoint[critic_key])
     critic.eval().requires_grad_(False)
     checkpoint["eval_critic_key"] = critic_key
 
     if args.actor_source == "pretrained_dp_first_action":
+        checkpoint["eval_actor_key"] = "pretrained_dp_checkpoint.ema_or_nets"
+    if args.actor_source in ("pretrained_dp_first_action", "hybrid_dp_chunk_actor"):
         return PretrainedDPFirstActionIDQLPolicy(
             dp_policy,
             critic,
             checkpoint,
+            critic_obs_encoder=critic_obs_encoder,
             num_candidates=args.num_candidates,
             candidate_batch_size=args.candidate_batch_size,
             selection=args.selection,
@@ -372,6 +489,8 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
         critic,
         actor,
         checkpoint,
+        actor_obs_encoder=actor_obs_encoder,
+        critic_obs_encoder=critic_obs_encoder,
         num_candidates=args.num_candidates,
         candidate_batch_size=args.candidate_batch_size,
         num_inference_steps=args.num_inference_steps,
@@ -390,7 +509,21 @@ def rollout(policy, env, horizon: int, return_obs: bool = False, video_writer=No
     obs = env.reset_to(state_dict)
     total_reward = 0.0
     success = False
-    traj = dict(actions=[], rewards=[], dones=[], states=[], q_selected=[], q_mean=[], q_max=[], q_min=[], v=[], initial_state_dict=state_dict)
+    traj = dict(
+        actions=[],
+        rewards=[],
+        dones=[],
+        states=[],
+        q_selected=[],
+        q_mean=[],
+        q_max=[],
+        q_min=[],
+        q_margin=[],
+        q_range=[],
+        v=[],
+        selected_index=[],
+        initial_state_dict=state_dict,
+    )
     if return_obs:
         traj.update(dict(obs=[], next_obs=[]))
     step_i = -1
@@ -416,13 +549,23 @@ def rollout(policy, env, horizon: int, return_obs: bool = False, video_writer=No
                 traj["q_mean"].append(np.nan)
                 traj["q_max"].append(np.nan)
                 traj["q_min"].append(np.nan)
+                traj["q_margin"].append(np.nan)
+                traj["q_range"].append(np.nan)
                 traj["v"].append(np.nan)
+                traj["selected_index"].append(-1)
             else:
-                traj["q_selected"].append(float(q[selected]))
-                traj["q_mean"].append(float(np.mean(q)))
-                traj["q_max"].append(float(np.max(q)))
-                traj["q_min"].append(float(np.min(q)))
+                q_selected = float(q[selected])
+                q_mean = float(np.mean(q))
+                q_max = float(np.max(q))
+                q_min = float(np.min(q))
+                traj["q_selected"].append(q_selected)
+                traj["q_mean"].append(q_mean)
+                traj["q_max"].append(q_max)
+                traj["q_min"].append(q_min)
+                traj["q_margin"].append(q_selected - q_mean)
+                traj["q_range"].append(q_max - q_min)
                 traj["v"].append(float(policy.last_v))
+                traj["selected_index"].append(int(selected))
             if return_obs:
                 traj["obs"].append(obs)
                 traj["next_obs"].append(next_obs)
@@ -437,19 +580,49 @@ def rollout(policy, env, horizon: int, return_obs: bool = False, video_writer=No
         if key == "initial_state_dict":
             continue
         traj[key] = np.asarray(traj[key])
+    selected_index = traj["selected_index"]
+    valid_selection = selected_index >= 0
+    if np.any(valid_selection):
+        for src_key, stat_key in (
+            ("q_selected", "Q_Selected_Mean"),
+            ("q_mean", "Q_Mean_Mean"),
+            ("q_max", "Q_Max_Mean"),
+            ("q_min", "Q_Min_Mean"),
+            ("q_margin", "Q_Margin_Mean"),
+            ("q_range", "Q_Range_Mean"),
+            ("v", "V_Mean"),
+        ):
+            values = np.asarray(traj[src_key], dtype=np.float64)
+            finite = np.isfinite(values)
+            if np.any(finite):
+                stats[stat_key] = float(np.mean(values[finite]))
+        valid_indices = selected_index[valid_selection].astype(np.float64)
+        stats["Selected_Index_Mean"] = float(np.mean(valid_indices))
+        stats["Selected_Index_First_Fraction"] = float(np.mean(valid_indices == 0.0))
     return stats, traj
 
 
 def aggregate(stats: list[dict]) -> dict:
     successes = float(sum(x["Success_Rate"] for x in stats))
     n = len(stats)
-    return {
+    result = {
         "Num_Rollouts": n,
         "Return": float(np.mean([x["Return"] for x in stats])) if n else float("nan"),
         "Horizon": float(np.mean([x["Horizon"] for x in stats])) if n else float("nan"),
         "Success_Rate": successes / max(n, 1),
         "Num_Success": successes,
     }
+    base_keys = set(result.keys())
+    extra_keys = sorted({key for item in stats for key in item.keys()} - base_keys)
+    for key in extra_keys:
+        values = []
+        for item in stats:
+            value = item.get(key)
+            if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
+                values.append(float(value))
+        if values:
+            result[key] = float(np.mean(values))
+    return result
 
 
 def wilson(successes: int, total: int, z: float = 1.959963984540054):
@@ -465,6 +638,9 @@ def wilson(successes: int, total: int, z: float = 1.959963984540054):
 def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
     avg = aggregate(stats)
     successes = int(round(avg["Num_Success"]))
+    standard_idql_actor = args.actor_source in ("idql_one_step_mlp", "idql_target_one_step_mlp")
+    pretrained_dp_actor = args.actor_source == "pretrained_dp_first_action"
+    hybrid_dp_chunk_actor = args.actor_source == "hybrid_dp_chunk_actor"
     return {
         "idql_checkpoint": str(args.idql_checkpoint),
         "pretrained_dp_checkpoint": str(policy.checkpoint["pretrained_dp_checkpoint"]),
@@ -473,15 +649,28 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         "eval_actor_key": policy.checkpoint.get("eval_actor_key", "actor"),
         "critic_source": args.critic_source,
         "eval_critic_key": policy.checkpoint.get("eval_critic_key", "critic"),
-        "actor_uses_pretrained_dp_weights": bool(args.actor_source == "pretrained_dp_first_action"),
-        "standard_idql_trained_actor": bool(args.actor_source in ("idql_one_step_mlp", "idql_target_one_step_mlp")),
+        "visual_critic_idql": bool(policy.checkpoint.get("visual_critic_idql", False)),
+        "hybrid_dp_chunk_actor_iql": bool(policy.checkpoint.get("hybrid_dp_chunk_actor_iql", False)),
+        "eval_actor_encoder_key": policy.checkpoint.get("eval_actor_encoder_key"),
+        "eval_critic_encoder_key": policy.checkpoint.get("eval_critic_encoder_key"),
+        "aux_next_pred_enabled": bool(policy.checkpoint.get("aux_next_pred_enabled", False)),
+        "aux_next_pred_weight": float(policy.checkpoint.get("aux_next_pred_weight", 0.0) or 0.0),
+        "aux_next_pred_mode": str(policy.checkpoint.get("aux_next_pred_mode", "delta")),
+        "actor_uses_pretrained_dp_weights": bool(pretrained_dp_actor or hybrid_dp_chunk_actor),
+        "standard_idql_trained_actor": bool(standard_idql_actor),
+        "dp_chunk_actor_bc_trained": bool(hybrid_dp_chunk_actor),
         "pretrained_checkpoint_used_for_encoder": True,
         "num_candidates": args.num_candidates,
         "num_inference_steps": args.num_inference_steps,
         "selection": args.selection,
         "clip_actions": args.clip_actions,
         "diffusion_clip_sample": args.diffusion_clip_sample,
-        "paper_faithful_one_step_idql": True,
+        "paper_faithful_one_step_idql": bool(standard_idql_actor),
+        "pretrained_dp_first_action_baseline": bool(pretrained_dp_actor and args.num_candidates == 1),
+        "pretrained_dp_proposal_idql_critic_rerank": bool(pretrained_dp_actor and args.num_candidates > 1),
+        "hybrid_dp_chunk_actor_actor_only": bool(hybrid_dp_chunk_actor and args.num_candidates == 1),
+        "hybrid_dp_chunk_actor_critic_rerank": bool(hybrid_dp_chunk_actor and args.num_candidates > 1),
+        "actor_proposal_horizon": int(policy.checkpoint.get("actor_action_horizon", 1)),
         "execution_horizon": 1,
         "replan_every_env_step": True,
         "critic_used_for_action_selection": bool(args.num_candidates > 1),
@@ -553,7 +742,20 @@ def evaluate(args) -> dict:
         )
         if data_group is not None:
             ep = data_group.create_group(f"demo_{i}")
-            for key in ("actions", "rewards", "dones", "states", "q_selected", "q_mean", "q_max", "q_min", "v"):
+            for key in (
+                "actions",
+                "rewards",
+                "dones",
+                "states",
+                "q_selected",
+                "q_mean",
+                "q_max",
+                "q_min",
+                "q_margin",
+                "q_range",
+                "v",
+                "selected_index",
+            ):
                 ep.create_dataset(key, data=traj[key])
             if "model" in traj["initial_state_dict"]:
                 ep.attrs["model_file"] = traj["initial_state_dict"]["model"]
@@ -580,7 +782,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--actor-source",
-        choices=("idql_target_one_step_mlp", "idql_one_step_mlp", "pretrained_dp_first_action"),
+        choices=(
+            "idql_target_one_step_mlp",
+            "idql_one_step_mlp",
+            "pretrained_dp_first_action",
+            "hybrid_dp_chunk_actor",
+        ),
         default="idql_target_one_step_mlp",
     )
     parser.add_argument("--critic-source", choices=("target", "online"), default="target")

@@ -32,11 +32,16 @@ SIGNED_RISK_REWARD_FEATURES=${SIGNED_RISK_REWARD_FEATURES:-rollouts/square_rgb_d
 FAILURE_ONLY_SIGNED_RISK_REWARD_FEATURES=${FAILURE_ONLY_SIGNED_RISK_REWARD_FEATURES:-rollouts/square_rgb_dp/epoch190_collection/idql/failure_only_signed_risk_lambda0p1_q95_one_step_features.npz}
 FAILURE_ONLY_POTENTIAL_RISK_REWARD_FEATURES=${FAILURE_ONLY_POTENTIAL_RISK_REWARD_FEATURES:-rollouts/square_rgb_dp/epoch190_collection/idql/failure_only_potential_risk_lambda0p1_one_step_features.npz}
 OUTPUT_DIR=${OUTPUT_DIR:-trained_models/square_rgb_dp_idql/default_reward_one_step_idql_paper_faithful}
-IDQL_CHECKPOINT=${IDQL_CHECKPOINT:-$OUTPUT_DIR/best_success_auc.pt}
+VISUAL_CRITIC_OUTPUT_DIR=${VISUAL_CRITIC_OUTPUT_DIR:-trained_models/square_rgb_dp_idql_visual/default_idql_visual_critic}
+CHUNK_ACTOR_IQL_OUTPUT_DIR=${CHUNK_ACTOR_IQL_OUTPUT_DIR:-trained_models/square_rgb_dp_idql_visual/default_reward_dp_chunk_actor_iql}
+CHUNK_ACTOR_IDQL_CHECKPOINT=${CHUNK_ACTOR_IDQL_CHECKPOINT:-$CHUNK_ACTOR_IQL_OUTPUT_DIR/best_success_auc.pt}
+IDQL_CHECKPOINT=${IDQL_CHECKPOINT:-$VISUAL_CRITIC_OUTPUT_DIR/best_success_auc.pt}
+SUCCESS_DATASET=${SUCCESS_DATASET:-$ROLLOUT_DATASET}
+FAILURE_DATASET=${FAILURE_DATASET:-$ROLLOUT_DATASET}
 EVAL_OUTPUT=${EVAL_OUTPUT:-rollouts/square_rgb_dp/one_step_idql_eval}
 ACTOR_SOURCE=${ACTOR_SOURCE:-idql_target_one_step_mlp}
-CRITIC_SOURCE=${CRITIC_SOURCE:-target}
-EVAL_NUM_CANDIDATES_VALUE=${EVAL_NUM_CANDIDATES:-"1 4 8 16 32 64"}
+CRITIC_SOURCE=${CRITIC_SOURCE:-online}
+EVAL_NUM_CANDIDATES_VALUE=${EVAL_NUM_CANDIDATES:-"1"}
 read -r -a EVAL_NUM_CANDIDATE_ARGS <<< "$EVAL_NUM_CANDIDATES_VALUE"
 EVAL_SEEDS_VALUE=${EVAL_SEEDS:-"0 1 2"}
 read -r -a EVAL_SEED_ARGS <<< "$EVAL_SEEDS_VALUE"
@@ -76,6 +81,34 @@ fi
 CLIP_SAMPLE_ARGS=(--clip-sample)
 if [[ "${CLIP_SAMPLE:-1}" == "0" ]]; then
   CLIP_SAMPLE_ARGS=(--no-clip-sample)
+fi
+AUX_NEXT_PRED_ARGS=(
+  --aux-next-pred-weight "${AUX_NEXT_PRED_WEIGHT:-0.0}"
+  --aux-next-pred-mode "${AUX_NEXT_PRED_MODE:-delta}"
+)
+TRAIN_ACTOR_ENCODER_ARGS=(--no-train-actor-encoder)
+if [[ "${TRAIN_ACTOR_ENCODER:-0}" == "1" ]]; then
+  TRAIN_ACTOR_ENCODER_ARGS=(--train-actor-encoder)
+fi
+PIN_MEMORY_ARGS=(--pin-memory)
+if [[ "${PIN_MEMORY:-1}" == "0" ]]; then
+  PIN_MEMORY_ARGS=(--no-pin-memory)
+fi
+PERSISTENT_WORKERS_ARGS=(--persistent-workers)
+if [[ "${PERSISTENT_WORKERS:-1}" == "0" ]]; then
+  PERSISTENT_WORKERS_ARGS=(--no-persistent-workers)
+fi
+ACTOR_NORMALIZE_WEIGHTS_ARGS=(--actor-normalize-weights-by-ds-size)
+if [[ "${ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE:-1}" == "0" ]]; then
+  ACTOR_NORMALIZE_WEIGHTS_ARGS=(--no-actor-normalize-weights-by-ds-size)
+fi
+CRITIC_NORMALIZE_WEIGHTS_ARGS=(--no-critic-normalize-weights-by-source)
+if [[ "${CRITIC_NORMALIZE_WEIGHTS_BY_SOURCE:-0}" == "1" ]]; then
+  CRITIC_NORMALIZE_WEIGHTS_ARGS=(--critic-normalize-weights-by-source)
+fi
+ACTOR_LR_SCHEDULER_ARGS=(--actor-disable-lr-scheduler)
+if [[ "${ACTOR_DISABLE_LR_SCHEDULER:-1}" == "0" ]]; then
+  ACTOR_LR_SCHEDULER_ARGS=(--no-actor-disable-lr-scheduler)
 fi
 DIFFUSION_CLIP_SAMPLE_ARGS=(--diffusion-clip-sample)
 if [[ "${DIFFUSION_CLIP_SAMPLE:-1}" == "0" ]]; then
@@ -206,6 +239,7 @@ case "$STAGE" in
       --num-diffusion-steps "${NUM_DIFFUSION_STEPS:-100}" \
       "${NORMALIZE_ACTION_ARGS[@]}" \
       "${CLIP_SAMPLE_ARGS[@]}" \
+      "${AUX_NEXT_PRED_ARGS[@]}" \
       "${ROLLOUT_EVAL_COMMON_ARGS[@]}"
     ;;
 
@@ -242,6 +276,7 @@ case "$STAGE" in
         --num-diffusion-steps "${NUM_DIFFUSION_STEPS:-100}" \
         "${NORMALIZE_ACTION_ARGS[@]}" \
         "${CLIP_SAMPLE_ARGS[@]}" \
+        "${AUX_NEXT_PRED_ARGS[@]}" \
         "${ROLLOUT_EVAL_COMMON_ARGS[@]}"
       status=$?
       set -e
@@ -284,6 +319,7 @@ case "$STAGE" in
       --num-diffusion-steps "${NUM_DIFFUSION_STEPS:-100}" \
       "${NORMALIZE_ACTION_ARGS[@]}" \
       "${CLIP_SAMPLE_ARGS[@]}" \
+      "${AUX_NEXT_PRED_ARGS[@]}" \
       "${ROLLOUT_EVAL_COMMON_ARGS[@]}"
     ;;
 
@@ -298,7 +334,318 @@ case "$STAGE" in
       --log-every 1 \
       --critic-hidden-dims 64 64 \
       --actor-hidden-dims 64 64 \
-      --num-diffusion-steps 10
+      --num-diffusion-steps 10 \
+      "${AUX_NEXT_PRED_ARGS[@]}"
+    ;;
+
+  train_visual_critic)
+    "$PYTHON" -B scripts/train_square_rgb_dp_one_step_idql_visual_critic.py \
+      --checkpoint "$DP_CHECKPOINT" \
+      --feature-index "$FEATURES" \
+      --demo-dataset "$DEMO_DATASET" \
+      --rollout-dataset "$ROLLOUT_DATASET" \
+      --output-dir "$VISUAL_CRITIC_OUTPUT_DIR" \
+      "${RESUME_ARGS[@]}" \
+      --device cuda \
+      --total-steps "${TOTAL_STEPS:-50000}" \
+      --batch-size "${BATCH_SIZE:-128}" \
+      --eval-batch-size "${EVAL_BATCH_SIZE:-512}" \
+      --max-eval-batches "${MAX_EVAL_BATCHES:-0}" \
+      --num-workers "${NUM_WORKERS:-4}" \
+      --eval-num-workers "${EVAL_NUM_WORKERS:-2}" \
+      --prefetch-factor "${PREFETCH_FACTOR:-2}" \
+      "${PIN_MEMORY_ARGS[@]}" \
+      "${PERSISTENT_WORKERS_ARGS[@]}" \
+      --eval-every "${EVAL_EVERY:-1000}" \
+      --log-every "${LOG_EVERY:-100}" \
+      --expectile "${EXPECTILE:-0.7}" \
+      --target-tau "${TARGET_TAU:-0.005}" \
+      --actor-target-tau "${ACTOR_TARGET_TAU:-0.001}" \
+      --critic-lr "${CRITIC_LR:-3e-4}" \
+      --critic-encoder-lr "${CRITIC_ENCODER_LR:-1e-5}" \
+      --actor-lr "${ACTOR_LR:-3e-4}" \
+      --actor-encoder-lr "${ACTOR_ENCODER_LR:-1e-5}" \
+      --reward-scale "${REWARD_SCALE:-1.0}" \
+      --num-diffusion-steps "${NUM_DIFFUSION_STEPS:-100}" \
+      "${NORMALIZE_ACTION_ARGS[@]}" \
+      "${CLIP_SAMPLE_ARGS[@]}" \
+      "${AUX_NEXT_PRED_ARGS[@]}" \
+      "${TRAIN_ACTOR_ENCODER_ARGS[@]}"
+    ;;
+
+  train_visual_critic_resilient)
+    max_restarts="${MAX_RESTARTS:-20}"
+    retry_sleep="${RETRY_SLEEP:-5}"
+    attempt=1
+    resume_for_attempt="$RESUME_POINT_VALUE"
+    if [[ -z "$resume_for_attempt" && -f "$VISUAL_CRITIC_OUTPUT_DIR/latest.pt" ]]; then
+      resume_for_attempt="$VISUAL_CRITIC_OUTPUT_DIR/latest.pt"
+    fi
+    while (( attempt <= max_restarts )); do
+      attempt_resume_args=()
+      if [[ -n "$resume_for_attempt" ]]; then
+        attempt_resume_args=(--resume-checkpoint "$resume_for_attempt")
+      fi
+      echo "[train_visual_critic_resilient attempt=$attempt/$max_restarts] resume=${resume_for_attempt:-none}" >&2
+      set +e
+      "$PYTHON" -B scripts/train_square_rgb_dp_one_step_idql_visual_critic.py \
+        --checkpoint "$DP_CHECKPOINT" \
+        --feature-index "$FEATURES" \
+        --demo-dataset "$DEMO_DATASET" \
+        --rollout-dataset "$ROLLOUT_DATASET" \
+        --output-dir "$VISUAL_CRITIC_OUTPUT_DIR" \
+        "${attempt_resume_args[@]}" \
+        --device cuda \
+        --total-steps "${TOTAL_STEPS:-50000}" \
+        --batch-size "${BATCH_SIZE:-128}" \
+        --eval-batch-size "${EVAL_BATCH_SIZE:-512}" \
+        --max-eval-batches "${MAX_EVAL_BATCHES:-0}" \
+        --num-workers "${NUM_WORKERS:-4}" \
+        --eval-num-workers "${EVAL_NUM_WORKERS:-2}" \
+        --prefetch-factor "${PREFETCH_FACTOR:-2}" \
+        "${PIN_MEMORY_ARGS[@]}" \
+        "${PERSISTENT_WORKERS_ARGS[@]}" \
+        --eval-every "${EVAL_EVERY:-1000}" \
+        --log-every "${LOG_EVERY:-100}" \
+        --expectile "${EXPECTILE:-0.7}" \
+        --target-tau "${TARGET_TAU:-0.005}" \
+        --actor-target-tau "${ACTOR_TARGET_TAU:-0.001}" \
+        --critic-lr "${CRITIC_LR:-3e-4}" \
+        --critic-encoder-lr "${CRITIC_ENCODER_LR:-1e-5}" \
+        --actor-lr "${ACTOR_LR:-3e-4}" \
+        --actor-encoder-lr "${ACTOR_ENCODER_LR:-1e-5}" \
+        --reward-scale "${REWARD_SCALE:-1.0}" \
+        --num-diffusion-steps "${NUM_DIFFUSION_STEPS:-100}" \
+        "${NORMALIZE_ACTION_ARGS[@]}" \
+        "${CLIP_SAMPLE_ARGS[@]}" \
+        "${AUX_NEXT_PRED_ARGS[@]}" \
+        "${TRAIN_ACTOR_ENCODER_ARGS[@]}"
+      status=$?
+      set -e
+      if [[ "$status" -eq 0 ]]; then
+        exit 0
+      fi
+      echo "[train_visual_critic_resilient attempt=$attempt] training exited with status $status" >&2
+      if [[ -f "$VISUAL_CRITIC_OUTPUT_DIR/last.pt" ]]; then
+        echo "[train_visual_critic_resilient] last.pt exists; treating training as complete" >&2
+        exit 0
+      fi
+      if [[ ! -f "$VISUAL_CRITIC_OUTPUT_DIR/latest.pt" ]]; then
+        echo "[train_visual_critic_resilient] no latest.pt available to resume from" >&2
+        exit "$status"
+      fi
+      resume_for_attempt="$VISUAL_CRITIC_OUTPUT_DIR/latest.pt"
+      attempt=$((attempt + 1))
+      sleep "$retry_sleep"
+    done
+    echo "[train_visual_critic_resilient] exhausted $max_restarts attempts" >&2
+    exit 1
+    ;;
+
+  smoke_train_visual_critic)
+    "$PYTHON" -B scripts/train_square_rgb_dp_one_step_idql_visual_critic.py \
+      --checkpoint "$DP_CHECKPOINT" \
+      --feature-index "$FEATURES" \
+      --demo-dataset "$DEMO_DATASET" \
+      --rollout-dataset "$ROLLOUT_DATASET" \
+      --output-dir "${SMOKE_OUTPUT_DIR:-/tmp/one_step_idql_visual_critic_smoke}" \
+      --device "${SMOKE_DEVICE:-cpu}" \
+      --total-steps 2 \
+      --batch-size 4 \
+      --eval-batch-size 4 \
+      --max-eval-batches 1 \
+      --num-workers "${SMOKE_NUM_WORKERS:-0}" \
+      --eval-num-workers "${SMOKE_EVAL_NUM_WORKERS:-0}" \
+      --prefetch-factor "${SMOKE_PREFETCH_FACTOR:-2}" \
+      --no-pin-memory \
+      --no-persistent-workers \
+      --eval-every 1 \
+      --log-every 1 \
+      --critic-hidden-dims 64 64 \
+      --actor-hidden-dims 64 64 \
+      --num-diffusion-steps 10 \
+      --no-tensorboard \
+      "${AUX_NEXT_PRED_ARGS[@]}" \
+      "${TRAIN_ACTOR_ENCODER_ARGS[@]}"
+    ;;
+
+  train_chunk_actor_iql)
+    "$PYTHON" -B scripts/train_square_rgb_dp_chunk_actor_iql.py \
+      --checkpoint "$DP_CHECKPOINT" \
+      --feature-index "$FEATURES" \
+      --demo-dataset "$DEMO_DATASET" \
+      --rollout-dataset "$ROLLOUT_DATASET" \
+      --success-dataset "$SUCCESS_DATASET" \
+      --failure-dataset "$FAILURE_DATASET" \
+      --output-dir "$CHUNK_ACTOR_IQL_OUTPUT_DIR" \
+      "${RESUME_ARGS[@]}" \
+      --device cuda \
+      --total-steps "${TOTAL_STEPS:-50000}" \
+      --batch-size "${BATCH_SIZE:-128}" \
+      --actor-batch-size "${ACTOR_BATCH_SIZE:-100}" \
+      --eval-batch-size "${EVAL_BATCH_SIZE:-512}" \
+      --max-eval-batches "${MAX_EVAL_BATCHES:-0}" \
+      --num-workers "${NUM_WORKERS:-4}" \
+      --actor-num-workers "${ACTOR_NUM_WORKERS:-0}" \
+      --eval-num-workers "${EVAL_NUM_WORKERS:-2}" \
+      --prefetch-factor "${PREFETCH_FACTOR:-2}" \
+      "${PIN_MEMORY_ARGS[@]}" \
+      "${PERSISTENT_WORKERS_ARGS[@]}" \
+      --eval-every "${EVAL_EVERY:-1000}" \
+      --log-every "${LOG_EVERY:-100}" \
+      --actor-hdf5-cache-mode "${ACTOR_HDF5_CACHE_MODE:-low_dim}" \
+      --demo-filter-key "${DEMO_FILTER_KEY:-}" \
+      --success-filter-key "${SUCCESS_FILTER_KEY:-success}" \
+      --failure-filter-key "${FAILURE_FILTER_KEY:-failure}" \
+      --actor-demo-weight "${ACTOR_DEMO_WEIGHT:-1.0}" \
+      --actor-success-weight "${ACTOR_SUCCESS_WEIGHT:-1.0}" \
+      --actor-failure-weight "${ACTOR_FAILURE_WEIGHT:-0.0}" \
+      "${ACTOR_NORMALIZE_WEIGHTS_ARGS[@]}" \
+      --critic-demo-weight "${CRITIC_DEMO_WEIGHT:-1.0}" \
+      --critic-success-weight "${CRITIC_SUCCESS_WEIGHT:-1.0}" \
+      --critic-failure-weight "${CRITIC_FAILURE_WEIGHT:-1.0}" \
+      "${CRITIC_NORMALIZE_WEIGHTS_ARGS[@]}" \
+      --expectile "${EXPECTILE:-0.7}" \
+      --target-tau "${TARGET_TAU:-0.005}" \
+      --critic-lr "${CRITIC_LR:-3e-4}" \
+      --critic-encoder-lr "${CRITIC_ENCODER_LR:-1e-5}" \
+      --actor-lr "${ACTOR_LR:-1e-4}" \
+      "${ACTOR_LR_SCHEDULER_ARGS[@]}" \
+      --reward-scale "${REWARD_SCALE:-1.0}" \
+      "${NORMALIZE_ACTION_ARGS[@]}" \
+      "${AUX_NEXT_PRED_ARGS[@]}"
+    ;;
+
+  train_chunk_actor_iql_resilient)
+    max_restarts="${MAX_RESTARTS:-20}"
+    retry_sleep="${RETRY_SLEEP:-5}"
+    attempt=1
+    resume_for_attempt="$RESUME_POINT_VALUE"
+    if [[ -z "$resume_for_attempt" && -f "$CHUNK_ACTOR_IQL_OUTPUT_DIR/latest.pt" ]]; then
+      resume_for_attempt="$CHUNK_ACTOR_IQL_OUTPUT_DIR/latest.pt"
+    fi
+    while (( attempt <= max_restarts )); do
+      attempt_resume_args=()
+      if [[ -n "$resume_for_attempt" ]]; then
+        attempt_resume_args=(--resume-checkpoint "$resume_for_attempt")
+      fi
+      echo "[train_chunk_actor_iql_resilient attempt=$attempt/$max_restarts] resume=${resume_for_attempt:-none}" >&2
+      set +e
+      "$PYTHON" -B scripts/train_square_rgb_dp_chunk_actor_iql.py \
+        --checkpoint "$DP_CHECKPOINT" \
+        --feature-index "$FEATURES" \
+        --demo-dataset "$DEMO_DATASET" \
+        --rollout-dataset "$ROLLOUT_DATASET" \
+        --success-dataset "$SUCCESS_DATASET" \
+        --failure-dataset "$FAILURE_DATASET" \
+        --output-dir "$CHUNK_ACTOR_IQL_OUTPUT_DIR" \
+        "${attempt_resume_args[@]}" \
+        --device cuda \
+        --total-steps "${TOTAL_STEPS:-50000}" \
+        --batch-size "${BATCH_SIZE:-128}" \
+        --actor-batch-size "${ACTOR_BATCH_SIZE:-100}" \
+        --eval-batch-size "${EVAL_BATCH_SIZE:-512}" \
+        --max-eval-batches "${MAX_EVAL_BATCHES:-0}" \
+        --num-workers "${NUM_WORKERS:-4}" \
+        --actor-num-workers "${ACTOR_NUM_WORKERS:-0}" \
+        --eval-num-workers "${EVAL_NUM_WORKERS:-2}" \
+        --prefetch-factor "${PREFETCH_FACTOR:-2}" \
+        "${PIN_MEMORY_ARGS[@]}" \
+        "${PERSISTENT_WORKERS_ARGS[@]}" \
+        --eval-every "${EVAL_EVERY:-1000}" \
+        --log-every "${LOG_EVERY:-100}" \
+        --actor-hdf5-cache-mode "${ACTOR_HDF5_CACHE_MODE:-low_dim}" \
+        --demo-filter-key "${DEMO_FILTER_KEY:-}" \
+        --success-filter-key "${SUCCESS_FILTER_KEY:-success}" \
+        --failure-filter-key "${FAILURE_FILTER_KEY:-failure}" \
+        --actor-demo-weight "${ACTOR_DEMO_WEIGHT:-1.0}" \
+        --actor-success-weight "${ACTOR_SUCCESS_WEIGHT:-1.0}" \
+        --actor-failure-weight "${ACTOR_FAILURE_WEIGHT:-0.0}" \
+        "${ACTOR_NORMALIZE_WEIGHTS_ARGS[@]}" \
+        --critic-demo-weight "${CRITIC_DEMO_WEIGHT:-1.0}" \
+        --critic-success-weight "${CRITIC_SUCCESS_WEIGHT:-1.0}" \
+        --critic-failure-weight "${CRITIC_FAILURE_WEIGHT:-1.0}" \
+        "${CRITIC_NORMALIZE_WEIGHTS_ARGS[@]}" \
+        --expectile "${EXPECTILE:-0.7}" \
+        --target-tau "${TARGET_TAU:-0.005}" \
+        --critic-lr "${CRITIC_LR:-3e-4}" \
+        --critic-encoder-lr "${CRITIC_ENCODER_LR:-1e-5}" \
+        --actor-lr "${ACTOR_LR:-1e-4}" \
+        --reward-scale "${REWARD_SCALE:-1.0}" \
+        "${NORMALIZE_ACTION_ARGS[@]}" \
+        "${AUX_NEXT_PRED_ARGS[@]}"
+      status=$?
+      set -e
+      if [[ "$status" -eq 0 ]]; then
+        exit 0
+      fi
+      echo "[train_chunk_actor_iql_resilient attempt=$attempt] training exited with status $status" >&2
+      if [[ -f "$CHUNK_ACTOR_IQL_OUTPUT_DIR/last.pt" ]]; then
+        echo "[train_chunk_actor_iql_resilient] last.pt exists; treating training as complete" >&2
+        exit 0
+      fi
+      if [[ ! -f "$CHUNK_ACTOR_IQL_OUTPUT_DIR/latest.pt" ]]; then
+        echo "[train_chunk_actor_iql_resilient] no latest.pt available to resume from" >&2
+        exit "$status"
+      fi
+      resume_for_attempt="$CHUNK_ACTOR_IQL_OUTPUT_DIR/latest.pt"
+      attempt=$((attempt + 1))
+      sleep "$retry_sleep"
+    done
+    echo "[train_chunk_actor_iql_resilient] exhausted $max_restarts attempts" >&2
+    exit 1
+    ;;
+
+  smoke_train_chunk_actor_iql)
+    "$PYTHON" -B scripts/train_square_rgb_dp_chunk_actor_iql.py \
+      --checkpoint "$DP_CHECKPOINT" \
+      --feature-index "$FEATURES" \
+      --demo-dataset "$DEMO_DATASET" \
+      --rollout-dataset "$ROLLOUT_DATASET" \
+      --success-dataset "$SUCCESS_DATASET" \
+      --failure-dataset "$FAILURE_DATASET" \
+      --output-dir "${SMOKE_OUTPUT_DIR:-/tmp/dp_chunk_actor_iql_smoke}" \
+      --device "${SMOKE_DEVICE:-cpu}" \
+      --total-steps 2 \
+      --batch-size 2 \
+      --actor-batch-size 2 \
+      --eval-batch-size 2 \
+      --max-eval-batches 1 \
+      --num-workers "${SMOKE_NUM_WORKERS:-0}" \
+      --actor-num-workers "${SMOKE_ACTOR_NUM_WORKERS:-0}" \
+      --eval-num-workers "${SMOKE_EVAL_NUM_WORKERS:-0}" \
+      --no-pin-memory \
+      --no-persistent-workers \
+      --eval-every 1 \
+      --log-every 1 \
+      --critic-hidden-dims 64 64 \
+      "${ACTOR_LR_SCHEDULER_ARGS[@]}" \
+      --actor-demo-weight "${ACTOR_DEMO_WEIGHT:-1.0}" \
+      --actor-success-weight "${ACTOR_SUCCESS_WEIGHT:-1.0}" \
+      --actor-failure-weight "${ACTOR_FAILURE_WEIGHT:-1.0}" \
+      --critic-demo-weight "${CRITIC_DEMO_WEIGHT:-1.0}" \
+      --critic-success-weight "${CRITIC_SUCCESS_WEIGHT:-1.0}" \
+      --critic-failure-weight "${CRITIC_FAILURE_WEIGHT:-1.0}" \
+      --no-tensorboard \
+      "${NORMALIZE_ACTION_ARGS[@]}" \
+      "${AUX_NEXT_PRED_ARGS[@]}"
+    ;;
+
+  eval_chunk_actor_iql)
+    "$PYTHON" -B scripts/eval_square_rgb_dp_one_step_idql.py \
+      --idql-checkpoint "$CHUNK_ACTOR_IDQL_CHECKPOINT" \
+      --output-dir "$EVAL_OUTPUT" \
+      --device cuda \
+      --actor-source hybrid_dp_chunk_actor \
+      --critic-source "$CRITIC_SOURCE" \
+      --n-rollouts "${N_ROLLOUTS:-50}" \
+      --horizon "${HORIZON:-400}" \
+      --seed "${SEED:-0}" \
+      --num-candidates "${N:-16}" \
+      --candidate-batch-size "${CANDIDATE_BATCH_SIZE:-16}" \
+      --num-inference-steps "${NUM_INFERENCE_STEPS:-100}" \
+      --selection "${SELECTION:-argmax}" \
+      "${DIFFUSION_CLIP_SAMPLE_ARGS[@]}"
     ;;
 
   eval)
@@ -388,7 +735,7 @@ PYGRID
 
   eval_grid_resilient)
     ckpt_name=$(basename "$IDQL_CHECKPOINT" .pt)
-    grid_dir="${EVAL_OUTPUT}_${ckpt_name}_grid"
+    grid_dir="${EVAL_OUTPUT}_${ckpt_name}"
     "$PYTHON" -B scripts/run_square_rgb_dp_one_step_idql_eval_grid.py \
       --idql-checkpoint "$IDQL_CHECKPOINT" \
       --output-dir "$grid_dir" \
@@ -425,7 +772,7 @@ PYGRID
     ;;
 
   *)
-    echo "Usage: $0 {build_features|build_risk_reward_features|build_hybrid_reward_features|build_signed_risk_reward_features|build_failure_only_signed_risk_reward_features|build_failure_only_potential_risk_reward_features|train|train_resilient|train_with_rollout_eval|smoke_train|eval|eval_grid|eval_grid_resilient|smoke_eval}" >&2
+    echo "Usage: $0 {build_features|build_risk_reward_features|build_hybrid_reward_features|build_signed_risk_reward_features|build_failure_only_signed_risk_reward_features|build_failure_only_potential_risk_reward_features|train|train_resilient|train_with_rollout_eval|smoke_train|train_visual_critic|train_visual_critic_resilient|smoke_train_visual_critic|train_chunk_actor_iql|train_chunk_actor_iql_resilient|smoke_train_chunk_actor_iql|eval_chunk_actor_iql|eval|eval_grid|eval_grid_resilient|smoke_eval}" >&2
     exit 2
     ;;
 esac

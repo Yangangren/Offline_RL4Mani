@@ -78,6 +78,13 @@ def load_boundary_labels(path: Path, field: str = "decision_boundary"):
     return labels
 
 
+def resolve_checkpoint_path(path_like) -> Path:
+    path = Path(path_like)
+    if path.is_absolute():
+        return path
+    return (ROOT / path).resolve()
+
+
 @torch.no_grad()
 def extract_features(args) -> None:
     import robomimic.models.obs_nets as ObsNets
@@ -88,12 +95,36 @@ def extract_features(args) -> None:
 
     device = torch.device(args.device)
     checkpoint = FileUtils.load_dict_from_checkpoint(str(args.dp_checkpoint))
+    encoder_checkpoint = checkpoint
+    encoder_source_kind = "robomimic_policy"
+    encoder_metadata_checkpoint = args.dp_checkpoint
+    if bool(checkpoint.get("hybrid_dp_chunk_actor_iql", False)):
+        encoder_source_kind = "hybrid_dp_chunk_actor_iql"
+        base_checkpoint_value = checkpoint.get(
+            "pretrained_dp_checkpoint",
+            checkpoint.get("args", {}).get("checkpoint"),
+        )
+        if base_checkpoint_value is None:
+            raise RuntimeError(
+                "hybrid DP chunk actor checkpoint is missing pretrained_dp_checkpoint"
+            )
+        base_checkpoint = resolve_checkpoint_path(base_checkpoint_value)
+        encoder_metadata_checkpoint = base_checkpoint
+        encoder_checkpoint = FileUtils.load_dict_from_checkpoint(str(base_checkpoint))
+        actor_model = checkpoint.get("actor_model", {})
+        policy_state = actor_model.get("ema", None) or actor_model.get("nets", None)
+        if policy_state is None:
+            raise RuntimeError("hybrid checkpoint contains no actor_model EMA/nets weights")
+    else:
+        model_state = checkpoint["model"]
+        policy_state = model_state.get("ema", None) or model_state["nets"]
+
     config, _ = FileUtils.config_from_checkpoint(
-        ckpt_dict=checkpoint,
+        ckpt_dict=encoder_checkpoint,
         verbose=False,
     )
     ObsUtils.initialize_obs_utils_with_config(config)
-    shape_meta = checkpoint["shape_metadata"]
+    shape_meta = encoder_checkpoint["shape_metadata"]
     if isinstance(shape_meta, list):
         shape_meta = shape_meta[0]
     policy_obs_keys = {
@@ -113,8 +144,6 @@ def extract_features(args) -> None:
         ),
     )
     encoder = replace_bn_with_gn(encoder).float().to(device)
-    model_state = checkpoint["model"]
-    policy_state = model_state.get("ema", None) or model_state["nets"]
     prefix = "policy.obs_encoder."
     encoder_state = {
         key[len(prefix) :]: value
@@ -128,6 +157,16 @@ def extract_features(args) -> None:
 
     critical_boundaries = load_boundary_labels(args.critical_summary)
     safe_boundaries = load_boundary_labels(args.safe_summary)
+    q_action_horizon = int(
+        args.q_action_horizon
+        if args.q_action_horizon is not None and args.q_action_horizon > 0
+        else args.prediction_horizon
+    )
+    if q_action_horizon > args.prediction_horizon:
+        raise ValueError(
+            f"q_action_horizon={q_action_horizon} cannot exceed "
+            f"prediction_horizon={args.prediction_horizon}"
+        )
 
     all_features = []
     all_actions = []
@@ -148,7 +187,7 @@ def extract_features(args) -> None:
         for episode_index, demo_key in enumerate(demos):
             group = dataset[f"data/{demo_key}"]
             length = int(group.attrs["num_samples"])
-            latest = length - args.prediction_horizon
+            latest = length - q_action_horizon
             boundaries = np.arange(
                 0, latest + 1, args.action_horizon, dtype=np.int64
             )
@@ -188,7 +227,7 @@ def extract_features(args) -> None:
             actions = np.stack(
                 [
                     group["actions"][
-                        boundary : boundary + args.prediction_horizon
+                        boundary : boundary + q_action_horizon
                     ]
                     for boundary in boundaries
                 ]
@@ -241,13 +280,18 @@ def extract_features(args) -> None:
         episode_labels=np.asarray(episode_labels, dtype=np.float32),
         episode_offsets=np.asarray(episode_offsets, dtype=np.int64),
         action_horizon=np.asarray(args.action_horizon),
-        prediction_horizon=np.asarray(args.prediction_horizon),
+        prediction_horizon=np.asarray(q_action_horizon),
+        q_action_horizon=np.asarray(q_action_horizon),
+        dp_prediction_horizon=np.asarray(args.prediction_horizon),
         dp_checkpoint=np.asarray(str(args.dp_checkpoint)),
+        encoder_source_kind=np.asarray(encoder_source_kind),
+        encoder_metadata_checkpoint=np.asarray(str(encoder_metadata_checkpoint)),
         rollout_path=np.asarray(str(args.rollouts)),
     )
     print(
         f"Wrote {args.features}: episodes={len(episode_keys)}, "
-        f"chunks={episode_offsets[-1]}, feature_dim={all_features[0].shape[1]}",
+        f"chunks={episode_offsets[-1]}, feature_dim={all_features[0].shape[1]}, "
+        f"q_action_horizon={q_action_horizon}, dp_prediction_horizon={args.prediction_horizon}",
         flush=True,
     )
 
@@ -787,6 +831,16 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--action-horizon", type=int, default=8)
     parser.add_argument("--prediction-horizon", type=int, default=16)
+    parser.add_argument(
+        "--q-action-horizon",
+        type=int,
+        default=None,
+        help=(
+            "Number of executable actions stored for Q/reward learning. "
+            "Defaults to prediction_horizon for backward compatibility. "
+            "Use 8 to score only the executed chunk while the DP still predicts 16."
+        ),
+    )
     parser.add_argument("--encoder-batch-size", type=int, default=128)
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--rebuild-features", action="store_true")
