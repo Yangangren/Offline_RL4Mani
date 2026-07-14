@@ -113,7 +113,35 @@ def parse_stats(text: str) -> dict | None:
     return json.loads(match.group(0)) if match else None
 
 
-def rollout_command(args, shard: Path, seed: int) -> list[str]:
+def build_shard_specs(args) -> list[dict]:
+    if args.policy_seeds is None:
+        return [
+            {
+                "shard_index": shard_index,
+                "seed": args.seed_base + shard_index,
+                "env_seed": None,
+                "policy_seed": None,
+            }
+            for shard_index in range(args.num_shards)
+        ]
+
+    specs = []
+    for env_index in range(args.num_env_seeds):
+        env_seed = args.seed_base + env_index
+        for policy_seed in args.policy_seeds:
+            specs.append(
+                {
+                    "shard_index": len(specs),
+                    "seed": env_seed,
+                    "env_seed": env_seed,
+                    "policy_seed": int(policy_seed),
+                    "env_index": env_index,
+                }
+            )
+    return specs
+
+
+def rollout_command(args, shard: Path, spec: dict, attempt: int) -> list[str]:
     command = [
         str(PYTHON),
         "-B",
@@ -125,11 +153,15 @@ def rollout_command(args, shard: Path, seed: int) -> list[str]:
         str(args.rollouts_per_shard),
         "--horizon",
         str(args.horizon),
-        "--seed",
-        str(seed),
         "--dataset_path",
         str(shard),
     ]
+    if spec.get("policy_seed") is None:
+        attempt_seed = int(spec["seed"]) + (attempt - 1) * args.retry_seed_offset
+        command.extend(["--seed", str(attempt_seed)])
+    else:
+        command.extend(["--env_seed", str(spec["env_seed"])])
+        command.extend(["--policy_seed", str(spec["policy_seed"])])
     if args.dataset_obs:
         command.append("--dataset_obs")
     return command
@@ -160,10 +192,19 @@ def run_shard_attempt(command: list[str], logger: TeeLogger, cache_suffix: str) 
 def collect(args) -> list[dict]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     shard_records = []
-    for shard_index in range(args.num_shards):
-        seed = args.seed_base + shard_index
+    specs = build_shard_specs(args)
+    for spec in specs:
+        shard_index = int(spec["shard_index"])
+        seed = int(spec["seed"])
         shard = args.output_dir / f"shard_{shard_index:03d}.hdf5"
         log = args.output_dir / f"shard_{shard_index:03d}.log"
+        base_record = {
+            "seed": seed,
+            "nominal_seed": seed,
+            "env_seed": spec.get("env_seed"),
+            "policy_seed": spec.get("policy_seed"),
+            "env_index": spec.get("env_index"),
+        }
         if (
             not args.force_shards
             and valid_shard(shard, args.rollouts_per_shard, args.dataset_obs)
@@ -174,7 +215,7 @@ def collect(args) -> list[dict]:
                 {
                     "shard": str(shard),
                     "log": str(log),
-                    "seed": seed,
+                    **base_record,
                     "attempts": 0,
                     "stats": stats,
                 }
@@ -186,11 +227,19 @@ def collect(args) -> list[dict]:
         logger = TeeLogger(log, mode="w")
         try:
             for attempt in range(1, args.max_retries + 1):
-                attempt_seed = seed + (attempt - 1) * args.retry_seed_offset
-                command = rollout_command(args, shard, attempt_seed)
+                command = rollout_command(args, shard, spec, attempt)
+                if spec.get("policy_seed") is None:
+                    attempt_seed = seed + (attempt - 1) * args.retry_seed_offset
+                    seed_desc = f"seed={seed} attempt_seed={attempt_seed}"
+                    record_seed = attempt_seed
+                else:
+                    seed_desc = (
+                        f"env_seed={spec['env_seed']} "
+                        f"policy_seed={spec['policy_seed']}"
+                    )
+                    record_seed = seed
                 logger.line(
-                    f"\n[collect shard={shard_index} seed={seed} "
-                    f"attempt_seed={attempt_seed} "
+                    f"\n[collect shard={shard_index} {seed_desc} "
                     f"attempt={attempt}/{args.max_retries}]"
                 )
                 if shard.exists():
@@ -212,8 +261,8 @@ def collect(args) -> list[dict]:
                         {
                             "shard": str(shard),
                             "log": str(log),
-                            "seed": attempt_seed,
-                            "nominal_seed": seed,
+                            **base_record,
+                            "seed": record_seed,
                             "attempts": attempt,
                             "stats": stats,
                         }
@@ -263,6 +312,12 @@ def merge(args, shard_records: list[dict]) -> dict:
                     group.attrs["policy_success"] = bool(is_success)
                     group.attrs["source_shard"] = Path(record["shard"]).name
                     group.attrs["source_demo"] = key
+                    if record.get("env_seed") is not None:
+                        group.attrs["env_seed"] = int(record["env_seed"])
+                    if record.get("policy_seed") is not None:
+                        group.attrs["policy_seed"] = int(record["policy_seed"])
+                    if record.get("env_index") is not None:
+                        group.attrs["env_index"] = int(record["env_index"])
 
                     all_keys.append(output_key)
                     if is_success:
@@ -278,6 +333,9 @@ def merge(args, shard_records: list[dict]) -> dict:
                             "horizon": horizon,
                             "source_shard": str(record["shard"]),
                             "source_demo": key,
+                            "env_seed": record.get("env_seed"),
+                            "policy_seed": record.get("policy_seed"),
+                            "env_index": record.get("env_index"),
                         }
                     )
                     output_index += 1
@@ -305,6 +363,9 @@ def merge(args, shard_records: list[dict]) -> dict:
         "mean_horizon": float(np.mean(horizons)) if len(horizons) else 0.0,
         "min_horizon": int(np.min(horizons)) if len(horizons) else 0,
         "max_horizon": int(np.max(horizons)) if len(horizons) else 0,
+        "split_seed_grid": args.policy_seeds is not None,
+        "num_env_seeds": args.num_env_seeds if args.policy_seeds is not None else None,
+        "policy_seeds": args.policy_seeds,
         "shards": shard_records,
         "episodes": episode_records,
     }
@@ -320,6 +381,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--merged-name", default="rollouts_raw.hdf5")
     parser.add_argument("--num-shards", type=int, default=5)
+    parser.add_argument("--num-env-seeds", type=int, default=None)
+    parser.add_argument("--policy-seeds", type=int, nargs="*", default=None)
     parser.add_argument("--rollouts-per-shard", type=int, default=100)
     parser.add_argument("--horizon", type=int, default=400)
     parser.add_argument("--seed-base", type=int, default=0)
@@ -340,6 +403,14 @@ def main() -> None:
     args = parser.parse_args()
     args.agent = args.agent.resolve()
     args.output_dir = args.output_dir.resolve()
+    if args.policy_seeds is not None:
+        if len(args.policy_seeds) == 0:
+            parser.error("--policy-seeds requires at least one seed")
+        if args.rollouts_per_shard != 1:
+            parser.error("split env/policy seed collection requires --rollouts-per-shard 1")
+        if args.num_env_seeds is None:
+            args.num_env_seeds = args.num_shards
+        args.num_shards = int(args.num_env_seeds) * len(args.policy_seeds)
     records = collect(args)
     merge(args, records)
 

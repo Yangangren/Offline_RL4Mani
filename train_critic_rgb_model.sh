@@ -182,44 +182,6 @@ case "$STAGE" in
     "$PYTHON" -B scripts/analyze_prefix_risk_predictions.py "${analysis_args[@]}"
     ;;
 
-  smoke)
-    MAX_EPISODES=${MAX_EPISODES:-20}
-    smoke_features="rollouts/square_rgb_dp/epoch190_collection/risk_model_smoke/chunk_features.npz"
-    smoke_output="trained_models/square_rgb_dp_causal_prefix_risk/epoch190_smoke"
-    smoke_analysis="rollouts/square_rgb_dp/epoch190_collection/risk_analysis_smoke"
-    "$PYTHON" -B scripts/train_rgb_dp_hazard_mil.py \
-      --rollouts "$ROLLOUTS" \
-      --dp-checkpoint "$DP_CHECKPOINT" \
-      --features "$smoke_features" \
-      --critical-summary "$CRITICAL_SUMMARY" \
-      --safe-summary "$SAFE_SUMMARY" \
-      --action-horizon "$ACTION_HORIZON" \
-      --prediction-horizon "$PREDICTION_HORIZON" \
-      --encoder-batch-size "$ENCODER_BATCH_SIZE" \
-      --max-episodes "$MAX_EPISODES" \
-      --rebuild-features \
-      --device cuda \
-      --prepare-only
-    "$PYTHON" -B scripts/train_rgb_dp_causal_prefix_risk.py \
-      --features "$smoke_features" \
-      --output-dir "$smoke_output" \
-      --device cuda \
-      --action-horizon "$ACTION_HORIZON" \
-      --model-arch "$MODEL_ARCH" \
-      --action-num-heads "$ACTION_NUM_HEADS" \
-      --action-conv-layers "$ACTION_CONV_LAYERS" \
-      --prefix-conv-layers "$PREFIX_CONV_LAYERS" \
-      --total-steps 50 \
-      --episode-batch-size 8 \
-      --eval-every 25 \
-      --seed "$SEED"
-    "$PYTHON" -B scripts/analyze_prefix_risk_predictions.py \
-      --rollouts "$ROLLOUTS" \
-      --predictions "$smoke_output/prefix_predictions.npz" \
-      --output-dir "$smoke_analysis" \
-      --top-k 10
-    ;;
-
   *)
     echo "Usage: $0 {features|train|analyze|all|smoke}" >&2
     echo "Common overrides: TOTAL_STEPS=5000 FORCE_FEATURES=1 MAX_EPISODES=100" >&2

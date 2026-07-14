@@ -18,7 +18,8 @@ export OPENBLAS_NUM_THREADS=1
 
 PYTHON=/home/ryan/miniconda3/envs/robomimic_stable/bin/python
 export ROBOMIMIC_PYTHON="$PYTHON"
-SCRIPT=scripts/run_square_rgb_dp_baseline.py
+SCRIPT=scripts/run_rgb_dp_baseline.py
+TASK=square
 
 # Choose exactly one stage per run. Keeping stages separate avoids carrying
 # simulator / torch / h5py state across dataset creation, training, and eval.
@@ -29,12 +30,14 @@ case "$STAGE" in
     # 1) Build datasets/square/ph/image_v15.hdf5 from raw Square PH states.
     #    If raw demo_v15.hdf5 is missing, this first downloads it.
     "$PYTHON" -B "$SCRIPT" \
+      --task "$TASK" \
       --stages dataset
     ;;
 
   prepare)
     # 2) Write / refresh the RGB-DP config only.
     "$PYTHON" -B "$SCRIPT" \
+      --task "$TASK" \
       --stages prepare
     ;;
 
@@ -47,6 +50,7 @@ case "$STAGE" in
     #      TARGET_EPOCH=200 ./train_square_rgb_dp.sh train
     TARGET_EPOCH=${TARGET_EPOCH:-2000}
     "$PYTHON" -B "$SCRIPT" \
+      --task "$TASK" \
       --stages train \
       --recipe official \
       --epochs "$TARGET_EPOCH" \
@@ -68,11 +72,12 @@ case "$STAGE" in
     EVAL_CHUNK_SIZE=${EVAL_CHUNK_SIZE:-10}
     read -r -a EVAL_SEED_ARRAY <<< "${EVAL_SEEDS:-0 1 2 3 4}"
     EVAL_ARGS=(
-      --stages eval \
-      --recipe official \
-      --target-epoch "$TARGET_EPOCH" \
-      --eval-rollouts "$EVAL_ROLLOUTS" \
-      --eval-chunk-size "$EVAL_CHUNK_SIZE" \
+      --task "$TASK"
+      --stages eval
+      --recipe official
+      --target-epoch "$TARGET_EPOCH"
+      --eval-rollouts "$EVAL_ROLLOUTS"
+      --eval-chunk-size "$EVAL_CHUNK_SIZE"
       --eval-seeds "${EVAL_SEED_ARRAY[@]}"
     )
     if [[ -n "${CHECKPOINT:-}" ]]; then
@@ -84,26 +89,6 @@ case "$STAGE" in
     "$PYTHON" -B "$SCRIPT" "${EVAL_ARGS[@]}"
     ;;
 
-  train_fast)
-    # Debug-only short recipe used by the earlier quick sanity run.
-    "$PYTHON" -B "$SCRIPT" \
-      --stages train \
-      --recipe fast \
-      --epochs 25 \
-      --target-epoch 25 \
-      --steps-per-epoch 500 \
-      --batch-size 64 \
-      --lr 1e-4
-    ;;
-
-  eval_fast)
-    "$PYTHON" -B "$SCRIPT" \
-      --stages eval \
-      --recipe fast \
-      --target-epoch 25 \
-      --eval-rollouts 100 \
-      --eval-seeds 0 1 2 3 4
-    ;;
 
   *)
     echo "Usage: $0 {dataset|prepare|train|eval|train_fast|eval_fast}" >&2

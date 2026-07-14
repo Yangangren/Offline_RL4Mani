@@ -25,7 +25,11 @@ Args:
         possible high-dimensional observations in output dataset hdf5 file (by default,
         observations are excluded and only simulator states are saved).
 
-    seed (int): if provided, set seed for rollouts
+    seed (int): if provided, set seed for both environment and policy rollouts
+
+    env_seed (int): if provided, set NumPy / Python RNG seed for environment resets
+
+    policy_seed (int): if provided, set Torch RNG seed for stochastic policy sampling
 
 Example usage:
 
@@ -53,6 +57,7 @@ Example usage:
 """
 import argparse
 import json
+import random
 import h5py
 import imageio
 import numpy as np
@@ -209,10 +214,17 @@ def run_trained_agent(args):
         verbose=True,
     )
 
-    # maybe set seed
-    if args.seed is not None:
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
+    # maybe set seeds. The legacy --seed path sets both streams;
+    # --env_seed and --policy_seed allow explicit split control.
+    env_seed = args.env_seed if args.env_seed is not None else args.seed
+    policy_seed = args.policy_seed if args.policy_seed is not None else args.seed
+    if env_seed is not None:
+        random.seed(env_seed)
+        np.random.seed(env_seed)
+    if policy_seed is not None:
+        torch.manual_seed(policy_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(policy_seed)
 
     # maybe create video writer
     video_writer = None
@@ -255,6 +267,10 @@ def run_trained_agent(args):
             # episode metadata
             if "model" in traj["initial_state_dict"]:
                 ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"] # model xml for this episode
+            if env_seed is not None:
+                ep_data_grp.attrs["env_seed"] = int(env_seed)
+            if policy_seed is not None:
+                ep_data_grp.attrs["policy_seed"] = int(policy_seed)
             ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0] # number of transitions in this episode
             total_samples += traj["actions"].shape[0]
 
@@ -365,6 +381,18 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="(optional) set seed for rollouts",
+    )
+    parser.add_argument(
+        "--env_seed",
+        type=int,
+        default=None,
+        help="(optional) seed for environment reset RNGs; overrides --seed for environment",
+    )
+    parser.add_argument(
+        "--policy_seed",
+        type=int,
+        default=None,
+        help="(optional) seed for stochastic policy sampling; overrides --seed for policy",
     )
 
     args = parser.parse_args()

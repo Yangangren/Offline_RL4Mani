@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Prepare, train, and evaluate a Square PH RGB Diffusion Policy baseline.
+"""Prepare, train, and evaluate a PH RGB Diffusion Policy baseline.
 
-This is the Square PH RGB-DP sanity baseline. By default it follows the
-robomimic Diffusion Policy template as closely as possible, while changing only
-the dataset and observation keys:
+This started as the Square PH RGB-DP sanity baseline and is now task-aware for
+sim tasks with the same two-camera setup, such as Square and Can. By default it
+follows the robomimic Diffusion Policy template as closely as possible, while
+changing only the dataset and observation keys:
 
 * two RGB cameras: agentview + wrist;
 * proprioception only, no object-state policy input;
@@ -15,8 +16,8 @@ Use ``--recipe fast`` only for quick debugging. The default ``official`` recipe
 keeps the default large UNet, DDPM sampler, batch size, epoch length, and long
 cosine schedule.
 
-The script does not download the Square dataset automatically, because that is
-a network operation. If the dataset is missing, it prints the exact command.
+The script does not download datasets during prepare, because that is a network
+operation. If the image dataset is missing, it prints the exact command.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -41,8 +43,7 @@ TEMPLATE = ROOT / "robomimic/exps/templates/diffusion_policy.json"
 CONFIG_DIR = ROOT / "robomimic/exps/templates/square_rgb_dp"
 MODEL_ROOT = ROOT / "trained_models/square_rgb_dp"
 ROLLOUT_ROOT = ROOT / "rollouts/square_rgb_dp"
-DEFAULT_RAW_DATASET = ROOT / "datasets/square/ph/demo_v15.hdf5"
-DEFAULT_DATASET = ROOT / "datasets/square/ph/image_v15.hdf5"
+CACHE_TAG = "square_rgb_dp"
 
 RGB_KEYS = ["agentview_image", "robot0_eye_in_hand_image"]
 PROPRIO_KEYS = ["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"]
@@ -65,10 +66,25 @@ COMMON_ENV = {
 }
 
 
+def configure_task_paths(args) -> None:
+    global CONFIG_DIR, MODEL_ROOT, ROLLOUT_ROOT, CACHE_TAG
+
+    tag = f"{args.task}_rgb_dp"
+    CACHE_TAG = tag
+    CONFIG_DIR = ROOT / f"robomimic/exps/templates/{tag}"
+    MODEL_ROOT = ROOT / f"trained_models/{tag}"
+    ROLLOUT_ROOT = ROOT / f"rollouts/{tag}"
+
+    if args.raw_dataset is None:
+        args.raw_dataset = ROOT / f"datasets/{args.task}/{args.dataset_type}/demo_v15.hdf5"
+    if args.dataset is None:
+        args.dataset = ROOT / f"datasets/{args.task}/{args.dataset_type}/image_v15.hdf5"
+
+
 def process_env(cache_suffix: str) -> dict[str, str]:
     env = os.environ.copy()
     env.update(COMMON_ENV)
-    env["PYTHONPYCACHEPREFIX"] = f"/tmp/robomimic_square_rgb_dp_{cache_suffix}"
+    env["PYTHONPYCACHEPREFIX"] = f"/tmp/robomimic_{CACHE_TAG}_{cache_suffix}"
     return env
 
 
@@ -100,35 +116,48 @@ def image_encoder_config() -> dict:
     }
 
 
-def dataset_download_message(path: Path) -> str:
-    command = (
-        f"cd {ROOT} && "
-        f"{PYTHON} -B scripts/run_square_rgb_dp_baseline.py --stages dataset"
-    )
+def task_title(args) -> str:
+    return args.task.replace("_", " ").title()
+
+
+def launcher_command(args, stages: str) -> str:
+    script = Path(sys.argv[0]).as_posix()
+    if not script.startswith("/") and not script.startswith("."):
+        script = f"./{script}"
     return (
-        f"Square PH two-camera image dataset was not found:\n"
+        f"cd {ROOT} && "
+        f"{PYTHON} -B {script} --task {args.task} "
+        f"--dataset-type {args.dataset_type} --stages {stages}"
+    )
+
+
+def dataset_download_message(path: Path, args) -> str:
+    title = task_title(args)
+    command = launcher_command(args, "dataset")
+    return (
+        f"{title} {args.dataset_type.upper()} two-camera image dataset was not found:\n"
         f"  {path}\n\n"
         f"Build it with:\n"
         f"  {command}\n\n"
-        f"This first downloads the raw Square PH dataset and then runs "
+        f"This first downloads the raw {title} {args.dataset_type.upper()} dataset and then runs "
         f"dataset_states_to_obs.py with agentview + robot0_eye_in_hand at 84x84. "
         f"If you already built a different image filename, pass it explicitly "
         f"via --dataset."
     )
 
 
-def require_dataset(path: Path) -> None:
+def require_dataset(path: Path, args) -> None:
     if path.exists():
         return
-    raise FileNotFoundError(dataset_download_message(path))
+    raise FileNotFoundError(dataset_download_message(path, args))
 
 
 def make_config(args) -> dict:
     config = json.loads(TEMPLATE.read_text())
     if args.recipe == "official":
-        experiment_name = f"square_ph_rgb_dp_official_s{args.seed}"
+        experiment_name = f"{args.task}_{args.dataset_type}_rgb_dp_official_s{args.seed}"
     else:
-        experiment_name = f"square_ph_rgb_dp_fast_s{args.seed}"
+        experiment_name = f"{args.task}_{args.dataset_type}_rgb_dp_fast_s{args.seed}"
     config["experiment"]["name"] = experiment_name
     config["experiment"]["render"] = False
     config["experiment"]["render_video"] = False
@@ -157,7 +186,7 @@ def make_config(args) -> dict:
     config["train"]["output_dir"] = str(MODEL_ROOT)
     config["train"]["normalize_weights_by_ds_size"] = False
     config["train"]["num_data_workers"] = 0
-    # Square PH image_v15 is small enough to cache fully. This avoids repeated
+    # The PH image datasets are small enough to cache fully. This avoids repeated
     # per-batch HDF5 reads and greatly reduces exposure to intermittent h5py /
     # importlib crashes in this environment.
     config["train"]["hdf5_cache_mode"] = args.hdf5_cache_mode
@@ -226,9 +255,9 @@ def build_dataset(args) -> None:
             "-m",
             "robomimic.scripts.download_datasets",
             "--tasks",
-            "square",
+            args.task,
             "--dataset_types",
-            "ph",
+            args.dataset_type,
             "--hdf5_types",
             "raw",
         ]
@@ -236,13 +265,15 @@ def build_dataset(args) -> None:
         subprocess.run(
             command,
             cwd=ROOT,
-            env=process_env("download_square_raw"),
+            env=process_env(f"download_{args.task}_raw"),
             check=True,
         )
 
     raw_dataset = args.raw_dataset.resolve()
     if not raw_dataset.exists():
-        raise FileNotFoundError(f"raw Square PH dataset was not created: {raw_dataset}")
+        raise FileNotFoundError(
+            f"raw {task_title(args)} {args.dataset_type.upper()} dataset was not created: {raw_dataset}"
+        )
 
     if args.dataset.exists() and args.force_dataset:
         args.dataset.unlink()
@@ -271,10 +302,10 @@ def build_dataset(args) -> None:
     subprocess.run(
         command,
         cwd=ROOT,
-        env=process_env("extract_square_rgb"),
+        env=process_env(f"extract_{args.task}_rgb"),
         check=True,
     )
-    require_dataset(args.dataset)
+    require_dataset(args.dataset, args)
     print(f"Built image dataset: {args.dataset}", flush=True)
 
 
@@ -286,11 +317,26 @@ def experiment_root(config_path: Path) -> Path:
     return output_dir / config["experiment"]["name"]
 
 
+def candidate_run_dirs(experiment: Path) -> list[Path]:
+    if not experiment.exists():
+        return []
+    ignored = {"logs", "models", "videos", "tb"}
+    return sorted(
+        path
+        for path in experiment.glob("*")
+        if path.is_dir() and path.name not in ignored and (path / "models").is_dir()
+    )
+
+
 def latest_checkpoint(experiment: Path, epoch: int) -> Path | None:
     if not experiment.exists():
         return None
-    runs = sorted(path for path in experiment.glob("*") if path.is_dir())
-    for run in reversed(runs):
+
+    direct_checkpoint = experiment / f"models/model_epoch_{epoch}.pth"
+    if direct_checkpoint.exists():
+        return direct_checkpoint
+
+    for run in reversed(candidate_run_dirs(experiment)):
         checkpoint = run / f"models/model_epoch_{epoch}.pth"
         if checkpoint.exists():
             return checkpoint
@@ -304,10 +350,15 @@ def latest_checkpoint_from_fresh_runs(
 ) -> Path | None:
     if not experiment.exists():
         return None
+
+    direct_checkpoint = experiment / f"models/model_epoch_{epoch}.pth"
+    if direct_checkpoint.exists() and direct_checkpoint.stat().st_mtime >= started_at - 2.0:
+        return direct_checkpoint
+
     runs = sorted(
         path
-        for path in experiment.glob("*")
-        if path.is_dir() and path.stat().st_mtime >= started_at - 2.0
+        for path in candidate_run_dirs(experiment)
+        if path.stat().st_mtime >= started_at - 2.0
     )
     for run in reversed(runs):
         checkpoint = run / f"models/model_epoch_{epoch}.pth"
@@ -371,7 +422,7 @@ def resilient_train(config_path: Path, args) -> Path:
         "--log-dir",
         str(log_dir),
     ]
-    cache = Path("/tmp/robomimic_square_rgb_dp_train_launcher")
+    cache = Path(f"/tmp/robomimic_{args.task}_rgb_dp_train_launcher")
     shutil.rmtree(cache, ignore_errors=True)
     print("+ " + " ".join(command), flush=True)
     subprocess.run(
@@ -426,6 +477,8 @@ def evaluate(checkpoint: Path, args) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--task", default="square", help="robomimic task name, e.g. square or can")
+    parser.add_argument("--dataset-type", default="ph", help="dataset type, e.g. ph or mh")
     parser.add_argument(
         "--stages",
         nargs="+",
@@ -433,8 +486,8 @@ def parse_args() -> argparse.Namespace:
         default=["prepare"],
         help="Stages to run. Example: --stages prepare train eval",
     )
-    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--raw-dataset", type=Path, default=DEFAULT_RAW_DATASET)
+    parser.add_argument("--dataset", type=Path, default=None)
+    parser.add_argument("--raw-dataset", type=Path, default=None)
     parser.add_argument("--camera-size", type=int, default=84)
     parser.add_argument("--force-dataset", action="store_true")
     parser.add_argument(
@@ -493,6 +546,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    configure_task_paths(args)
     args.dataset = args.dataset.resolve()
     args.raw_dataset = args.raw_dataset.resolve()
     if "dataset" in args.stages:
@@ -500,11 +554,11 @@ def main() -> None:
 
     config_path = write_config(args)
     if not args.dataset.exists():
-        print("\n" + dataset_download_message(args.dataset), flush=True)
+        print("\n" + dataset_download_message(args.dataset, args), flush=True)
 
     checkpoint = args.checkpoint.resolve() if args.checkpoint is not None else None
     if "train" in args.stages:
-        require_dataset(args.dataset)
+        require_dataset(args.dataset, args)
         checkpoint = (
             resilient_train(config_path, args)
             if args.resilient_train

@@ -331,6 +331,17 @@ def dataset_states_to_obs(args):
             ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"] # model xml for this episode
         if "ep_meta" in f["data/{}".format(ep)].attrs:
             ep_data_grp.attrs["ep_meta"] = f["data/{}".format(ep)].attrs["ep_meta"]
+        for attr_name in (
+            "episode_return",
+            "policy_success",
+            "source_shard",
+            "source_demo",
+            "env_seed",
+            "policy_seed",
+            "env_index",
+        ):
+            if attr_name in f["data/{}".format(ep)].attrs:
+                ep_data_grp.attrs[attr_name] = f["data/{}".format(ep)].attrs[attr_name]
         ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0] # number of transitions in this episode
 
         if camera_info is not None:
