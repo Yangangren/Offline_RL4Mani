@@ -20,25 +20,31 @@ export PYTHONFAULTHANDLER=1
 
 PYTHON=${ROBOMIMIC_PYTHON:-/home/ryan/miniconda3/envs/robomimic_stable/bin/python}
 export ROBOMIMIC_PYTHON="$PYTHON"
+DEVICE=${DEVICE:-cuda}
 
 POLICY=${POLICY:-trained_models/square_rgb_dp_idql_visual/default_reward_dp_chunk_actor_iql/best_success_auc.pt}
-RISK=${RISK:-trained_models/square_rgb_dp_causal_prefix_risk/epoch190_two_stage_temporal_safe_anchor/best.pt}
-OUTPUT_DIR=${OUTPUT_DIR:-rollouts/square_rgb_dp/risk_extraction_eval}
+RISK=${RISK:-trained_models/square_rgb_dp_causal_prefix_success/iql_actor_v2_q8_delta_progress_stride1/best.pt}
+OUTPUT_DIR=${OUTPUT_DIR:-rollouts/square_rgb_dp_visual/success_advantage_q8_delta_progress_stride1}
 
-NUM_CANDIDATES=${NUM_CANDIDATES:-"4 8"}
-SCORE_MODES=${SCORE_MODES:-"action_probability"}
+NUM_CANDIDATES=${NUM_CANDIDATES:-"1 4 8"}
+SCORE_MODES=${SCORE_MODES:-"action_probability action_advantage_logodds positive_action_advantage"}
 SELECTIONS=${SELECTIONS:-"argmax"}
 SEEDS=${SEEDS:-"0 1 2 3 4"}
 N_ROLLOUTS=${N_ROLLOUTS:-50}
-ROLLOUTS_PER_CHUNK=${ROLLOUTS_PER_CHUNK:-10}
+# Keep native robosuite / NumPy failures isolated to one rollout. The grid
+# runner can still resume older 10-rollout chunks without discarding them.
+ROLLOUTS_PER_CHUNK=${ROLLOUTS_PER_CHUNK:-1}
 HORIZON=${HORIZON:-400}
 CANDIDATE_BATCH_SIZE=${CANDIDATE_BATCH_SIZE:-16}
 EXECUTE_HORIZON=${EXECUTE_HORIZON:-8}
+
 ACTION_START_INDEX=${ACTION_START_INDEX:--1}
 MAX_PREFIX_LEN=${MAX_PREFIX_LEN:-0}
-MAX_RETRIES=${MAX_RETRIES:-3}
+MAX_RETRIES=${MAX_RETRIES:-10}
 RISK_THRESHOLD=${RISK_THRESHOLD:-}
-SCORE_GAP_THRESHOLD=${SCORE_GAP_THRESHOLD:-0.02}
+# Probability scores saturate near one, so probability-space gaps around 0.01
+# are not meaningful. Start without fallback; tune a gap only with raw log-odds.
+SCORE_GAP_THRESHOLD=${SCORE_GAP_THRESHOLD:-0.0}
 FORCE=${FORCE:-0}
 
 STAGE=${1:-grid}
@@ -47,7 +53,7 @@ common_args=(
   --policy "$POLICY"
   --risk "$RISK"
   --output-dir "$OUTPUT_DIR"
-  --device cuda
+  --device "$DEVICE"
   --horizon "$HORIZON"
   --candidate-batch-size "$CANDIDATE_BATCH_SIZE"
   --execute-horizon "$EXECUTE_HORIZON"
@@ -66,8 +72,8 @@ case "$STAGE" in
       --n-rollouts "$N_ROLLOUTS" \
       --seed "${SEED:-0}" \
       --num-candidates "${N:-16}" \
-      --score-mode "${SCORE_MODE:-positive_action_risk}" \
-      --selection "${SELECTION:-argmin}"
+      --score-mode "${SCORE_MODE:-action_advantage_logodds}" \
+      --selection "${SELECTION:-argmax}"
     ;;
 
   grid)
@@ -84,7 +90,7 @@ case "$STAGE" in
     if [[ "$FORCE" == "1" ]]; then
       grid_args+=(--force)
     fi
-    "$PYTHON" -B scripts/run_square_rgb_dp_risk_extraction_grid.py "${grid_args[@]}"
+    "$PYTHON" -B scripts/run_critic_based_action_selection_grid.py "${grid_args[@]}"
     ;;
 
   *)

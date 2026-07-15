@@ -38,6 +38,10 @@ import robomimic.utils.torch_utils as TorchUtils
 from robomimic.envs.env_base import EnvBase
 from robomimic.envs.wrappers import EnvWrapper
 from robomimic.models.prefix_risk_nets import CausalPrefixRisk, make_causal_prefix_model
+from robomimic.utils.rgb_critic_utils import (
+    build_rgb_encoder_from_critic_spec,
+    prepare_observation_for_rgb_critic,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -129,6 +133,8 @@ class RiskGuidedDPPolicy:
     def __init__(
         self,
         dp_policy,
+        risk_feature_policy,
+        risk_feature_policy_path: Path | None,
         risk_checkpoint: dict,
         risk_model: CausalPrefixRisk,
         *,
@@ -144,9 +150,14 @@ class RiskGuidedDPPolicy:
         max_prefix_len: int,
     ):
         self.dp_policy = dp_policy
+        self.risk_feature_policy = risk_feature_policy
+        self.risk_feature_policy_path = risk_feature_policy_path
         self.algo = dp_policy.policy
         self.risk_checkpoint = risk_checkpoint
         self.risk_model = risk_model
+        self.self_contained_rgb_critic = bool(
+            risk_checkpoint.get("self_contained_rgb_critic", False)
+        )
         self.num_candidates = int(num_candidates)
         self.candidate_batch_size = int(candidate_batch_size)
         self.score_mode = score_mode
@@ -210,6 +221,27 @@ class RiskGuidedDPPolicy:
             raise ValueError(f"invalid action_start_index={self.action_start_index}")
         if self.execute_horizon <= 0:
             raise ValueError(f"execute_horizon must be positive, got {self.execute_horizon}")
+        if self.execute_horizon > self.prediction_horizon:
+            raise ValueError(
+                "the evaluator would execute actions that were not scored: "
+                f"execute_horizon={self.execute_horizon}, "
+                f"risk_horizon={self.prediction_horizon}"
+            )
+        if self.action_start_index + self.prediction_horizon > policy_prediction_horizon:
+            raise ValueError(
+                "the DP trajectory does not contain enough future slots for the "
+                "critic; padding would create a training/inference mismatch: "
+                f"start={self.action_start_index}, risk_horizon={self.prediction_horizon}, "
+                f"policy_horizon={policy_prediction_horizon}"
+            )
+        self._validate_score_selection()
+        if self.score_mode == "action_probability" and self.score_gap_threshold >= 1e-3:
+            print(
+                "WARNING: action_probability is often saturated; a probability-space "
+                f"score gap of {self.score_gap_threshold:g} may suppress nearly all "
+                "critic interventions. Prefer action_advantage_logodds.",
+                flush=True,
+            )
 
         self.last_scores: np.ndarray | None = None
         self.last_state_logit: float | None = None
@@ -228,8 +260,41 @@ class RiskGuidedDPPolicy:
         self.last_selected_index: int | None = None
         self.last_threshold_fallback: bool | None = None
 
+    def _validate_score_selection(self) -> None:
+        """Reject score directions that invert the configured outcome target."""
+
+        if self.selection == "threshold_fallback":
+            if self.score_mode != "positive_action_risk":
+                raise ValueError(
+                    "threshold_fallback is defined only for positive_action_risk"
+                )
+            return
+
+        higher_is_better = self.score_mode in (
+            "positive_action_advantage",
+            "action_advantage_logodds",
+        )
+        if self.score_mode in ("action_delta_logodds", "action_logit", "action_probability"):
+            higher_is_better = self.target_outcome == "success"
+        if self.score_mode == "positive_action_risk":
+            higher_is_better = False
+
+        uses_max = self.selection in ("argmax", "softmax")
+        uses_min = self.selection in ("argmin", "greedy", "softmin")
+        if (higher_is_better and uses_min) or ((not higher_is_better) and uses_max):
+            direction = "argmax" if higher_is_better else "argmin"
+            raise ValueError(
+                f"score_mode={self.score_mode} with target_outcome={self.target_outcome} "
+                f"must use {direction}, got selection={self.selection}"
+            )
+
     def start_episode(self) -> None:
         self.dp_policy.start_episode()
+        if (
+            self.risk_feature_policy is not None
+            and self.risk_feature_policy is not self.dp_policy
+        ):
+            self.risk_feature_policy.start_episode()
         self.action_queue.clear()
         self.previous_ob = None
         self.prefix_features.clear()
@@ -274,6 +339,16 @@ class RiskGuidedDPPolicy:
         )
         obs_cond = obs_features.flatten(start_dim=1)
         batch_size = obs_cond.shape[0]
+        # Match DiffusionPolicyUNet._get_action_trajectory exactly. This is a
+        # no-op for ordinary checkpoints, but it is required for actors that
+        # contain the optional success-condition adapter.
+        obs_cond, _ = algo._apply_success_condition(
+            obs_cond,
+            nets=nets,
+            success_condition=torch.ones(batch_size, device=algo.device),
+            condition_mask=torch.ones(batch_size, device=algo.device),
+            validate=True,
+        )
         trajectory = torch.randn(
             (batch_size, int(algo.algo_config.horizon.prediction_horizon), algo.ac_dim),
             device=algo.device,
@@ -303,12 +378,12 @@ class RiskGuidedDPPolicy:
 
     def trajectory_to_future_actions(self, trajectories: torch.Tensor) -> torch.Tensor:
         future = trajectories[:, self.action_start_index :, :]
-        if future.shape[1] >= self.prediction_horizon:
-            return future[:, : self.prediction_horizon, :]
-        padding = future[:, -1:, :].expand(
-            -1, self.prediction_horizon - future.shape[1], -1
-        )
-        return torch.cat([future, padding], dim=1)
+        if future.shape[1] < self.prediction_horizon:
+            raise RuntimeError(
+                f"only {future.shape[1]} future DP slots are available, but the "
+                f"critic requires {self.prediction_horizon}"
+            )
+        return future[:, : self.prediction_horizon, :]
 
     def selected_actions_for_execution(self, selected_trajectory: torch.Tensor) -> torch.Tensor:
         start = self.action_start_index
@@ -322,14 +397,45 @@ class RiskGuidedDPPolicy:
 
     @torch.no_grad()
     def update_prefix(self, current_ob: dict) -> torch.Tensor:
-        feature = encode_pair_feature(self.dp_policy, self.previous_ob, current_ob)
-        if feature.shape[-1] != self.feature_mean.numel():
-            raise ValueError(
-                f"encoded risk feature dim={feature.shape[-1]} but checkpoint expects "
-                f"{self.feature_mean.numel()}"
+        if self.self_contained_rgb_critic:
+            # This is the important V4 deployment path: RGB preprocessing and
+            # encoding are performed entirely by the critic. The candidate DP
+            # actor is not consulted here.
+            current = prepare_observation_for_rgb_critic(
+                current_ob,
+                self.risk_model.observation_shapes,
+                self.algo.device,
             )
-        normalized = (feature - self.feature_mean[None, :]) / self.feature_std[None, :]
-        self.prefix_features.append(normalized.squeeze(0))
+            previous = (
+                current
+                if self.previous_ob is None
+                else prepare_observation_for_rgb_critic(
+                    self.previous_ob,
+                    self.risk_model.observation_shapes,
+                    self.algo.device,
+                )
+            )
+            observation_window = {
+                key: torch.stack([previous[key], current[key]], dim=1)
+                for key in self.risk_model.observation_shapes
+            }
+            feature = self.risk_model.encode_rgb_boundary(observation_window)
+        else:
+            # Legacy V1--V3 checkpoints contain only feature-space heads.
+            feature = encode_pair_feature(
+                self.risk_feature_policy,
+                self.previous_ob,
+                current_ob,
+            )
+            if feature.shape[-1] != self.feature_mean.numel():
+                raise ValueError(
+                    f"encoded risk feature dim={feature.shape[-1]} but checkpoint expects "
+                    f"{self.feature_mean.numel()}"
+                )
+            feature = (
+                feature - self.feature_mean[None, :]
+            ) / self.feature_std[None, :]
+        self.prefix_features.append(feature.squeeze(0))
         if self.max_prefix_len > 0 and len(self.prefix_features) > self.max_prefix_len:
             self.prefix_features = self.prefix_features[-self.max_prefix_len :]
         return torch.stack(self.prefix_features, dim=0).unsqueeze(0)
@@ -342,9 +448,12 @@ class RiskGuidedDPPolicy:
         state_logit = self.risk_model.state_head(current_context).squeeze(-1).squeeze(-1)
 
         risk_actions = self.trajectory_to_future_actions(candidates)
-        normalized_actions = (
-            risk_actions - self.action_mean[None, None, :]
-        ) / self.action_std[None, None, :]
+        if self.self_contained_rgb_critic:
+            normalized_actions = self.risk_model.normalize_actions(risk_actions)
+        else:
+            normalized_actions = (
+                risk_actions - self.action_mean[None, None, :]
+            ) / self.action_std[None, None, :]
         repeated_context = current_context.repeat(risk_actions.shape[0], 1, 1)
         action_delta = self.risk_model.action_delta(
             repeated_context,
@@ -482,6 +591,8 @@ def load_dp_policy_for_rollout(policy_path: Path, device: torch.device):
     """Load either a normal robomimic policy checkpoint or our hybrid actor checkpoint."""
 
     raw_checkpoint = FileUtils.load_dict_from_checkpoint(str(policy_path))
+
+    # load the actor of IDQL
     if bool(raw_checkpoint.get("hybrid_dp_chunk_actor_iql", False)):
         base_checkpoint_value = raw_checkpoint.get(
             "pretrained_dp_checkpoint",
@@ -501,6 +612,7 @@ def load_dp_policy_for_rollout(policy_path: Path, device: torch.device):
         dp_policy.policy.set_eval()
         return dp_policy, base_ckpt, raw_checkpoint
 
+    # load the standard policy trained by BC
     dp_policy, ckpt_dict = FileUtils.policy_from_checkpoint(
         ckpt_dict=raw_checkpoint,
         device=device,
@@ -509,15 +621,65 @@ def load_dp_policy_for_rollout(policy_path: Path, device: torch.device):
     return dp_policy, ckpt_dict, raw_checkpoint
 
 
-def load_risk_policy(policy_path: Path, risk_path: Path, device: torch.device, args):
+def load_critic_model(policy_path: Path, risk_path: Path, device: torch.device, args):
     dp_policy, env_ckpt, policy_checkpoint = load_dp_policy_for_rollout(
         policy_path,
         device,
     )
     checkpoint = torch.load(risk_path, map_location=device, weights_only=False)
     ckpt_args = checkpoint["args"]
+    model_arch = str(ckpt_args.get("model_arch", "v1"))
+    rgb_encoder = None
+    observation_shapes = None
+    observation_horizon = None
+    if model_arch == "v4":
+        if not bool(checkpoint.get("self_contained_rgb_critic", False)):
+            raise ValueError("V4 checkpoint is not marked as a self-contained RGB critic")
+        if "rgb_encoder_spec" not in checkpoint:
+            raise ValueError("V4 checkpoint is missing rgb_encoder_spec")
+        rgb_encoder, observation_shapes, observation_horizon = (
+            build_rgb_encoder_from_critic_spec(
+                checkpoint["rgb_encoder_spec"],
+                device,
+            )
+        )
+        risk_feature_policy = None
+        risk_feature_policy_path = None
+        print(
+            "Using self-contained critic RGB encoder; candidate actor is used "
+            "only to generate action chunks.",
+            flush=True,
+        )
+    else:
+        expected_policy = ckpt_args.get("expected_dp_checkpoint")
+        if expected_policy is not None:
+            expected_policy = resolve_checkpoint_path(expected_policy)
+            if expected_policy == policy_path.resolve():
+                risk_feature_policy = dp_policy
+            else:
+                risk_feature_policy, _, _ = load_dp_policy_for_rollout(
+                    expected_policy,
+                    device,
+                )
+                print(
+                    "Using separate policies: candidate actor="
+                    f"{policy_path.resolve()}, critic feature encoder={expected_policy}",
+                    flush=True,
+                )
+            risk_feature_policy_path = expected_policy
+        else:
+            # Legacy checkpoints did not record their feature encoder. Reusing
+            # the candidate actor preserves their historical behavior.
+            risk_feature_policy = dp_policy
+            risk_feature_policy_path = policy_path.resolve()
+            print(
+                "WARNING: critic checkpoint does not record expected_dp_checkpoint; "
+                "using the candidate actor as its feature encoder",
+                flush=True,
+            )
+    stats = checkpoint["stats"]
     risk_model = make_causal_prefix_model(
-        model_arch=str(ckpt_args.get("model_arch", "v1")),
+        model_arch=model_arch,
         feature_dim=int(checkpoint["feature_dim"]),
         prediction_horizon=int(checkpoint["prediction_horizon"]),
         action_dim=int(checkpoint["action_dim"]),
@@ -527,12 +689,23 @@ def load_risk_policy(policy_path: Path, risk_path: Path, device: torch.device, a
         action_num_heads=int(ckpt_args.get("action_num_heads", 4)),
         action_conv_layers=int(ckpt_args.get("action_conv_layers", 2)),
         prefix_conv_layers=int(ckpt_args.get("prefix_conv_layers", 1)),
+        rgb_encoder=rgb_encoder,
+        observation_shapes=observation_shapes,
+        observation_horizon=observation_horizon,
+        feature_mean=stats["feature_mean"],
+        feature_std=stats["feature_std"],
+        action_mean=stats["action_mean"],
+        action_std=stats["action_std"],
     ).to(device)
+    if model_arch == "v4":
+        risk_model.rgb_encoder_spec = checkpoint["rgb_encoder_spec"]
     risk_model.load_state_dict(checkpoint["model"])
     risk_model.eval()
     risk_model.requires_grad_(False)
     guided_policy = RiskGuidedDPPolicy(
         dp_policy=dp_policy,
+        risk_feature_policy=risk_feature_policy,
+        risk_feature_policy_path=risk_feature_policy_path,
         risk_checkpoint=checkpoint,
         risk_model=risk_model,
         num_candidates=args.num_candidates,
@@ -720,7 +893,7 @@ def score_gap_suffix(score_gap_threshold: float) -> str:
 def evaluate(args) -> dict:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
-    policy, ckpt_dict, policy_checkpoint = load_risk_policy(
+    policy, ckpt_dict, policy_checkpoint = load_critic_model(
         args.policy,
         args.risk,
         device,
@@ -853,6 +1026,16 @@ def evaluate(args) -> dict:
             else "robomimic_policy"
         ),
         "risk": str(args.risk),
+        "risk_feature_policy": (
+            str(policy.risk_feature_policy_path)
+            if policy.risk_feature_policy_path is not None
+            else None
+        ),
+        "separate_risk_feature_encoder": bool(
+            policy.risk_feature_policy is not None
+            and policy.risk_feature_policy is not policy.dp_policy
+        ),
+        "self_contained_rgb_critic": policy.self_contained_rgb_critic,
         "risk_target_outcome": str(policy.risk_checkpoint.get("args", {}).get("target_outcome", "failure")),
         "risk_best_step": int(policy.risk_checkpoint.get("best_step", -1)),
         "risk_best_quality": list(policy.risk_checkpoint.get("best_quality", [])),

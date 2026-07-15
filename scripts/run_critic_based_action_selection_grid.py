@@ -220,6 +220,21 @@ def run_chunk(
 
     last_stdout = ""
     for attempt in range(1, args.max_retries + 1):
+        # A native robosuite / NumPy crash can be trajectory-specific. Repeating
+        # the exact same seed merely replays the same failing trajectory, so
+        # retries use a deterministic alternate seed while preserving the
+        # requested seed in the canonical chunk filename.
+        attempt_seed = int(
+            (chunk_seed + (attempt - 1) * 1_000_003) % (2**32 - 1)
+        )
+        attempt_json = result_json_path(
+            chunk_dir,
+            score_mode,
+            selection,
+            num_candidates,
+            attempt_seed,
+            args.score_gap_threshold,
+        )
         cache_suffix = (
             f"{score_mode}_{selection}_N{num_candidates}_s{seed}_"
             f"gap{float(args.score_gap_threshold):.6g}_"
@@ -232,7 +247,7 @@ def run_chunk(
             output_dir=chunk_dir,
             n_rollouts=n_rollouts,
             horizon=args.horizon,
-            seed=chunk_seed,
+            seed=attempt_seed,
             num_candidates=num_candidates,
             candidate_batch_size=args.candidate_batch_size,
             device=args.device,
@@ -248,7 +263,8 @@ def run_chunk(
         logger.line(
             f"\n[chunk start] score={score_mode} selection={selection} "
             f"N={num_candidates} seed={seed} chunk={chunk_index} "
-            f"chunk_seed={chunk_seed} rollouts={n_rollouts} attempt={attempt}/{args.max_retries}"
+            f"requested_chunk_seed={chunk_seed} attempt_seed={attempt_seed} "
+            f"rollouts={n_rollouts} attempt={attempt}/{args.max_retries}"
         )
         logger.line(" ".join(command))
         proc = subprocess.Popen(
@@ -269,11 +285,17 @@ def run_chunk(
         proc.stdout.close()
         proc.stdout = None
         last_stdout = "".join(output_parts)
-        if proc.returncode == 0 and chunk_json.exists():
-            logger.line(f"[chunk ok] {chunk_json}")
-            return json.loads(chunk_json.read_text())
+        if proc.returncode == 0 and attempt_json.exists():
+            result = json.loads(attempt_json.read_text())
+            result["requested_seed"] = int(chunk_seed)
+            result["actual_seed"] = int(attempt_seed)
+            chunk_json.write_text(json.dumps(result, indent=2))
+            logger.line(
+                f"[chunk ok] {chunk_json} actual_seed={attempt_seed}"
+            )
+            return result
         logger.line(
-            f"[chunk failed] returncode={proc.returncode}; expected={chunk_json}\n"
+            f"[chunk failed] returncode={proc.returncode}; expected={attempt_json}\n"
             + "\n".join(last_stdout.splitlines()[-40:])
         )
     raise RuntimeError(
@@ -326,6 +348,8 @@ def run_pair(
     all_rollouts: list[dict] = []
     chunk_records: list[dict] = []
     resolved_action_start_index = None
+    risk_feature_policy = None
+    separate_risk_feature_encoder = None
     remaining = args.n_rollouts
     chunk_index = 0
     try:
@@ -347,18 +371,33 @@ def run_pair(
             resolved_action_start_index = chunk.get(
                 "action_start_index", resolved_action_start_index
             )
-            if len(rollouts) != count:
+            risk_feature_policy = chunk.get(
+                "risk_feature_policy", risk_feature_policy
+            )
+            separate_risk_feature_encoder = chunk.get(
+                "separate_risk_feature_encoder",
+                separate_risk_feature_encoder,
+            )
+            actual_count = len(rollouts)
+            if actual_count <= 0 or actual_count > remaining:
                 raise RuntimeError(
-                    f"chunk returned {len(rollouts)} rollouts, expected {count}: "
+                    f"chunk returned {actual_count} rollouts with {remaining} remaining: "
                     f"score={score_mode}, selection={selection}, N={num_candidates}, "
                     f"seed={seed}, chunk={chunk_index}"
+                )
+            if actual_count != count:
+                logger.line(
+                    f"[resume variable chunk] requested={count} existing={actual_count}"
                 )
             all_rollouts.extend(rollouts)
             chunk_records.append(
                 {
                     "chunk_index": chunk_index,
                     "chunk_seed": chunk_seed,
-                    "num_rollouts": count,
+                    "num_rollouts": actual_count,
+                    "actual_seed": int(
+                        chunk.get("actual_seed", chunk.get("seed", chunk_seed))
+                    ),
                     "json": str(
                         result_json_path(
                             args.output_dir
@@ -378,7 +417,7 @@ def run_pair(
                     "average_rollout_stats": chunk.get("average_rollout_stats", {}),
                 }
             )
-            remaining -= count
+            remaining -= actual_count
             partial = aggregate_rollouts(all_rollouts)
             logger.line("[pair partial] " + json.dumps(partial, sort_keys=True))
             chunk_index += 1
@@ -391,6 +430,8 @@ def run_pair(
     result = {
         "policy": str(args.policy),
         "risk": str(args.risk),
+        "risk_feature_policy": risk_feature_policy,
+        "separate_risk_feature_encoder": separate_risk_feature_encoder,
         "score_mode": score_mode,
         "selection": selection,
         "num_candidates": num_candidates,
@@ -524,6 +565,17 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
     summary = {
         "policy": str(args.policy),
         "risk": str(args.risk),
+        "risk_feature_policies": sorted(
+            {
+                str(result["risk_feature_policy"])
+                for result in results
+                if result.get("risk_feature_policy") is not None
+            }
+        ),
+        "uses_separate_risk_feature_encoder": any(
+            bool(result.get("separate_risk_feature_encoder", False))
+            for result in results
+        ),
         "horizon": args.horizon,
         "n_rollouts_per_seed": args.n_rollouts,
         "rollouts_per_chunk": args.rollouts_per_chunk,

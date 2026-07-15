@@ -2,11 +2,11 @@
 """Prepare, train, and evaluate a PH RGB Diffusion Policy baseline.
 
 This started as the Square PH RGB-DP sanity baseline and is now task-aware for
-sim tasks with the same two-camera setup, such as Square and Can. By default it
+the common robomimic sim PH tasks. By default it
 follows the robomimic Diffusion Policy template as closely as possible, while
-changing only the dataset and observation keys:
+changing only the dataset and task-specific observation keys:
 
-* two RGB cameras: agentview + wrist;
+* RGB cameras from the official image dataset for each task;
 * proprioception only, no object-state policy input;
 * frame_stack=2, seq_length=16;
 * DP horizon: obs=2, action=8, prediction=16;
@@ -45,8 +45,69 @@ MODEL_ROOT = ROOT / "trained_models/square_rgb_dp"
 ROLLOUT_ROOT = ROOT / "rollouts/square_rgb_dp"
 CACHE_TAG = "square_rgb_dp"
 
-RGB_KEYS = ["agentview_image", "robot0_eye_in_hand_image"]
-PROPRIO_KEYS = ["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"]
+SINGLE_ARM_PROPRIO_KEYS = ["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"]
+TRANSPORT_PROPRIO_KEYS = [
+    "robot0_eef_pos",
+    "robot0_eef_quat",
+    "robot0_gripper_qpos",
+    "robot1_eef_pos",
+    "robot1_eef_quat",
+    "robot1_gripper_qpos",
+]
+
+TASK_ALIASES = {
+    "can": "can",
+    "square": "square",
+    "transport": "transport",
+    "tool_hang": "tool_hang",
+    "toolhang": "tool_hang",
+    "tool-hang": "tool_hang",
+}
+
+TASK_DEFAULTS = {
+    "can": {
+        "camera_names": ["agentview", "robot0_eye_in_hand"],
+        "rgb_keys": ["agentview_image", "robot0_eye_in_hand_image"],
+        "low_dim_keys": SINGLE_ARM_PROPRIO_KEYS,
+        "camera_size": 84,
+        "crop_size": 76,
+        "horizon": 400,
+    },
+    "square": {
+        "camera_names": ["agentview", "robot0_eye_in_hand"],
+        "rgb_keys": ["agentview_image", "robot0_eye_in_hand_image"],
+        "low_dim_keys": SINGLE_ARM_PROPRIO_KEYS,
+        "camera_size": 84,
+        "crop_size": 76,
+        "horizon": 400,
+    },
+    "transport": {
+        "camera_names": [
+            "shouldercamera0",
+            "shouldercamera1",
+            "robot0_eye_in_hand",
+            "robot1_eye_in_hand",
+        ],
+        "rgb_keys": [
+            "shouldercamera0_image",
+            "robot0_eye_in_hand_image",
+            "shouldercamera1_image",
+            "robot1_eye_in_hand_image",
+        ],
+        "low_dim_keys": TRANSPORT_PROPRIO_KEYS,
+        "camera_size": 84,
+        "crop_size": 76,
+        "horizon": 700,
+    },
+    "tool_hang": {
+        "camera_names": ["sideview", "robot0_eye_in_hand"],
+        "rgb_keys": ["sideview_image", "robot0_eye_in_hand_image"],
+        "low_dim_keys": SINGLE_ARM_PROPRIO_KEYS,
+        "camera_size": 240,
+        "crop_size": 216,
+        "horizon": 700,
+    },
+}
 
 COMMON_ENV = {
     "MPLCONFIGDIR": "/tmp/matplotlib",
@@ -66,9 +127,19 @@ COMMON_ENV = {
 }
 
 
+def normalize_task(task: str) -> str:
+    key = task.lower().replace("-", "_")
+    if key not in TASK_ALIASES:
+        supported = ", ".join(sorted(TASK_DEFAULTS))
+        raise ValueError(f"unsupported task '{task}'. Supported tasks: {supported}")
+    return TASK_ALIASES[key]
+
+
 def configure_task_paths(args) -> None:
     global CONFIG_DIR, MODEL_ROOT, ROLLOUT_ROOT, CACHE_TAG
 
+    args.task = normalize_task(args.task)
+    defaults = TASK_DEFAULTS[args.task]
     tag = f"{args.task}_rgb_dp"
     CACHE_TAG = tag
     CONFIG_DIR = ROOT / f"robomimic/exps/templates/{tag}"
@@ -79,6 +150,20 @@ def configure_task_paths(args) -> None:
         args.raw_dataset = ROOT / f"datasets/{args.task}/{args.dataset_type}/demo_v15.hdf5"
     if args.dataset is None:
         args.dataset = ROOT / f"datasets/{args.task}/{args.dataset_type}/image_v15.hdf5"
+    if args.camera_size is None:
+        args.camera_size = int(defaults["camera_size"])
+    if args.camera_names is None:
+        args.camera_names = list(defaults["camera_names"])
+    if args.rgb_keys is None:
+        args.rgb_keys = [f"{camera}_image" for camera in args.camera_names]
+        if args.camera_names == defaults["camera_names"]:
+            args.rgb_keys = list(defaults["rgb_keys"])
+    if args.low_dim_keys is None:
+        args.low_dim_keys = list(defaults["low_dim_keys"])
+    if args.crop_size is None:
+        args.crop_size = int(defaults["crop_size"])
+    if args.horizon is None:
+        args.horizon = int(defaults["horizon"])
 
 
 def process_env(cache_suffix: str) -> dict[str, str]:
@@ -88,7 +173,7 @@ def process_env(cache_suffix: str) -> dict[str, str]:
     return env
 
 
-def image_encoder_config() -> dict:
+def image_encoder_config(crop_size: int) -> dict:
     return {
         "core_class": "VisualCore",
         "core_kwargs": {
@@ -108,8 +193,8 @@ def image_encoder_config() -> dict:
         },
         "obs_randomizer_class": "CropRandomizer",
         "obs_randomizer_kwargs": {
-            "crop_height": 76,
-            "crop_width": 76,
+            "crop_height": crop_size,
+            "crop_width": crop_size,
             "num_crops": 1,
             "pos_enc": False,
         },
@@ -135,12 +220,13 @@ def dataset_download_message(path: Path, args) -> str:
     title = task_title(args)
     command = launcher_command(args, "dataset")
     return (
-        f"{title} {args.dataset_type.upper()} two-camera image dataset was not found:\n"
+        f"{title} {args.dataset_type.upper()} RGB image dataset was not found:\n"
         f"  {path}\n\n"
         f"Build it with:\n"
         f"  {command}\n\n"
         f"This first downloads the raw {title} {args.dataset_type.upper()} dataset and then runs "
-        f"dataset_states_to_obs.py with agentview + robot0_eye_in_hand at 84x84. "
+        f"dataset_states_to_obs.py with cameras {args.camera_names} at "
+        f"{args.camera_size}x{args.camera_size}. "
         f"If you already built a different image filename, pass it explicitly "
         f"via --dataset."
     )
@@ -168,6 +254,7 @@ def make_config(args) -> dict:
     # training objective, but avoids simulator / h5py / torch state leaking
     # into a long training process.
     config["experiment"]["rollout"]["enabled"] = args.enable_train_rollouts
+    config["experiment"]["rollout"]["horizon"] = int(args.horizon)
     config["experiment"]["save"]["every_n_epochs"] = args.save_every_epochs
     config["experiment"]["save"]["epochs"] = sorted(
         set(
@@ -218,8 +305,8 @@ def make_config(args) -> dict:
         config["algo"]["ddim"]["num_inference_timesteps"] = args.ddim_steps
 
     config["observation"]["modalities"]["obs"] = {
-        "low_dim": PROPRIO_KEYS,
-        "rgb": RGB_KEYS,
+        "low_dim": list(args.low_dim_keys),
+        "rgb": list(args.rgb_keys),
         "depth": [],
         "scan": [],
     }
@@ -229,7 +316,7 @@ def make_config(args) -> dict:
         "depth": [],
         "scan": [],
     }
-    config["observation"]["encoder"]["rgb"] = image_encoder_config()
+    config["observation"]["encoder"]["rgb"] = image_encoder_config(int(args.crop_size))
     return config
 
 
@@ -289,8 +376,7 @@ def build_dataset(args) -> None:
         "--output_name",
         args.dataset.name,
         "--camera_names",
-        "agentview",
-        "robot0_eye_in_hand",
+        *args.camera_names,
         "--camera_height",
         str(args.camera_size),
         "--camera_width",
@@ -477,7 +563,11 @@ def evaluate(checkpoint: Path, args) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", default="square", help="robomimic task name, e.g. square or can")
+    parser.add_argument(
+        "--task",
+        default="square",
+        help="robomimic task name: can, square, transport, or tool_hang",
+    )
     parser.add_argument("--dataset-type", default="ph", help="dataset type, e.g. ph or mh")
     parser.add_argument(
         "--stages",
@@ -488,7 +578,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset", type=Path, default=None)
     parser.add_argument("--raw-dataset", type=Path, default=None)
-    parser.add_argument("--camera-size", type=int, default=84)
+    parser.add_argument("--camera-size", type=int, default=None)
+    parser.add_argument(
+        "--camera-names",
+        nargs="+",
+        default=None,
+        help="Override image extraction cameras. Defaults are task-specific.",
+    )
+    parser.add_argument(
+        "--rgb-keys",
+        nargs="+",
+        default=None,
+        help="Override config RGB observation keys. Defaults to <camera>_image.",
+    )
+    parser.add_argument(
+        "--low-dim-keys",
+        nargs="+",
+        default=None,
+        help="Override config proprio observation keys. Defaults are task-specific.",
+    )
+    parser.add_argument(
+        "--crop-size",
+        type=int,
+        default=None,
+        help="Override square crop size for the RGB randomizer. Defaults are task-specific.",
+    )
     parser.add_argument("--force-dataset", action="store_true")
     parser.add_argument(
         "--recipe",
@@ -516,7 +630,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-train-rollouts", action="store_true")
     parser.add_argument("--ddim-steps", type=int, default=10)
     parser.add_argument("--hdf5-cache-mode", choices=("all", "low_dim"), default="all")
-    parser.add_argument("--horizon", type=int, default=400)
+    parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--eval-rollouts", type=int, default=100)
     parser.add_argument(
         "--eval-chunk-size",

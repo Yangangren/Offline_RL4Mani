@@ -323,21 +323,6 @@ case "$STAGE" in
       "${ROLLOUT_EVAL_COMMON_ARGS[@]}"
     ;;
 
-  smoke_train)
-    "$PYTHON" -B scripts/train_square_rgb_dp_one_step_idql.py \
-      --features "$FEATURES" \
-      --output-dir "${SMOKE_OUTPUT_DIR:-/tmp/one_step_idql_smoke}" \
-      --device "${SMOKE_DEVICE:-cpu}" \
-      --total-steps 2 \
-      --batch-size 16 \
-      --eval-every 1 \
-      --log-every 1 \
-      --critic-hidden-dims 64 64 \
-      --actor-hidden-dims 64 64 \
-      --num-diffusion-steps 10 \
-      "${AUX_NEXT_PRED_ARGS[@]}"
-    ;;
-
   train_visual_critic)
     "$PYTHON" -B scripts/train_square_rgb_dp_one_step_idql_visual_critic.py \
       --checkpoint "$DP_CHECKPOINT" \
@@ -440,33 +425,6 @@ case "$STAGE" in
     done
     echo "[train_visual_critic_resilient] exhausted $max_restarts attempts" >&2
     exit 1
-    ;;
-
-  smoke_train_visual_critic)
-    "$PYTHON" -B scripts/train_square_rgb_dp_one_step_idql_visual_critic.py \
-      --checkpoint "$DP_CHECKPOINT" \
-      --feature-index "$FEATURES" \
-      --demo-dataset "$DEMO_DATASET" \
-      --rollout-dataset "$ROLLOUT_DATASET" \
-      --output-dir "${SMOKE_OUTPUT_DIR:-/tmp/one_step_idql_visual_critic_smoke}" \
-      --device "${SMOKE_DEVICE:-cpu}" \
-      --total-steps 2 \
-      --batch-size 4 \
-      --eval-batch-size 4 \
-      --max-eval-batches 1 \
-      --num-workers "${SMOKE_NUM_WORKERS:-0}" \
-      --eval-num-workers "${SMOKE_EVAL_NUM_WORKERS:-0}" \
-      --prefetch-factor "${SMOKE_PREFETCH_FACTOR:-2}" \
-      --no-pin-memory \
-      --no-persistent-workers \
-      --eval-every 1 \
-      --log-every 1 \
-      --critic-hidden-dims 64 64 \
-      --actor-hidden-dims 64 64 \
-      --num-diffusion-steps 10 \
-      --no-tensorboard \
-      "${AUX_NEXT_PRED_ARGS[@]}" \
-      "${TRAIN_ACTOR_ENCODER_ARGS[@]}"
     ;;
 
   train_chunk_actor_iql)
@@ -734,10 +692,15 @@ PYGRID
     ;;
 
   eval_grid_resilient)
+    if [[ "$ACTOR_SOURCE" == "plain_dp" ]]; then
+      ckpt_name=$(basename "$DP_CHECKPOINT" .pth)
+    else
     ckpt_name=$(basename "$IDQL_CHECKPOINT" .pt)
+    fi
     grid_dir="${EVAL_OUTPUT}_${ckpt_name}"
     "$PYTHON" -B scripts/run_square_rgb_dp_one_step_idql_eval_grid.py \
       --idql-checkpoint "$IDQL_CHECKPOINT" \
+      --dp-checkpoint "$DP_CHECKPOINT" \
       --output-dir "$grid_dir" \
       --device cuda \
       --actor-source "$ACTOR_SOURCE" \
@@ -746,33 +709,17 @@ PYGRID
       --horizon "${HORIZON:-400}" \
       --num-candidates "${EVAL_NUM_CANDIDATE_ARGS[@]}" \
       --seeds "${EVAL_SEED_ARGS[@]}" \
-      --rollouts-per-chunk "${ROLLOUTS_PER_CHUNK:-5}" \
+      --rollouts-per-chunk "${ROLLOUTS_PER_CHUNK:-10}" \
       --max-retries "${EVAL_MAX_RETRIES:-3}" \
       --candidate-batch-size "${CANDIDATE_BATCH_SIZE:-16}" \
       --num-inference-steps "${NUM_INFERENCE_STEPS:-100}" \
+      --execution-horizon "${EXECUTION_HORIZON:-1}" \
       --selection "${SELECTION:-argmax}" \
       "${DIFFUSION_CLIP_SAMPLE_ARGS[@]}"
     ;;
 
-  smoke_eval)
-    "$PYTHON" -B scripts/eval_square_rgb_dp_one_step_idql.py \
-      --idql-checkpoint "$IDQL_CHECKPOINT" \
-      --output-dir "${SMOKE_EVAL_OUTPUT:-/tmp/one_step_idql_eval_smoke}" \
-      --device cuda \
-      --actor-source "$ACTOR_SOURCE" \
-      --critic-source "$CRITIC_SOURCE" \
-      --n-rollouts 1 \
-      --horizon 400 \
-      --seed 0 \
-      --num-candidates "${N:-2}" \
-      --candidate-batch-size "${CANDIDATE_BATCH_SIZE:-2}" \
-      --num-inference-steps "${NUM_INFERENCE_STEPS:-100}" \
-      --selection argmax \
-      "${DIFFUSION_CLIP_SAMPLE_ARGS[@]}"
-    ;;
-
   *)
-    echo "Usage: $0 {build_features|build_risk_reward_features|build_hybrid_reward_features|build_signed_risk_reward_features|build_failure_only_signed_risk_reward_features|build_failure_only_potential_risk_reward_features|train|train_resilient|train_with_rollout_eval|smoke_train|train_visual_critic|train_visual_critic_resilient|smoke_train_visual_critic|train_chunk_actor_iql|train_chunk_actor_iql_resilient|smoke_train_chunk_actor_iql|eval_chunk_actor_iql|eval|eval_grid|eval_grid_resilient|smoke_eval}" >&2
+    echo "Usage: $0 {build_features|build_gt_good_failure_chunks|build_risk_reward_features|build_hybrid_reward_features|build_signed_risk_reward_features|build_failure_only_signed_risk_reward_features|build_failure_only_potential_risk_reward_features|train|train_resilient|train_with_rollout_eval|smoke_train|train_visual_critic|train_visual_critic_resilient|smoke_train_visual_critic|train_chunk_actor_iql|train_chunk_actor_iql_resilient|train_chunk_actor_dql|train_chunk_actor_dql_resilient|smoke_train_chunk_actor_iql|train_self_imitation|train_self_imitation_resilient|train_mixed_imitation|train_mixed_imitation_resilient|train_conditioned_mixed_imitation|train_conditioned_mixed_imitation_resilient|train_gt_good_failure_imitation|train_gt_good_failure_imitation_resilient|eval_chunk_actor_iql|eval|eval_grid|eval_grid_resilient|smoke_eval}" >&2
     exit 2
     ;;
 esac

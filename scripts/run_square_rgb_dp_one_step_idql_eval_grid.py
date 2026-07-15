@@ -159,6 +159,11 @@ def eval_command(
     ]
     cmd.append("--clip-actions" if args.clip_actions else "--no-clip-actions")
     cmd.append("--diffusion-clip-sample" if args.diffusion_clip_sample else "--no-diffusion-clip-sample")
+    cmd.append(
+        "--require-success-condition-adapter"
+        if args.require_success_condition_adapter
+        else "--no-require-success-condition-adapter"
+    )
     return cmd
 
 
