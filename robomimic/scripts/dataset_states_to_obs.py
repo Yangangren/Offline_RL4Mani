@@ -49,6 +49,7 @@ Example usage:
 """
 import os
 import json
+import atexit
 import h5py
 import argparse
 import numpy as np
@@ -59,6 +60,69 @@ import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.env_utils as EnvUtils
 from robomimic.envs.env_base import EnvBase
+
+
+_CONVERSION_MANIFEST_ATTR = "_robomimic_conversion_manifest"
+_CONVERSION_STATUS_ATTR = "_robomimic_conversion_status"
+_EPISODE_COMPLETE_ATTR = "_robomimic_conversion_complete"
+
+
+def _metadata_identity(value):
+    """Return a stable, exact identity for XML and episode metadata values."""
+    if isinstance(value, bytes):
+        return ("bytes", value)
+    if value is None:
+        return ("none", None)
+    return ("str", str(value))
+
+
+def _close_environment(env):
+    """Explicitly release renderer and simulator resources when supported."""
+    if env is None:
+        return
+    try:
+        base_env = env.base_env
+        close_fn = getattr(base_env, "close", None)
+        if callable(close_fn):
+            close_fn()
+            return
+        close_fn = getattr(env, "close", None)
+        if callable(close_fn):
+            close_fn()
+    except Exception as exc:
+        # Cleanup should be attempted on every exit, but should not hide the
+        # conversion result or the original exception.
+        print("WARNING: environment cleanup failed: {}".format(exc))
+
+
+def _conversion_manifest(args):
+    source_stat = os.stat(args.dataset)
+    return json.dumps(
+        dict(
+            version=1,
+            source_path=os.path.realpath(args.dataset),
+            source_size=source_stat.st_size,
+            source_mtime_ns=source_stat.st_mtime_ns,
+            n=args.n,
+            shaped=args.shaped,
+            done_mode=args.done_mode,
+            copy_rewards=args.copy_rewards,
+            copy_dones=args.copy_dones,
+            camera_names=list(args.camera_names),
+            camera_height=args.camera_height,
+            camera_width=args.camera_width,
+            depth=args.depth,
+            exclude_next_obs=args.exclude_next_obs,
+            compress=args.compress,
+            reuse_identical_models=args.reuse_identical_models,
+        ),
+        sort_keys=True,
+    )
+
+
+def _close_hdf5(file_handle):
+    if file_handle is not None and file_handle.id.valid:
+        file_handle.close()
 
 
 def extract_trajectory(
@@ -221,6 +285,34 @@ def dataset_states_to_obs(args):
     if args.depth:
         assert len(args.camera_names) > 0, "must specify camera names if using depth"
 
+    # Resolve and validate output paths before allocating MuJoCo / EGL.
+    output_name = args.output_name
+    if output_name is None:
+        if len(args.camera_names) == 0:
+            output_name = os.path.basename(args.dataset)[:-5] + "_ld.hdf5"
+        else:
+            output_name = os.path.basename(args.dataset)[:-5] + "_im{}.hdf5".format(args.camera_width)
+    output_path = os.path.join(os.path.dirname(args.dataset), output_name)
+    partial_path = output_path + ".partial"
+    if os.path.realpath(output_path) == os.path.realpath(args.dataset):
+        raise ValueError("output dataset must differ from the input dataset")
+    if os.path.exists(output_path) and not args.overwrite:
+        raise FileExistsError(
+            "output dataset already exists at {}. Refusing to overwrite it; "
+            "pass --overwrite explicitly if replacement is intended.".format(output_path)
+        )
+    if args.restart and os.path.exists(partial_path):
+        os.remove(partial_path)
+
+    partial_exists = os.path.exists(partial_path)
+    if partial_exists and not args.resume:
+        raise FileExistsError(
+            "partial conversion already exists at {}. Re-run with --resume "
+            "or --restart.".format(partial_path)
+        )
+
+    manifest = _conversion_manifest(args)
+
     # create environment to use for data processing
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=args.dataset)
     env = EnvUtils.create_env_for_data_processing(
@@ -231,6 +323,7 @@ def dataset_states_to_obs(args):
         reward_shaping=args.shaped,
         use_depth_obs=args.depth,
     )
+    atexit.register(_close_environment, env)
 
     print("==== Using environment with the following metadata ====")
     print(json.dumps(env.serialize(), indent=4))
@@ -241,6 +334,7 @@ def dataset_states_to_obs(args):
 
     # list of all demonstration episodes (sorted in increasing number order)
     f = h5py.File(args.dataset, "r")
+    atexit.register(_close_hdf5, f)
     demos = list(f["data"].keys())
     inds = np.argsort([int(elem[5:]) for elem in demos])
     demos = [demos[i] for i in inds]
@@ -249,35 +343,85 @@ def dataset_states_to_obs(args):
     if args.n is not None:
         demos = demos[:args.n]
 
-    # output file in same directory as input file
-    output_name = args.output_name
-    if output_name is None:
-        if len(args.camera_names) == 0:
-            output_name = os.path.basename(args.dataset)[:-5] + "_ld.hdf5"
-        else:
-            output_name = os.path.basename(args.dataset)[:-5] + "_im{}.hdf5".format(args.camera_width)
+    # Write to a partial file, and atomically publish only a complete dataset.
+    f_out = h5py.File(partial_path, "a" if partial_exists else "w")
+    atexit.register(_close_hdf5, f_out)
+    if partial_exists:
+        stored_manifest = f_out.attrs.get(_CONVERSION_MANIFEST_ATTR, None)
+        if isinstance(stored_manifest, bytes):
+            stored_manifest = stored_manifest.decode("utf-8")
+        if stored_manifest != manifest:
+            raise RuntimeError(
+                "partial conversion options or source dataset do not match the "
+                "current request. Re-run with --restart after checking the paths."
+            )
+        print("resuming partial output: {}".format(partial_path))
+        data_grp = f_out["data"]
+    else:
+        f_out.attrs[_CONVERSION_MANIFEST_ATTR] = manifest
+        f_out.attrs[_CONVERSION_STATUS_ATTR] = "in_progress"
+        data_grp = f_out.create_group("data")
 
-    output_path = os.path.join(os.path.dirname(args.dataset), output_name)
-    f_out = h5py.File(output_path, "w")
-    data_grp = f_out.create_group("data")
+    # Drop only a trajectory that was interrupted before its final flush.
+    completed_demos = set()
+    for ep in list(data_grp.keys()):
+        if bool(data_grp[ep].attrs.get(_EPISODE_COMPLETE_ATTR, False)):
+            completed_demos.add(ep)
+        else:
+            del data_grp[ep]
+    unexpected_demos = completed_demos.difference(demos)
+    if unexpected_demos:
+        raise RuntimeError(
+            "partial output contains demos outside this request: {}".format(
+                sorted(unexpected_demos)
+            )
+        )
+
     print("input file: {}".format(args.dataset))
     print("output file: {}".format(output_path))
+    print("partial file: {}".format(partial_path))
+    if completed_demos:
+        print(
+            "reusing {} completed trajectories from the partial output".format(
+                len(completed_demos)
+            )
+        )
 
-    total_samples = 0
+    total_samples = sum(
+        int(data_grp[ep].attrs["num_samples"])
+        for ep in completed_demos
+    )
+    loaded_model_key = None
     for ind in tqdm(range(len(demos))):
         ep = demos[ind]
+        if ep in completed_demos:
+            continue
+
+        source_ep_grp = f["data/{}".format(ep)]
 
         # prepare initial state to reload from
-        states = f["data/{}/states".format(ep)][()]
+        states = source_ep_grp["states"][()]
         initial_state = dict(states=states[0])
+        model_file = None
         if is_robosuite_env:
-            initial_state["model"] = f["data/{}".format(ep)].attrs["model_file"]
-            initial_state["ep_meta"] = f["data/{}".format(ep)].attrs.get("ep_meta", None)
+            model_file = source_ep_grp.attrs["model_file"]
+            ep_meta = source_ep_grp.attrs.get("ep_meta", None)
+            model_key = (
+                _metadata_identity(model_file),
+                _metadata_identity(ep_meta),
+            )
+            if (
+                not args.reuse_identical_models
+                or model_key != loaded_model_key
+            ):
+                initial_state["model"] = model_file
+                initial_state["ep_meta"] = ep_meta
+                loaded_model_key = model_key
 
         # extract obs, rewards, dones
-        actions = f["data/{}/actions".format(ep)][()]
-        if "data/{}/actions_abs".format(ep) in f:
-            actions_abs = f["data/{}/actions_abs".format(ep)][()]
+        actions = source_ep_grp["actions"][()]
+        if "actions_abs" in source_ep_grp:
+            actions_abs = source_ep_grp["actions_abs"][()]
         else:
             actions_abs = None
         traj, camera_info = extract_trajectory(
@@ -294,9 +438,9 @@ def dataset_states_to_obs(args):
 
         # maybe copy reward or done signal from source file
         if args.copy_rewards:
-            traj["rewards"] = f["data/{}/rewards".format(ep)][()]
+            traj["rewards"] = source_ep_grp["rewards"][()]
         if args.copy_dones:
-            traj["dones"] = f["data/{}/dones".format(ep)][()]
+            traj["dones"] = source_ep_grp["dones"][()]
 
         # store transitions
 
@@ -321,16 +465,16 @@ def dataset_states_to_obs(args):
                     ep_data_grp.create_dataset("next_obs/{}".format(k), data=np.array(traj["next_obs"][k]))
 
         # copy action dict (if applicable)
-        if "data/{}/action_dict".format(ep) in f:
-            action_dict = f["data/{}/action_dict".format(ep)]
+        if "action_dict" in source_ep_grp:
+            action_dict = source_ep_grp["action_dict"]
             for k in action_dict:
                 ep_data_grp.create_dataset("action_dict/{}".format(k), data=np.array(action_dict[k][()]))
 
         # episode metadata
         if is_robosuite_env:
-            ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"] # model xml for this episode
-        if "ep_meta" in f["data/{}".format(ep)].attrs:
-            ep_data_grp.attrs["ep_meta"] = f["data/{}".format(ep)].attrs["ep_meta"]
+            ep_data_grp.attrs["model_file"] = model_file # model xml for this episode
+        if "ep_meta" in source_ep_grp.attrs:
+            ep_data_grp.attrs["ep_meta"] = source_ep_grp.attrs["ep_meta"]
         for attr_name in (
             "episode_return",
             "policy_success",
@@ -340,8 +484,8 @@ def dataset_states_to_obs(args):
             "policy_seed",
             "env_index",
         ):
-            if attr_name in f["data/{}".format(ep)].attrs:
-                ep_data_grp.attrs[attr_name] = f["data/{}".format(ep)].attrs[attr_name]
+            if attr_name in source_ep_grp.attrs:
+                ep_data_grp.attrs[attr_name] = source_ep_grp.attrs[attr_name]
         ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0] # number of transitions in this episode
 
         if camera_info is not None:
@@ -349,19 +493,28 @@ def dataset_states_to_obs(args):
             ep_data_grp.attrs["camera_info"] = json.dumps(camera_info, indent=4)
 
         total_samples += traj["actions"].shape[0]
-
+        ep_data_grp.attrs[_EPISODE_COMPLETE_ATTR] = True
+        f_out.flush()
 
     # copy over all filter keys that exist in the original hdf5
+    if "mask" in f_out:
+        del f_out["mask"]
     if "mask" in f:
         f.copy("mask", f_out)
 
     # global metadata
     data_grp.attrs["total"] = total_samples
     data_grp.attrs["env_args"] = json.dumps(env.serialize(), indent=4) # environment info
-    print("Wrote {} trajectories to {}".format(len(demos), output_path))
+    f_out.attrs[_CONVERSION_STATUS_ATTR] = "complete"
+    f_out.flush()
 
     f.close()
     f_out.close()
+    _close_environment(env)
+    atexit.unregister(_close_hdf5)
+    atexit.unregister(_close_environment)
+    os.replace(partial_path, output_path)
+    print("Wrote {} trajectories to {}".format(len(demos), output_path))
 
 
 if __name__ == "__main__":
@@ -463,6 +616,33 @@ if __name__ == "__main__":
         "--compress", 
         action='store_true',
         help="(optional) compress observations with gzip option in hdf5",
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume a matching partial conversion, if one exists",
+    )
+
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="discard a partial conversion and start it again from the first trajectory",
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="atomically replace an existing completed output dataset",
+    )
+
+    parser.add_argument(
+        "--reuse-identical-models",
+        action="store_true",
+        help=(
+            "avoid repeated XML reloads for consecutive trajectories with "
+            "identical model XML and episode metadata"
+        ),
     )
 
     args = parser.parse_args()

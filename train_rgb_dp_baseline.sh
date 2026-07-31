@@ -49,17 +49,22 @@ SCRIPT=scripts/run_rgb_dp_baseline.py
 STAGE=${1:-prepare}
 RECIPE=${RECIPE:-official}
 DATASET_TYPE=${DATASET_TYPE:-ph}
-TARGET_EPOCH=${TARGET_EPOCH:-2000}
+
+TARGET_EPOCH=${TARGET_EPOCH:-200}
 EPOCHS=${EPOCHS:-$TARGET_EPOCH}
 STEPS_PER_EPOCH=${STEPS_PER_EPOCH:-100}
 BATCH_SIZE=${BATCH_SIZE:-100}
 LR=${LR:-1e-4}
 SAVE_EVERY_EPOCHS=${SAVE_EVERY_EPOCHS:-50}
-EVAL_ROLLOUTS=${EVAL_ROLLOUTS:-100}
+EXTRA_SAVE_EPOCHS=${EXTRA_SAVE_EPOCHS:-200 250 300}
+HDF5_CACHE_MODE=${HDF5_CACHE_MODE:-}
+NUM_DATA_WORKERS=${NUM_DATA_WORKERS:-}
+EVAL_ROLLOUTS=${EVAL_ROLLOUTS:-50}
 EVAL_CHUNK_SIZE=${EVAL_CHUNK_SIZE:-10}
 MAX_TRAIN_ATTEMPTS=${MAX_TRAIN_ATTEMPTS:-100}
-MAX_EVAL_RETRIES=${MAX_EVAL_RETRIES:-5}
+MAX_EVAL_RETRIES=${MAX_EVAL_RETRIES:-0}
 read -r -a EVAL_SEED_ARRAY <<< "${EVAL_SEEDS:-0 1 2 3 4}"
+read -r -a EXTRA_SAVE_EPOCH_ARRAY <<< "$EXTRA_SAVE_EPOCHS"
 
 BASE_ARGS=(
   --task "$TASK"
@@ -106,6 +111,9 @@ TRAIN_ARGS=(
   --save-every-epochs "$SAVE_EVERY_EPOCHS"
   --max-train-attempts "$MAX_TRAIN_ATTEMPTS"
 )
+if (( ${#EXTRA_SAVE_EPOCH_ARRAY[@]} > 0 )); then
+  TRAIN_ARGS+=(--extra-save-epochs "${EXTRA_SAVE_EPOCH_ARRAY[@]}")
+fi
 if [[ -n "${SEED:-}" ]]; then
   TRAIN_ARGS+=(--seed "$SEED")
 fi
@@ -114,6 +122,12 @@ if [[ "${FORCE_TRAIN:-0}" == "1" ]]; then
 fi
 if [[ "${ENABLE_TRAIN_ROLLOUTS:-0}" == "1" ]]; then
   TRAIN_ARGS+=(--enable-train-rollouts)
+fi
+if [[ -n "$HDF5_CACHE_MODE" ]]; then
+  TRAIN_ARGS+=(--hdf5-cache-mode "$HDF5_CACHE_MODE")
+fi
+if [[ -n "$NUM_DATA_WORKERS" ]]; then
+  TRAIN_ARGS+=(--num-data-workers "$NUM_DATA_WORKERS")
 fi
 
 EVAL_ARGS=(
@@ -151,30 +165,24 @@ case "$STAGE" in
     run_stage --stages train "${TRAIN_ARGS[@]}"
     ;;
 
+  resume)
+    run_stage --stages train "${TRAIN_ARGS[@]}" --resume-train
+    ;;
+
   train_resilient)
     run_stage --stages train "${TRAIN_ARGS[@]}" --resilient-train
+    ;;
+
+  resume_resilient)
+    run_stage --stages train "${TRAIN_ARGS[@]}" --resume-train --resilient-train
     ;;
 
   eval)
     run_stage --stages eval "${EVAL_ARGS[@]}"
     ;;
 
-  all)
-    "$0" "$TASK" dataset
-    "$0" "$TASK" prepare
-    "$0" "$TASK" train
-    "$0" "$TASK" eval
-    ;;
-
-  all_resilient)
-    "$0" "$TASK" dataset
-    "$0" "$TASK" prepare
-    "$0" "$TASK" train_resilient
-    "$0" "$TASK" eval
-    ;;
-
   *)
-    echo "Usage: $0 [can|square|transport|tool_hang] {dataset|prepare|train|train_resilient|eval|all|all_resilient}" >&2
+    echo "Usage: $0 [can|square|transport|tool_hang] {dataset|prepare|train|resume|train_resilient|resume_resilient|eval}" >&2
     exit 2
     ;;
 esac

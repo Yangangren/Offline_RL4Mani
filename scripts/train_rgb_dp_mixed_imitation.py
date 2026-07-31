@@ -140,6 +140,78 @@ def infer_description(args: argparse.Namespace) -> str:
     return "actor-only post-deployment DP training"
 
 
+def condition_source_values(args: argparse.Namespace) -> dict[str, float]:
+    if str(args.condition_label_mode) == "human_only":
+        return {
+            "human_demo": 1.0,
+            "success_rollout": 0.0,
+            "failure_rollout": 0.0,
+        }
+    return {
+        "human_demo": 1.0,
+        "success_rollout": 1.0,
+        "failure_rollout": 0.0,
+    }
+
+
+def success_condition_summary(args: argparse.Namespace) -> dict[str, Any]:
+    if not bool(args.conditioned_mixed_imitation):
+        return {
+            "enabled": False,
+            "condition_input_used": False,
+            "label_mode": None,
+            "positive_sources": [],
+            "negative_sources": [],
+            "source_conditions": None,
+            "source_condition_masks": None,
+            "inference_condition": None,
+            "inference_condition_mask": None,
+            "dropout": None,
+            "dropout_semantics": None,
+            "hidden_dim": None,
+        }
+    source_conditions = condition_source_values(args)
+    return {
+        "enabled": True,
+        "condition_input_used": True,
+        "label_mode": str(args.condition_label_mode),
+        "positive_sources": [
+            source for source, value in source_conditions.items() if value == 1.0
+        ],
+        "negative_sources": [
+            source for source, value in source_conditions.items() if value == 0.0
+        ],
+        "source_conditions": source_conditions,
+        "source_condition_masks": {
+            "human_demo": 1.0,
+            "success_rollout": 1.0,
+            "failure_rollout": 1.0,
+        },
+        "inference_condition": 1.0,
+        "inference_condition_mask": 1.0,
+        "dropout": float(args.condition_dropout),
+        "dropout_semantics": "condition=0, mask=0 null token; real failure is condition=0, mask=1",
+        "hidden_dim": int(args.condition_hidden_dim),
+    }
+
+
+def has_success_condition_adapter(actor_algo) -> bool:
+    adapter_in_nets = "condition_adapter" in actor_algo.nets["policy"]
+    adapter_in_ema = (
+        actor_algo.ema is not None
+        and "condition_adapter" in actor_algo.ema.averaged_model["policy"]
+    )
+    return bool(adapter_in_nets or adapter_in_ema)
+
+
+def require_unconditioned_policy(actor_algo, checkpoint: Path) -> None:
+    if has_success_condition_adapter(actor_algo):
+        raise ValueError(
+            "standard mixed imitation must not use a condition adapter, but one "
+            f"was found in checkpoint {checkpoint}"
+        )
+
+
 def make_summary(
     *,
     args: argparse.Namespace,
@@ -150,6 +222,7 @@ def make_summary(
     last_checkpoint: Path | None,
 ) -> dict:
     mode_name = infer_mode_name(args)
+    policy_optim = actor_config.algo.optim_params.policy
     return {
         "mode": mode_name,
         "description": infer_description(args),
@@ -157,6 +230,8 @@ def make_summary(
         "output_dir": str(args.output_dir),
         "epochs": int(args.epochs),
         "steps_per_epoch": int(args.steps_per_epoch),
+        "steps_per_epoch_source": str(args.steps_per_epoch_source),
+        "drop_last": bool(args.actor_drop_last),
         "actor_dataset_size": int(len(actor_dataset)),
         "actor_action_normalization_source": getattr(
             actor_dataset,
@@ -167,29 +242,50 @@ def make_summary(
             getattr(args, "actor_initialized_from_deployed_ema", False)
         ),
         "actor_data": jsonable(actor_config.train.data),
+        "actor_optimization": {
+            "optimizer_type": str(policy_optim.optimizer_type),
+            "initial_learning_rate": float(policy_optim.learning_rate.initial),
+            "scheduler_type": str(policy_optim.learning_rate.scheduler_type),
+            "scheduler_enabled": not bool(args.actor_disable_lr_scheduler),
+            "scheduler_step_every_batch": bool(policy_optim.learning_rate.step_every_batch),
+            "scheduler_warmup_steps": int(policy_optim.learning_rate.warmup_steps),
+            "scheduler_num_cycles": float(policy_optim.learning_rate.num_cycles),
+            "weight_decay": float(policy_optim.regularization.L2),
+            "num_train_batches": int(policy_optim.num_train_batches),
+            "num_epochs": int(policy_optim.num_epochs),
+            "batch_size": int(actor_config.train.batch_size),
+            "seed": int(actor_config.train.seed),
+        },
+        "actor_normalization": {
+            "hdf5_normalize_obs": bool(actor_config.train.hdf5_normalize_obs),
+            "action_config": jsonable(actor_config.train.action_config),
+            "action_stats_source": getattr(
+                actor_dataset,
+                "actor_action_normalization_source",
+                None,
+            ),
+            "normalize_source_weights_by_dataset_size": bool(
+                actor_config.train.normalize_weights_by_ds_size
+            ),
+        },
+        "actor_sampling": {
+            "mode": (
+                "uniform_sample_pool_without_replacement"
+                if args.actor_uniform_sample_pool
+                else "weighted_random_with_replacement"
+            ),
+            "source_weighting_enabled": not bool(args.actor_uniform_sample_pool),
+            "source_weights": None if args.actor_uniform_sample_pool else {
+                "human_demo": float(args.actor_demo_weight),
+                "success_rollout": float(args.actor_success_weight),
+                "failure_rollout": float(args.actor_failure_weight),
+            },
+        },
         "actor_training_scope": "full_pretrained_dp_policy_including_obs_encoder",
         "actor_trainability": jsonable(trainability),
         "critic_trained": False,
         "loaded_pretrained_dp": True,
-        "success_conditioning": {
-            "enabled": bool(args.conditioned_mixed_imitation),
-            "positive_sources": ["demo", "success"],
-            "negative_sources": ["failure"],
-            "source_conditions": {
-                "human_demo": 1.0,
-                "success_rollout": 1.0,
-                "failure_rollout": 0.0,
-            },
-            "source_condition_masks": {
-                "human_demo": 1.0,
-                "success_rollout": 1.0,
-                "failure_rollout": 1.0,
-            },
-            "inference_condition": 1.0,
-            "dropout": float(args.condition_dropout),
-            "dropout_semantics": "condition=0, mask=0 null token; real failure is condition=0, mask=1",
-            "hidden_dim": int(args.condition_hidden_dim),
-        },
+        "success_conditioning": success_condition_summary(args),
         "last_checkpoint": str(last_checkpoint) if last_checkpoint is not None else None,
         "history": history,
     }
@@ -204,22 +300,58 @@ def train(args: argparse.Namespace) -> dict:
         failure_label = float(args.actor_failure_anti_failure_label)
         if float(args.actor_failure_weight) > 0.0 and failure_label != 1.0:
             raise ValueError(
-                "conditioned mixed imitation requires failure rollouts to use "
-                f"actor_failure_anti_failure_label=1.0, got {failure_label}"
+                "conditioned mixed imitation requires failure condition 0 "
+                f"(actor_failure_anti_failure_label=1.0), got {failure_label}"
             )
 
+    device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
+
+    dp_ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    checkpoint_config, _ = FileUtils.config_from_checkpoint(
+        ckpt_dict=dp_ckpt,
+        verbose=False,
+    )
+    if args.seed is None:
+        args.seed = int(checkpoint_config.train.seed)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
-    device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
 
-    actor_policy, dp_ckpt = FileUtils.policy_from_checkpoint(
-        ckpt_path=str(args.checkpoint),
+    actor_policy, _ = FileUtils.policy_from_checkpoint(
+        ckpt_dict=dp_ckpt,
         device=device,
         verbose=False,
     )
     actor_policy.start_episode()
     actor_algo = actor_policy.policy
+    if args.actor_batch_size is None:
+        args.actor_batch_size = int(checkpoint_config.train.batch_size)
+    if args.actor_lr is None:
+        args.actor_lr = float(
+            checkpoint_config.algo.optim_params.policy.learning_rate.initial
+        )
+    active_actor_sources = sum(
+        float(weight) > 0.0
+        for weight in (
+            args.actor_demo_weight,
+            args.actor_success_weight,
+            args.actor_failure_weight,
+        )
+    )
+    if args.actor_uniform_sample_pool:
+        args.actor_normalize_weights_by_ds_size = False
+    elif args.actor_normalize_weights_by_ds_size is None:
+        args.actor_normalize_weights_by_ds_size = (
+            bool(checkpoint_config.train.normalize_weights_by_ds_size)
+            if active_actor_sources == 1
+            else True
+        )
+    if args.actor_hdf5_cache_mode is None:
+        args.actor_hdf5_cache_mode = (
+            str(checkpoint_config.train.hdf5_cache_mode)
+            if active_actor_sources == 1
+            else "low_dim"
+        )
     args.actor_initialized_from_deployed_ema = False
     if args.resume_checkpoint is None:
         args.actor_initialized_from_deployed_ema = initialize_actor_from_deployed_ema(actor_algo)
@@ -229,13 +361,32 @@ def train(args: argparse.Namespace) -> dict:
         if not hasattr(actor_algo, "install_success_condition_adapter"):
             raise RuntimeError("loaded policy does not support success-conditioned DP adapters")
         actor_algo.install_success_condition_adapter(hidden_dim=int(args.condition_hidden_dim))
+        actor_algo.set_inference_success_condition(
+            success_condition=1.0,
+            condition_mask=1.0,
+        )
         actor_algo.success_condition_dropout = float(args.condition_dropout)
-    configure_actor_optimizer(actor_algo, args.actor_lr, args.actor_disable_lr_scheduler)
-
+    else:
+        require_unconditioned_policy(actor_algo, args.checkpoint)
     actor_dataset, actor_loader, actor_config = build_actor_loader(
         args=args,
         actor_algo=actor_algo,
         checkpoint_dict=dp_ckpt,
+    )
+    args.actor_drop_last = bool(actor_loader.drop_last)
+    if args.steps_per_epoch is None:
+        args.steps_per_epoch = len(actor_loader)
+        args.steps_per_epoch_source = "dataloader_length"
+    else:
+        args.steps_per_epoch_source = "command_line_override"
+
+    configure_actor_optimizer(
+        actor_algo,
+        args.actor_lr,
+        args.actor_disable_lr_scheduler,
+        num_train_batches=args.steps_per_epoch,
+        num_epochs=args.epochs,
+        reset_scheduler=True,
     )
     with actor_config.values_unlocked():
         actor_config.experiment.name = args.experiment_name
@@ -243,6 +394,9 @@ def train(args: argparse.Namespace) -> dict:
         actor_config.train.output_dir = str(args.output_dir)
         actor_config.train.num_epochs = int(args.epochs)
         actor_config.train.seed = int(args.seed)
+        actor_config.algo.optim_params.policy.learning_rate.initial = float(args.actor_lr)
+        actor_config.algo.optim_params.policy.num_train_batches = int(args.steps_per_epoch)
+        actor_config.algo.optim_params.policy.num_epochs = int(args.epochs)
 
     start_epoch = 0
     global_step = 0
@@ -252,7 +406,16 @@ def train(args: argparse.Namespace) -> dict:
         if "model" not in ckpt:
             raise ValueError(f"resume checkpoint is not a robomimic policy checkpoint: {args.resume_checkpoint}")
         actor_algo.deserialize(ckpt["model"], load_optimizers=True)
-        configure_actor_optimizer(actor_algo, args.actor_lr, args.actor_disable_lr_scheduler)
+        if not bool(args.conditioned_mixed_imitation):
+            require_unconditioned_policy(actor_algo, args.resume_checkpoint)
+        configure_actor_optimizer(
+            actor_algo,
+            args.actor_lr,
+            args.actor_disable_lr_scheduler,
+            num_train_batches=args.steps_per_epoch,
+            num_epochs=args.epochs,
+            preserve_current_lr=True,
+        )
         variable_state = ckpt.get("variable_state", {}) or {}
         start_epoch = int(variable_state.get("epoch", 0))
         global_step = int(variable_state.get("global_step", start_epoch * int(args.steps_per_epoch)))
@@ -277,21 +440,51 @@ def train(args: argparse.Namespace) -> dict:
                 ),
                 "actor_initialized_from_deployed_ema": bool(args.actor_initialized_from_deployed_ema),
                 "actor_data": jsonable(actor_config.train.data),
-                "success_conditioning": {
-                    "enabled": bool(args.conditioned_mixed_imitation),
-                    "source_conditions": {
-                        "human_demo": 1.0,
-                        "success_rollout": 1.0,
-                        "failure_rollout": 0.0,
-                    },
-                    "source_condition_masks": {
-                        "human_demo": 1.0,
-                        "success_rollout": 1.0,
-                        "failure_rollout": 1.0,
-                    },
-                    "dropout": float(args.condition_dropout),
-                    "hidden_dim": int(args.condition_hidden_dim),
+                "actor_optimization": {
+                    "optimizer_type": str(actor_config.algo.optim_params.policy.optimizer_type),
+                    "initial_learning_rate": float(args.actor_lr),
+                    "scheduler_type": str(
+                        actor_config.algo.optim_params.policy.learning_rate.scheduler_type
+                    ),
+                    "scheduler_enabled": not bool(args.actor_disable_lr_scheduler),
+                    "scheduler_step_every_batch": bool(
+                        actor_config.algo.optim_params.policy.learning_rate.step_every_batch
+                    ),
+                    "scheduler_warmup_steps": int(
+                        actor_config.algo.optim_params.policy.learning_rate.warmup_steps
+                    ),
+                    "weight_decay": float(
+                        actor_config.algo.optim_params.policy.regularization.L2
+                    ),
+                    "batch_size": int(args.actor_batch_size),
+                    "seed": int(args.seed),
+                    "steps_per_epoch": int(args.steps_per_epoch),
+                    "steps_per_epoch_source": str(args.steps_per_epoch_source),
+                    "actor_dataset_size": int(len(actor_dataset)),
+                    "drop_last": bool(args.actor_drop_last),
+                    "epochs": int(args.epochs),
                 },
+                "actor_normalization": {
+                    "hdf5_normalize_obs": bool(actor_config.train.hdf5_normalize_obs),
+                    "action_config": jsonable(actor_config.train.action_config),
+                    "action_stats_source": getattr(
+                        actor_dataset,
+                        "actor_action_normalization_source",
+                        None,
+                    ),
+                    "normalize_source_weights_by_dataset_size": bool(
+                        actor_config.train.normalize_weights_by_ds_size
+                    ),
+                },
+                "actor_sampling": {
+                    "mode": (
+                        "uniform_sample_pool_without_replacement"
+                        if args.actor_uniform_sample_pool
+                        else "weighted_random_with_replacement"
+                    ),
+                    "source_weighting_enabled": not bool(args.actor_uniform_sample_pool),
+                },
+                "success_conditioning": success_condition_summary(args),
                 "resume_epoch": int(start_epoch),
             },
             indent=2,
@@ -416,31 +609,85 @@ def main() -> None:
     parser.add_argument("--mode-name", type=str, default=None)
     parser.add_argument("--description", type=str, default=None)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    parser.add_argument("--seed", type=int, default=20260710)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Defaults to train.seed from the pretrained DP checkpoint.",
+    )
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--steps-per-epoch", type=int, default=100)
-    parser.add_argument("--actor-batch-size", type=int, default=100)
+    parser.add_argument(
+        "--steps-per-epoch",
+        type=int,
+        default=None,
+        help=(
+            "Override batches per epoch. By default, use len(train_loader): one "
+            "shuffled pass over the selected pooled sequences per epoch."
+        ),
+    )
+    parser.add_argument(
+        "--actor-batch-size",
+        type=int,
+        default=None,
+        help="Defaults to train.batch_size from the pretrained DP checkpoint.",
+    )
     parser.add_argument("--actor-num-workers", type=int, default=0)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--actor-seq-length", type=int, default=None)
-    parser.add_argument("--actor-hdf5-cache-mode", type=str, default="low_dim")
+    parser.add_argument(
+        "--actor-hdf5-cache-mode",
+        choices=("all", "low_dim"),
+        default=None,
+        help=(
+            "Defaults to the checkpoint cache mode for one source and to low_dim "
+            "for multi-source MetaDataset training."
+        ),
+    )
     parser.add_argument("--demo-filter-key", type=str, default="")
     parser.add_argument("--success-filter-key", type=str, default="success_100")
     parser.add_argument("--failure-filter-key", type=str, default="failure")
     parser.add_argument("--actor-demo-weight", type=float, default=1.0)
     parser.add_argument("--actor-success-weight", type=float, default=1.0)
     parser.add_argument("--actor-failure-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--actor-uniform-sample-pool",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--actor-failure-demo-start-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--actor-failure-sample-start-offset", type=int, default=0)
     parser.add_argument("--actor-failure-anti-failure-label", type=float, default=1.0)
     parser.add_argument("--conditioned-mixed-imitation", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--condition-label-mode",
+        choices=("outcome", "human_only"),
+        default="outcome",
+    )
     parser.add_argument("--condition-dropout", type=float, default=0.0)
     parser.add_argument("--condition-hidden-dim", type=int, default=128)
-    parser.add_argument("--actor-normalize-weights-by-ds-size", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--actor-lr", type=float, default=1e-4)
-    parser.add_argument("--actor-disable-lr-scheduler", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--actor-normalize-weights-by-ds-size",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Defaults to the checkpoint setting for one source and to true for "
+            "multi-source training so source weights are sampling probabilities."
+        ),
+    )
+    parser.add_argument(
+        "--actor-lr",
+        type=float,
+        default=None,
+        help="Defaults to the policy learning rate from the pretrained DP checkpoint.",
+    )
+    parser.add_argument(
+        "--actor-disable-lr-scheduler",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable the checkpoint DP learning-rate schedule; it remains enabled by default.",
+    )
     parser.add_argument("--save-every-epochs", type=int, default=10)
     parser.add_argument("--save-latest-every-epochs", type=int, default=10)
     parser.add_argument("--save-checkpoints", action=argparse.BooleanOptionalAction, default=True)

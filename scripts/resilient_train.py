@@ -3,8 +3,8 @@
 
 This wrapper is intentionally process-based: a failed interpreter process is
 discarded, while robomimic's per-epoch ``last.pth`` checkpoint allows the next
-fresh process to continue. It also stops a longer configured run immediately
-after the requested milestone checkpoint appears.
+fresh process to continue. The native training loop receives the requested stop
+epoch so it exits cleanly after all target-epoch checkpoint writes complete.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import argparse
 import json
 import os
 import shutil
-import signal
 import subprocess
 import time
 from pathlib import Path
@@ -39,6 +38,29 @@ COMMON_ENV = {
     "ROBOMIMIC_SAVE_LATEST_EVERY_N_EPOCHS": "10",
 }
 
+FATAL_FAILURE_MARKERS = (
+    "Fatal Python error",
+    "Segmentation fault",
+    "PyCapsule_GetPointer called with invalid PyCapsule object",
+    "appears to be C subclassed NumPy array",
+    "double free or corruption",
+    "free(): invalid pointer",
+    "malloc(): corrupted",
+)
+
+
+def fatal_failure(returncode: int, output: str) -> str | None:
+    if returncode < 0:
+        return f"terminated by signal {-returncode}"
+    if returncode == 130:
+        return "interrupted"
+    if returncode in (134, 139):
+        return f"native crash exit status {returncode}"
+    for marker in FATAL_FAILURE_MARKERS:
+        if marker in output:
+            return f"output contains {marker!r}"
+    return None
+
 
 def experiment_root_from_config(config_path: Path) -> Path:
     config = json.loads(config_path.read_text())
@@ -51,7 +73,21 @@ def experiment_root_from_config(config_path: Path) -> Path:
 def latest_run(experiment_root: Path) -> Path | None:
     if not experiment_root.exists():
         return None
-    candidates = sorted(path for path in experiment_root.glob("*") if path.is_dir())
+    if (
+        (experiment_root / "models").is_dir()
+        and (
+            (experiment_root / "last.pth").exists()
+            or (experiment_root / "last_bak.pth").exists()
+        )
+    ):
+        return experiment_root
+    candidates = sorted(
+        path
+        for path in experiment_root.glob("*")
+        if path.is_dir()
+        and (path / "models").is_dir()
+        and ((path / "last.pth").exists() or (path / "last_bak.pth").exists())
+    )
     return candidates[-1] if candidates else None
 
 
@@ -158,24 +194,26 @@ def main() -> None:
                 text=True,
             )
             while process.poll() is None:
-                target = current_target_checkpoint(experiment_root, target_epoch)
-                if target is not None:
-                    print(f"target reached: {target}", flush=True)
-                    process.send_signal(signal.SIGINT)
-                    try:
-                        process.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        process.terminate()
-                        process.wait(timeout=30)
-                    return
                 time.sleep(args.poll_seconds)
 
         target = current_target_checkpoint(experiment_root, target_epoch)
         if target is not None:
             print(f"target reached: {target}", flush=True)
             return
-        tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-8:])
-        print(f"[attempt {attempt}] exited before target\n{tail}", flush=True)
+        log_text = log_path.read_text(errors="replace")
+        fatal_reason = fatal_failure(process.returncode, log_text)
+        tail = "\n".join(log_text.splitlines()[-8:])
+        if process.returncode in (130, -2):
+            raise RuntimeError(
+                f"training was interrupted during attempt {attempt}; "
+                f"inspect {log_path} before relaunching"
+            )
+        reason = fatal_reason or f"exit status {process.returncode}"
+        print(
+            f"[attempt {attempt}] exited before target ({reason}); "
+            f"retrying from the latest valid checkpoint\n{tail}",
+            flush=True,
+        )
         time.sleep(1.0)
 
     raise RuntimeError(

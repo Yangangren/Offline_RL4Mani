@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
-export PYTHONPYCACHEPREFIX="/tmp/robomimic_square_collect_pycache_${USER}_$$"
+export PYTHONPYCACHEPREFIX="/tmp/robomimic_collect_pycache_${USER}_$$"
 export MPLCONFIGDIR=/tmp/matplotlib
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
@@ -17,7 +17,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
-PYTHON=/home/ryan/miniconda3/envs/robomimic_stable/bin/python
+PYTHON=${ROBOMIMIC_PYTHON:-/home/ryan/miniconda3/envs/robomimic_stable/bin/python}
 export ROBOMIMIC_PYTHON="$PYTHON"
 
 CHECKPOINT=${CHECKPOINT:-/home/ryan/Documents/robomimic/trained_models/square_rgb_dp/square_ph_rgb_dp_official_s1/20260629231002/last.pth}
@@ -37,6 +37,12 @@ RETRY_SEED_OFFSET=${RETRY_SEED_OFFSET:-100000}
 RAW_NAME=${RAW_NAME:-square_rgb_dp_rollouts_raw.hdf5}
 RGB_NAME=${RGB_NAME:-square_rgb_dp_rollouts_rgb2.hdf5}
 CAMERA_SIZE=${CAMERA_SIZE:-84}
+CAMERA_NAMES=${CAMERA_NAMES:-agentview robot0_eye_in_hand}
+read -r -a CAMERA_NAME_ARRAY <<< "$CAMERA_NAMES"
+if (( ${#CAMERA_NAME_ARRAY[@]} == 0 )); then
+  echo "CAMERA_NAMES must contain at least one camera name" >&2
+  exit 2
+fi
 
 if [[ -n "$POLICY_SEEDS" ]]; then
   if (( ROLLOUTS_PER_SHARD != 1 )); then
@@ -99,37 +105,32 @@ case "$STAGE" in
     ;;
 
   convert_rgb)
-    "$PYTHON" -B robomimic/scripts/dataset_states_to_obs.py \
-      --dataset "$OUTPUT_DIR/$RAW_NAME" \
-      --output_name "$RGB_NAME" \
-      --done_mode 2 \
-      --copy_rewards \
-      --copy_dones \
-      --camera_names agentview robot0_eye_in_hand \
-      --camera_height "$CAMERA_SIZE" \
-      --camera_width "$CAMERA_SIZE" \
-      --compress \
+    convert_rgb_args=(
+      --dataset "$OUTPUT_DIR/$RAW_NAME"
+      --output_name "$RGB_NAME"
+      --done_mode 2
+      --copy_rewards
+      --camera_names "${CAMERA_NAME_ARRAY[@]}"
+      --camera_height "$CAMERA_SIZE"
+      --camera_width "$CAMERA_SIZE"
+      --compress
       --exclude-next-obs
-    ;;
-
-  all)
-    "$PYTHON" -B scripts/collect_rollout_shards.py "${collect_args[@]}"
-    "$PYTHON" -B robomimic/scripts/dataset_states_to_obs.py \
-      --dataset "$OUTPUT_DIR/$RAW_NAME" \
-      --output_name "$RGB_NAME" \
-      --done_mode 2 \
-      --copy_rewards \
-      --copy_dones \
-      --camera_names agentview robot0_eye_in_hand \
-      --camera_height "$CAMERA_SIZE" \
-      --camera_width "$CAMERA_SIZE" \
-      --compress \
-      --exclude-next-obs
+      --resume
+      --reuse-identical-models
+    )
+    if [[ "${RESTART_RGB:-0}" == "1" ]]; then
+      convert_rgb_args+=(--restart)
+    fi
+    if [[ "${OVERWRITE_RGB:-0}" == "1" ]]; then
+      convert_rgb_args+=(--overwrite)
+    fi
+    "$PYTHON" -B robomimic/scripts/dataset_states_to_obs.py "${convert_rgb_args[@]}"
     ;;
 
   *)
-    echo "Usage: $0 {collect|convert_rgb|all}" >&2
-    echo "Common overrides: TOTAL_ROLLOUTS=500 ROLLOUTS_PER_SHARD=10 CHECKPOINT=... OUTPUT_DIR=... FORCE_COLLECT=1" >&2
+    echo "Usage: $0 {collect|convert_rgb}" >&2
+    echo "Common overrides: TOTAL_ROLLOUTS=500 ROLLOUTS_PER_SHARD=10 HORIZON=... CHECKPOINT=... OUTPUT_DIR=... RAW_NAME=... FORCE_COLLECT=1" >&2
+    echo "RGB conversion overrides: RGB_NAME=... CAMERA_NAMES=\"camera0 camera1\" CAMERA_SIZE=84" >&2
     echo "Split seed grid: POLICY_SEEDS=\"0 1\" NUM_ENV_SEEDS=250 ROLLOUTS_PER_SHARD=1 TOTAL_ROLLOUTS=500" >&2
     exit 2
     ;;

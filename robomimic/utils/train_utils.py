@@ -58,11 +58,24 @@ def get_exp_dir(config, auto_remove_exp_dir=False, resume=False):
         # relative paths are specified relative to robomimic module location
         base_output_dir = os.path.join(robomimic.__path__[0], base_output_dir)
     base_output_dir = os.path.join(base_output_dir, config.experiment.name)
+    time_dir = None
     if resume:
         assert os.path.exists(base_output_dir), "Resuming training run, but output dir {} does not exist".format(base_output_dir)
-        subdir_lst = os.listdir(base_output_dir)
-        time_str = sorted(subdir_lst)[-1]  # get the most recent subdirectory
-        assert os.path.isdir(os.path.join(base_output_dir, time_str)), "Found item {} that is not a subdirectory in {}".format(time_str, base_output_dir)
+        flat_last = os.path.join(base_output_dir, "last.pth")
+        flat_last_bak = os.path.join(base_output_dir, "last_bak.pth")
+        flat_models = os.path.join(base_output_dir, "models")
+        if os.path.isdir(flat_models) and (os.path.exists(flat_last) or os.path.exists(flat_last_bak)):
+            time_dir = base_output_dir
+        else:
+            subdir_lst = sorted(
+                item
+                for item in os.listdir(base_output_dir)
+                if os.path.isdir(os.path.join(base_output_dir, item))
+                and os.path.isdir(os.path.join(base_output_dir, item, "models"))
+            )
+            assert len(subdir_lst) > 0, "Could not find a resumable run under {}".format(base_output_dir)
+            time_str = subdir_lst[-1]  # get the most recent subdirectory
+            time_dir = os.path.join(base_output_dir, time_str)
     elif os.path.exists(base_output_dir):
         if not auto_remove_exp_dir:
             ans = input("WARNING: model directory ({}) already exists! \noverwrite? (y/n)\n".format(base_output_dir))
@@ -75,18 +88,19 @@ def get_exp_dir(config, auto_remove_exp_dir=False, resume=False):
     # only make model directory if model saving is enabled
     output_dir = None
     if config.experiment.save.enabled:
-        output_dir = os.path.join(base_output_dir, time_str, "models")
+        output_dir = os.path.join(time_dir if time_dir is not None else os.path.join(base_output_dir, time_str), "models")
         os.makedirs(output_dir, exist_ok=resume)
 
     # tensorboard directory
-    log_dir = os.path.join(base_output_dir, time_str, "logs")
+    log_dir = os.path.join(time_dir if time_dir is not None else os.path.join(base_output_dir, time_str), "logs")
     os.makedirs(log_dir, exist_ok=resume)
 
     # video directory
-    video_dir = os.path.join(base_output_dir, time_str, "videos")
+    video_dir = os.path.join(time_dir if time_dir is not None else os.path.join(base_output_dir, time_str), "videos")
     os.makedirs(video_dir, exist_ok=resume)
 
-    time_dir = os.path.join(base_output_dir, time_str)
+    if time_dir is None:
+        time_dir = os.path.join(base_output_dir, time_str)
     
     return log_dir, output_dir, video_dir, time_dir
 
@@ -651,7 +665,16 @@ def save_model(model, config, env_meta, shape_meta, ckpt_path, variable_state=No
     if action_normalization_stats is not None:
         action_normalization_stats = deepcopy(action_normalization_stats)
         params["action_normalization_stats"] = TensorUtils.to_list(action_normalization_stats)
-    torch.save(params, ckpt_path)
+    # Publish the final path only after serialization completes. This prevents
+    # checkpoint monitors from treating a partially written file as complete.
+    temporary_path = "{}.tmp.{}".format(ckpt_path, os.getpid())
+    try:
+        torch.save(params, temporary_path)
+        os.replace(temporary_path, ckpt_path)
+    except BaseException:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        raise
     print("save checkpoint to {}".format(ckpt_path))
 
 

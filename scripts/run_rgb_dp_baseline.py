@@ -272,10 +272,11 @@ def make_config(args) -> dict:
     config["train"]["data"] = [{"path": str(args.dataset.resolve())}]
     config["train"]["output_dir"] = str(MODEL_ROOT)
     config["train"]["normalize_weights_by_ds_size"] = False
-    config["train"]["num_data_workers"] = 0
-    # The PH image datasets are small enough to cache fully. This avoids repeated
-    # per-batch HDF5 reads and greatly reduces exposure to intermittent h5py /
-    # importlib crashes in this environment.
+    config["train"]["num_data_workers"] = (
+        0 if args.num_data_workers is None else args.num_data_workers
+    )
+    # Keep caching task-configurable: large 240x240 ToolHang images require
+    # low_dim mode, while smaller datasets can fit the full cache.
     config["train"]["hdf5_cache_mode"] = args.hdf5_cache_mode
     config["train"]["hdf5_load_next_obs"] = False
     config["train"]["seq_length"] = 16
@@ -326,6 +327,75 @@ def write_config(args) -> Path:
     path = CONFIG_DIR / f"{config['experiment']['name']}.json"
     path.write_text(json.dumps(config, indent=4))
     print(f"Wrote config: {path}", flush=True)
+    return path
+
+
+def saved_run_config(experiment_dir: Path) -> Path:
+    direct = experiment_dir / "config.json"
+    if direct.exists():
+        return direct
+
+    timestamped = sorted(
+        path
+        for path in experiment_dir.glob("*/config.json")
+        if (path.parent / "models").is_dir()
+        and (
+            (path.parent / "last.pth").exists()
+            or (path.parent / "last_bak.pth").exists()
+        )
+    )
+    if timestamped:
+        return timestamped[-1]
+
+    raise FileNotFoundError(
+        f"cannot find a resumable saved config under {experiment_dir}"
+    )
+
+
+def write_resume_config(args) -> Path:
+    """Preserve the completed run's training recipe while extending its target."""
+    generated = make_config(args)
+    experiment_name = generated["experiment"]["name"]
+    saved_path = saved_run_config(MODEL_ROOT / experiment_name)
+
+    config = json.loads(saved_path.read_text())
+    if config["experiment"]["name"] != experiment_name:
+        raise ValueError(
+            f"saved config experiment {config['experiment']['name']!r} does not "
+            f"match requested experiment {experiment_name!r}"
+        )
+
+    original_end_epoch = int(config["train"]["num_epochs"])
+    end_epoch = max(original_end_epoch, args.epochs, args.target_epoch)
+    config["train"]["num_epochs"] = end_epoch
+    if args.num_data_workers is not None:
+        config["train"]["num_data_workers"] = args.num_data_workers
+
+    # These scheduler dimensions are injected by train.py after config parsing.
+    # Saved run configs contain them, but the public config schema is key-locked
+    # and rejects them when the JSON is loaded again.
+    for optim_config in config.get("algo", {}).get("optim_params", {}).values():
+        optim_config.pop("num_train_batches", None)
+        optim_config.pop("num_epochs", None)
+
+    save_config = config["experiment"]["save"]
+    saved_epochs = save_config.get("epochs", [])
+    save_config["epochs"] = sorted(
+        {
+            int(epoch)
+            for epoch in (*saved_epochs, *args.extra_save_epochs, args.target_epoch)
+            if 0 < int(epoch) <= end_epoch
+        }
+    )
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path = CONFIG_DIR / f"{experiment_name}_resume_to_{args.target_epoch}.json"
+    path.write_text(json.dumps(config, indent=4))
+    print(
+        f"Wrote resume config from {saved_path}: {path} "
+        f"(schedule end={end_epoch}, target={args.target_epoch})",
+        flush=True,
+    )
     return path
 
 
@@ -464,6 +534,8 @@ def train_once(config_path: Path, args) -> Path:
         "--config",
         str(config_path),
     ]
+    if args.resume_train:
+        command.append("--resume")
     print("+ " + " ".join(command), flush=True)
     subprocess.run(
         command,
@@ -477,9 +549,10 @@ def train_once(config_path: Path, args) -> Path:
         started_at,
     )
     if target is None:
+        mode = "resumed training" if args.resume_train else "fresh training"
         raise RuntimeError(
-            f"fresh training finished but model_epoch_{args.target_epoch}.pth "
-            f"was not found in a new run under {experiment}"
+            f"{mode} finished but model_epoch_{args.target_epoch}.pth "
+            f"was not found under {experiment}"
         )
     print(f"Training target: {target}", flush=True)
     return target
@@ -624,12 +697,18 @@ def parse_args() -> argparse.Namespace:
         "--extra-save-epochs",
         type=int,
         nargs="*",
-        default=[50, 100, 200, 500, 1000],
+        default=[50, 100, 200, 300, 400, 500],
         help="Additional milestone checkpoints to save if they are reached.",
     )
     parser.add_argument("--enable-train-rollouts", action="store_true")
     parser.add_argument("--ddim-steps", type=int, default=10)
     parser.add_argument("--hdf5-cache-mode", choices=("all", "low_dim"), default="all")
+    parser.add_argument(
+        "--num-data-workers",
+        type=int,
+        default=None,
+        help="Override DataLoader workers; default 0 preserves maximum HDF5 stability.",
+    )
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--eval-rollouts", type=int, default=100)
     parser.add_argument(
@@ -647,6 +726,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--force-train", action="store_true")
     parser.add_argument("--force-eval", action="store_true")
+    parser.add_argument(
+        "--resume-train",
+        action="store_true",
+        help="Resume robomimic training from last.pth instead of starting a new run.",
+    )
     parser.add_argument(
         "--resilient-train",
         action="store_true",
@@ -666,7 +750,7 @@ def main() -> None:
     if "dataset" in args.stages:
         build_dataset(args)
 
-    config_path = write_config(args)
+    config_path = write_resume_config(args) if args.resume_train else write_config(args)
     if not args.dataset.exists():
         print("\n" + dataset_download_message(args.dataset, args), flush=True)
 

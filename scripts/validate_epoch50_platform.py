@@ -56,6 +56,16 @@ COMMON_ENV = {
     "TORCHDYNAMO_DISABLE": "1",
 }
 
+FATAL_NATIVE_FAILURE_MARKERS = (
+    "Fatal Python error",
+    "Segmentation fault",
+    "PyCapsule_GetPointer called with invalid PyCapsule object",
+    "appears to be C subclassed NumPy array",
+    "double free or corruption",
+    "free(): invalid pointer",
+    "malloc(): corrupted",
+)
+
 
 def process_env(cache_suffix: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
@@ -94,6 +104,18 @@ def parse_rollout_stats(text: str) -> dict[str, float]:
     if match is None:
         raise RuntimeError("could not parse Average Rollout Stats JSON")
     return json.loads(match.group(0))
+
+
+def fatal_native_failure(returncode: int, output: str) -> str | None:
+    """Return a reason when retrying could worsen native process corruption."""
+    if returncode < 0:
+        return f"terminated by signal {-returncode}"
+    if returncode in (134, 139):
+        return f"native crash exit status {returncode}"
+    for marker in FATAL_NATIVE_FAILURE_MARKERS:
+        if marker in output:
+            return f"output contains {marker!r}"
+    return None
 
 
 def infer_num_rollouts(stats: dict[str, float]) -> int | None:
@@ -156,6 +178,7 @@ def evaluate(
                 max_retries=max_retries,
                 log_path=log_path,
                 chunk_size=chunk_size,
+                force=force,
             )
             if stats is None:
                 raise RuntimeError(f"seed {seed} failed before completion")
@@ -306,6 +329,17 @@ def run_rollout_subprocess(
             + "\n".join(stdout.splitlines()[-30:])
             + "\n"
         )
+        fatal_reason = fatal_native_failure(proc.returncode, stdout)
+        if fatal_reason is not None:
+            emit(
+                f"[fatal native failure] {fatal_reason}; aborting this evaluation "
+                "without another retry to protect host stability.\n"
+            )
+            raise subprocess.CalledProcessError(
+                proc.returncode,
+                cmd,
+                output=stdout,
+            )
     raise subprocess.CalledProcessError(
         last_proc.returncode,
         cmd,
@@ -322,6 +356,7 @@ def evaluate_seed(
     max_retries: int,
     log_path: Path,
     chunk_size: int,
+    force: bool,
 ) -> dict[str, float]:
     logger = TeeLogger(log_path, mode="w")
     logger.line(
@@ -343,6 +378,17 @@ def evaluate_seed(
         finally:
             logger.close()
 
+    chunk_dir = log_path.parent / f"{log_path.stem}_chunks"
+    if force and chunk_dir.exists():
+        shutil.rmtree(chunk_dir)
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_stat = checkpoint.stat()
+    checkpoint_identity = {
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_size": checkpoint_stat.st_size,
+        "checkpoint_mtime_ns": checkpoint_stat.st_mtime_ns,
+    }
     remaining = n_rollouts
     chunk_index = 0
     chunk_stats = []
@@ -354,19 +400,43 @@ def evaluate_seed(
             # PyTorch process alive for all rollouts.
             chunk_seed = seed * 100000 + chunk_index
             completed_before = n_rollouts - remaining
+            cache_path = chunk_dir / f"chunk_{chunk_index:03d}.json"
+            expected_cache = {
+                **checkpoint_identity,
+                "run_seed": seed,
+                "chunk_index": chunk_index,
+                "chunk_seed": chunk_seed,
+                "n_rollouts": count,
+                "horizon": horizon,
+            }
             logger.line(
                 f"\n===== chunk {chunk_index} seed={chunk_seed} "
                 f"n_rollouts={count} progress={completed_before}/{n_rollouts} ====="
             )
-            stats, _ = run_rollout_subprocess(
-                checkpoint=checkpoint,
-                n_rollouts=count,
-                horizon=horizon,
-                seed=chunk_seed,
-                cache_suffix=f"eval_seed_{seed}_chunk_{chunk_index}",
-                max_retries=max_retries,
-                logger=logger,
-            )
+            stats = None
+            if cache_path.exists():
+                try:
+                    cached = json.loads(cache_path.read_text())
+                    if all(cached.get(key) == value for key, value in expected_cache.items()):
+                        stats = cached["stats"]
+                        logger.line(f"[resume chunk] using completed {cache_path}")
+                except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                    stats = None
+            if stats is None:
+                stats, _ = run_rollout_subprocess(
+                    checkpoint=checkpoint,
+                    n_rollouts=count,
+                    horizon=horizon,
+                    seed=chunk_seed,
+                    cache_suffix=f"eval_seed_{seed}_chunk_{chunk_index}",
+                    max_retries=max_retries,
+                    logger=logger,
+                )
+                cache_payload = {**expected_cache, "stats": stats}
+                temp_cache_path = cache_path.with_suffix(".json.tmp")
+                temp_cache_path.write_text(json.dumps(cache_payload, indent=4))
+                temp_cache_path.replace(cache_path)
+                logger.line(f"[saved chunk] {cache_path}")
             chunk_stats.append((count, stats))
             remaining -= count
             chunk_index += 1

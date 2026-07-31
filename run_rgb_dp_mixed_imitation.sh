@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-if [[ "${1:-}" == "can" || "${1:-}" == "Can" || "${1:-}" == "square" || "${1:-}" == "Square" ]]; then
+if [[ "${1:-}" == "can" || "${1:-}" == "Can" || "${1:-}" == "square" || "${1:-}" == "Square" || "${1:-}" == "transport" || "${1:-}" == "Transport" ]]; then
   TASK=$1
   shift
 fi
@@ -34,21 +34,42 @@ case "$TASK" in
     DEFAULT_DP_CHECKPOINT=trained_models/can_rgb_dp/can_ph_rgb_dp_official_s1/models/model_epoch_50.pth
     DEFAULT_DEMO_DATASET=datasets/can/ph/image_v15.hdf5
     DEFAULT_ROLLOUT_DATASET=rollouts/can_rgb_dp/epoch50_collection/can_rgb_dp_rollouts_rgb2.hdf5
-    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/self_imitation/200demo_100success
+    DEFAULT_FAILURE_FILTER_SIZE=33
+    DEFAULT_FAILURE_FILTER_KEY=failure
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/mixed_imitation/200demo_100success
     DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/mixed_imitation/200demo_100success_33failure
+    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/mixed_imitation/200demo_100success_33failure_conditioned
     DEFAULT_EVAL_OUTPUT=rollouts/can_rgb_dp/imitation_eval
+    DEFAULT_HORIZON=400
     ;;
   square)
     TASK_RGB_PREFIX=square_rgb_dp
-    DEFAULT_DP_CHECKPOINT=trained_models/square_rgb_dp/square_ph_rgb_dp_official_s1/20260629231002/last.pth
+    DEFAULT_DP_CHECKPOINT=trained_models/square_rgb_dp/square_ph_rgb_dp_official_s1/models/model_epoch_200.pth
     DEFAULT_DEMO_DATASET=datasets/square/ph/image_v15.hdf5
     DEFAULT_ROLLOUT_DATASET=rollouts/square_rgb_dp/epoch190_collection/square_rgb_dp_rollouts_rgb2.hdf5
+    DEFAULT_FAILURE_FILTER_SIZE=50
+    DEFAULT_FAILURE_FILTER_KEY=failure_50
     DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/square_rgb_dp_self_imitation/200demo_100success
-    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/square_rgb_dp_mixed_imitation/200demo_100success_94failure
+    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/square_rgb_dp/mixed_imitation/200demo_100success_50failure
+    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/square_rgb_dp/mixed_imitation/200demo_100success_50failure_human_condition
     DEFAULT_EVAL_OUTPUT=rollouts/square_rgb_dp/imitation_eval
+    DEFAULT_HORIZON=400
+    ;;
+  transport)
+    TASK_RGB_PREFIX=transport_rgb_dp
+    DEFAULT_DP_CHECKPOINT=trained_models/transport_rgb_dp/transport_ph_rgb_dp_official_s1/models/model_epoch_200.pth
+    DEFAULT_DEMO_DATASET=datasets/transport/ph/image_v15.hdf5
+    DEFAULT_ROLLOUT_DATASET=rollouts/transport_rgb_dp/epoch200_collection/transport_rgb_dp_rollouts_rgb4.hdf5
+    DEFAULT_FAILURE_FILTER_SIZE=50
+    DEFAULT_FAILURE_FILTER_KEY=failure_50
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/transport_rgb_dp/mixed_imitation/200demo_100success
+    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/transport_rgb_dp/mixed_imitation/200demo_100success_50failure
+    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/transport_rgb_dp/mixed_imitation/200demo_100success_50failure_conditioned
+    DEFAULT_EVAL_OUTPUT=rollouts/transport_rgb_dp/imitation_eval
+    DEFAULT_HORIZON=700
     ;;
   *)
-    echo "Unsupported TASK=$TASK. Use TASK=can or TASK=square, or pass can|square as the first argument." >&2
+    echo "Unsupported TASK=$TASK. Use TASK=can, TASK=square, or TASK=transport." >&2
     exit 2
     ;;
 esac
@@ -59,7 +80,7 @@ case "$STAGE" in
   train|train_mixed_imitation)
     STAGE=train
     IMITATION_KIND=mixed
-    ;;
+        ;;
   train_resilient|train_mixed_imitation_resilient)
     STAGE=train_resilient
     IMITATION_KIND=mixed
@@ -79,6 +100,11 @@ case "$STAGE" in
   check_mixed)
     STAGE=check
     IMITATION_KIND=mixed
+    ;;
+  check_conditioned|check_conditioned_mixed_imitation)
+    STAGE=check
+    IMITATION_KIND=mixed
+    CONDITIONED_MIXED_IMITATION=1
     ;;
   prepare_self_filters|prepare_filters_self)
     STAGE=prepare_filters
@@ -101,7 +127,7 @@ case "$STAGE" in
     IMITATION_KIND=mixed
     CONDITIONED_MIXED_IMITATION=1
     ;;
-  train_conditioned_resilient|train_conditioned_mixed_imitation_resilient)
+  train_conditioned_resilient|train_conditioned_imitation_resilient)
     STAGE=train_resilient
     IMITATION_KIND=mixed
     CONDITIONED_MIXED_IMITATION=1
@@ -133,20 +159,30 @@ DEMO_DATASET=${DEMO_DATASET:-$DEFAULT_DEMO_DATASET}
 ROLLOUT_DATASET=${ROLLOUT_DATASET:-$DEFAULT_ROLLOUT_DATASET}
 SUCCESS_DATASET=${SUCCESS_DATASET:-$ROLLOUT_DATASET}
 FAILURE_DATASET=${FAILURE_DATASET:-$ROLLOUT_DATASET}
+HORIZON=${HORIZON:-$DEFAULT_HORIZON}
 
 ACTOR_BATCH_SIZE=${ACTOR_BATCH_SIZE:-100}
-ACTOR_LR=${ACTOR_LR:-1e-4}
-ACTOR_HDF5_CACHE_MODE=${ACTOR_HDF5_CACHE_MODE:-low_dim}
-ACTOR_NUM_WORKERS=${ACTOR_NUM_WORKERS:-0}
+ACTOR_LR=${ACTOR_LR:-}
+ACTOR_HDF5_CACHE_MODE=${ACTOR_HDF5_CACHE_MODE:-}
+ACTOR_NUM_WORKERS=${ACTOR_NUM_WORKERS:-4}
+ACTOR_UNIFORM_SAMPLE_POOL=${ACTOR_UNIFORM_SAMPLE_POOL:-1}
+ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE=${ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE:-0}
+CONDITION_LABEL_MODE=${CONDITION_LABEL_MODE:-human_only}
+IMITATION_STEPS_PER_EPOCH=${IMITATION_STEPS_PER_EPOCH:-}
 PREFETCH_FACTOR=${PREFETCH_FACTOR:-2}
 LOG_EVERY=${LOG_EVERY:-100}
 
 SELF_IMITATION_OUTPUT_DIR=${SELF_IMITATION_OUTPUT_DIR:-$DEFAULT_SELF_IMITATION_OUTPUT_DIR}
 MIXED_IMITATION_OUTPUT_DIR=${MIXED_IMITATION_OUTPUT_DIR:-$DEFAULT_MIXED_IMITATION_OUTPUT_DIR}
+CONDITIONED_IMITATION_OUTPUT_DIR=${CONDITIONED_IMITATION_OUTPUT_DIR:-$DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR}
 
 SUCCESS_SOURCE_FILTER_KEY=${SUCCESS_SOURCE_FILTER_KEY:-success}
 SUCCESS_FILTER_SIZE=${SUCCESS_FILTER_SIZE:-100}
 SUCCESS_FILTER_SUFFIX=${SUCCESS_FILTER_SUFFIX:-100}
+SUCCESS_SELECTION_SEED=${SUCCESS_SELECTION_SEED:-0}
+FAILURE_SOURCE_FILTER_KEY=${FAILURE_SOURCE_FILTER_KEY:-failure}
+FAILURE_FILTER_SIZE=${FAILURE_FILTER_SIZE:-$DEFAULT_FAILURE_FILTER_SIZE}
+FAILURE_SELECTION_SEED=${FAILURE_SELECTION_SEED:-0}
 DEMO_FILTER_KEY=${DEMO_FILTER_KEY:-}
 
 if [[ "$IMITATION_KIND" == "self" ]]; then
@@ -156,10 +192,9 @@ if [[ "$IMITATION_KIND" == "self" ]]; then
   fi
   IMITATION_OUTPUT_DIR=${IMITATION_OUTPUT_DIR:-$SELF_IMITATION_OUTPUT_DIR}
   IMITATION_EPOCHS=${IMITATION_EPOCHS:-${SELF_IMITATION_EPOCHS:-${MIXED_IMITATION_EPOCHS:-50}}}
-  IMITATION_STEPS_PER_EPOCH=${IMITATION_STEPS_PER_EPOCH:-${SELF_IMITATION_STEPS_PER_EPOCH:-${MIXED_IMITATION_STEPS_PER_EPOCH:-100}}}
   IMITATION_SAVE_EVERY_EPOCHS=${IMITATION_SAVE_EVERY_EPOCHS:-${SELF_IMITATION_SAVE_EVERY_EPOCHS:-10}}
   IMITATION_SAVE_LATEST_EVERY_EPOCHS=${IMITATION_SAVE_LATEST_EVERY_EPOCHS:-${SELF_IMITATION_SAVE_LATEST_EVERY_EPOCHS:-1}}
-  IMITATION_SEED=${IMITATION_SEED:-${SELF_IMITATION_SEED:-${MIXED_IMITATION_SEED:-20260710}}}
+  IMITATION_SEED=${IMITATION_SEED:-${SELF_IMITATION_SEED:-${MIXED_IMITATION_SEED:-}}}
   SUCCESS_FILTER_KEY=${SELF_IMITATION_SUCCESS_FILTER_KEY:-${SUCCESS_FILTER_KEY:-${SUCCESS_SOURCE_FILTER_KEY}_${SUCCESS_FILTER_SUFFIX}}}
   FAILURE_FILTER_KEY=${FAILURE_FILTER_KEY:-failure}
   IMITATION_MODE_NAME_VALUE="${SELF_IMITATION_MODE_NAME:-${IMITATION_MODE_NAME:-self_imitation_learning}}"
@@ -168,26 +203,32 @@ if [[ "$IMITATION_KIND" == "self" ]]; then
   IMITATION_SUCCESS_WEIGHT_VALUE="${SELF_IMITATION_SUCCESS_WEIGHT:-${IMITATION_SUCCESS_WEIGHT:-1.0}}"
   IMITATION_FAILURE_WEIGHT_VALUE=0.0
 else
-  IMITATION_OUTPUT_DIR=${IMITATION_OUTPUT_DIR:-$MIXED_IMITATION_OUTPUT_DIR}
+  if [[ "${CONDITIONED_MIXED_IMITATION:-0}" == "1" ]]; then
+    IMITATION_OUTPUT_DIR=${IMITATION_OUTPUT_DIR:-$CONDITIONED_IMITATION_OUTPUT_DIR}
+  else
+    IMITATION_OUTPUT_DIR=${IMITATION_OUTPUT_DIR:-$MIXED_IMITATION_OUTPUT_DIR}
+  fi
   IMITATION_EPOCHS=${IMITATION_EPOCHS:-${MIXED_IMITATION_EPOCHS:-50}}
-  IMITATION_STEPS_PER_EPOCH=${IMITATION_STEPS_PER_EPOCH:-${MIXED_IMITATION_STEPS_PER_EPOCH:-100}}
   IMITATION_SAVE_EVERY_EPOCHS=${IMITATION_SAVE_EVERY_EPOCHS:-${MIXED_IMITATION_SAVE_EVERY_EPOCHS:-10}}
   IMITATION_SAVE_LATEST_EVERY_EPOCHS=${IMITATION_SAVE_LATEST_EVERY_EPOCHS:-${MIXED_IMITATION_SAVE_LATEST_EVERY_EPOCHS:-1}}
-  IMITATION_SEED=${IMITATION_SEED:-${MIXED_IMITATION_SEED:-20260710}}
+  IMITATION_SEED=${IMITATION_SEED:-${MIXED_IMITATION_SEED:-}}
   SUCCESS_FILTER_KEY=${MIXED_IMITATION_SUCCESS_FILTER_KEY:-${SUCCESS_FILTER_KEY:-${SUCCESS_SOURCE_FILTER_KEY}_${SUCCESS_FILTER_SUFFIX}}}
-  FAILURE_FILTER_KEY=${MIXED_IMITATION_FAILURE_FILTER_KEY:-${FAILURE_FILTER_KEY:-failure}}
+  FAILURE_FILTER_KEY=${MIXED_IMITATION_FAILURE_FILTER_KEY:-${FAILURE_FILTER_KEY:-$DEFAULT_FAILURE_FILTER_KEY}}
   if [[ "${CONDITIONED_MIXED_IMITATION:-0}" == "1" ]]; then
     IMITATION_MODE_NAME_VALUE="${MIXED_IMITATION_MODE_NAME:-${IMITATION_MODE_NAME:-success_conditioned_mixed_quality_imitation_learning}}"
-    IMITATION_EXPERIMENT_NAME_VALUE="${MIXED_IMITATION_EXPERIMENT_NAME:-${IMITATION_EXPERIMENT_NAME:-${TASK_RGB_PREFIX}_success_conditioned_mixed_quality_imitation}}"
+    IMITATION_EXPERIMENT_NAME_VALUE="${MIXED_IMITATION_EXPERIMENT_NAME:-${IMITATION_EXPERIMENT_NAME:-${TASK_RGB_PREFIX}_human_conditioned_mixed_imitation_200demo_${SUCCESS_FILTER_SIZE}success_${FAILURE_FILTER_SIZE}failure}}"
   else
     IMITATION_MODE_NAME_VALUE="${MIXED_IMITATION_MODE_NAME:-${IMITATION_MODE_NAME:-mixed_quality_imitation_learning}}"
-    IMITATION_EXPERIMENT_NAME_VALUE="${MIXED_IMITATION_EXPERIMENT_NAME:-${IMITATION_EXPERIMENT_NAME:-${TASK_RGB_PREFIX}_mixed_imitation_200demo_${SUCCESS_FILTER_SIZE}success}}"
+    IMITATION_EXPERIMENT_NAME_VALUE="${MIXED_IMITATION_EXPERIMENT_NAME:-${IMITATION_EXPERIMENT_NAME:-${TASK_RGB_PREFIX}_mixed_imitation_200demo_${SUCCESS_FILTER_SIZE}success_${FAILURE_FILTER_SIZE}failure}}"
   fi
-  IMITATION_DEMO_WEIGHT_VALUE="${MIXED_IMITATION_DEMO_WEIGHT:-${IMITATION_DEMO_WEIGHT:-0.4}}"
-  IMITATION_SUCCESS_WEIGHT_VALUE="${MIXED_IMITATION_SUCCESS_WEIGHT:-${IMITATION_SUCCESS_WEIGHT:-0.4}}"
-  IMITATION_FAILURE_WEIGHT_VALUE="${MIXED_IMITATION_FAILURE_WEIGHT:-${IMITATION_FAILURE_WEIGHT:-0.2}}"
+  # Mixed-imitation weights are inclusion flags only. With the default uniform
+  # sample pool, every selected sequence is shuffled without source weighting.
+  IMITATION_DEMO_WEIGHT_VALUE=1.0
+  IMITATION_SUCCESS_WEIGHT_VALUE=1.0
+  IMITATION_FAILURE_WEIGHT_VALUE=1.0
 fi
 SUCCESS_SELECTION_MANIFEST=${SUCCESS_SELECTION_MANIFEST:-${ROLLOUT_DATASET%.hdf5}_${SUCCESS_FILTER_KEY}_selection.json}
+FAILURE_SELECTION_MANIFEST=${FAILURE_SELECTION_MANIFEST:-${FAILURE_DATASET%.hdf5}_${FAILURE_FILTER_KEY}_selection.json}
 
 # evaluation
 EVAL_DP_CHECKPOINT=${EVAL_DP_CHECKPOINT:-$IMITATION_OUTPUT_DIR/models/model_epoch_${IMITATION_EPOCHS}.pth}
@@ -210,17 +251,52 @@ DIFFUSION_CLIP_SAMPLE_ARGS=(--diffusion-clip-sample)
 if [[ "${DIFFUSION_CLIP_SAMPLE:-1}" == "0" ]]; then
   DIFFUSION_CLIP_SAMPLE_ARGS=(--no-diffusion-clip-sample)
 fi
-ACTOR_NORMALIZE_WEIGHTS_ARGS=(--actor-normalize-weights-by-ds-size)
-if [[ "${ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE:-1}" == "0" ]]; then
-  ACTOR_NORMALIZE_WEIGHTS_ARGS=(--no-actor-normalize-weights-by-ds-size)
+ACTOR_BATCH_SIZE_ARGS=()
+if [[ -n "$ACTOR_BATCH_SIZE" ]]; then
+  ACTOR_BATCH_SIZE_ARGS=(--actor-batch-size "$ACTOR_BATCH_SIZE")
 fi
-ACTOR_LR_SCHEDULER_ARGS=(--actor-disable-lr-scheduler)
-if [[ "${ACTOR_DISABLE_LR_SCHEDULER:-1}" == "0" ]]; then
-  ACTOR_LR_SCHEDULER_ARGS=(--no-actor-disable-lr-scheduler)
+ACTOR_LR_ARGS=()
+if [[ -n "$ACTOR_LR" ]]; then
+  ACTOR_LR_ARGS=(--actor-lr "$ACTOR_LR")
+fi
+IMITATION_SEED_ARGS=()
+if [[ -n "$IMITATION_SEED" ]]; then
+  IMITATION_SEED_ARGS=(--seed "$IMITATION_SEED")
+fi
+IMITATION_STEPS_PER_EPOCH_ARGS=()
+if [[ -n "$IMITATION_STEPS_PER_EPOCH" ]]; then
+  IMITATION_STEPS_PER_EPOCH_ARGS=(--steps-per-epoch "$IMITATION_STEPS_PER_EPOCH")
+fi
+ACTOR_HDF5_CACHE_MODE_ARGS=()
+if [[ -n "$ACTOR_HDF5_CACHE_MODE" ]]; then
+  ACTOR_HDF5_CACHE_MODE_ARGS=(--actor-hdf5-cache-mode "$ACTOR_HDF5_CACHE_MODE")
+fi
+ACTOR_NORMALIZE_WEIGHTS_ARGS=()
+case "$ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE" in
+  auto) ;;
+  1) ACTOR_NORMALIZE_WEIGHTS_ARGS=(--actor-normalize-weights-by-ds-size) ;;
+  0) ACTOR_NORMALIZE_WEIGHTS_ARGS=(--no-actor-normalize-weights-by-ds-size) ;;
+  *)
+    echo "ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE must be auto, 0, or 1." >&2
+    exit 2
+    ;;
+esac
+ACTOR_SAMPLE_POOL_ARGS=(--no-actor-uniform-sample-pool)
+if [[ "$ACTOR_UNIFORM_SAMPLE_POOL" == "1" ]]; then
+  ACTOR_SAMPLE_POOL_ARGS=(--actor-uniform-sample-pool)
+fi
+
+ACTOR_LR_SCHEDULER_ARGS=(--no-actor-disable-lr-scheduler)
+if [[ "${ACTOR_DISABLE_LR_SCHEDULER:-0}" == "1" ]]; then
+  ACTOR_LR_SCHEDULER_ARGS=(--actor-disable-lr-scheduler)
+fi
+DEFAULT_FAILURE_ANTI_FAILURE_LABEL=0.0
+if [[ "${CONDITIONED_MIXED_IMITATION:-0}" == "1" ]]; then
+  DEFAULT_FAILURE_ANTI_FAILURE_LABEL=1.0
 fi
 FAILURE_CHUNK_ARGS=(
   --actor-failure-sample-start-offset "${MIXED_IMITATION_FAILURE_SAMPLE_START_OFFSET:-0}"
-  --actor-failure-anti-failure-label "${MIXED_IMITATION_FAILURE_ANTI_FAILURE_LABEL:-1.0}"
+  --actor-failure-anti-failure-label "${MIXED_IMITATION_FAILURE_ANTI_FAILURE_LABEL:-$DEFAULT_FAILURE_ANTI_FAILURE_LABEL}"
 )
 if [[ "${MIXED_IMITATION_FAILURE_DEMO_START_ONLY:-0}" == "1" ]]; then
   FAILURE_CHUNK_ARGS=(--actor-failure-demo-start-only "${FAILURE_CHUNK_ARGS[@]}")
@@ -231,122 +307,81 @@ fi
 if [[ "${CONDITIONED_MIXED_IMITATION:-0}" == "1" ]]; then
   CONDITION_ARGS=(
     --conditioned-mixed-imitation
+    --condition-label-mode "$CONDITION_LABEL_MODE"
     --condition-dropout "${MIXED_IMITATION_CONDITION_DROPOUT:-${CONDITION_DROPOUT:-0.0}}"
     --condition-hidden-dim "${MIXED_IMITATION_CONDITION_HIDDEN_DIM:-${CONDITION_HIDDEN_DIM:-128}}"
   )
 else
   CONDITION_ARGS=(
     --no-conditioned-mixed-imitation
-    --condition-dropout "${MIXED_IMITATION_CONDITION_DROPOUT:-${CONDITION_DROPOUT:-0.0}}"
-    --condition-hidden-dim "${MIXED_IMITATION_CONDITION_HIDDEN_DIM:-${CONDITION_HIDDEN_DIM:-128}}"
   )
 fi
 
-EVAL_CONDITION_ARGS=(
-  --inference-success-condition 1.0
-  --inference-condition-mask 1.0
-)
 if [[ "${CONDITIONED_MIXED_IMITATION:-0}" == "1" ]]; then
-  EVAL_CONDITION_ARGS=(--require-success-condition-adapter "${EVAL_CONDITION_ARGS[@]}")
+  EVAL_CONDITION_ARGS=(
+    --require-success-condition-adapter
+    --no-forbid-success-condition-adapter
+    --inference-success-condition 1.0
+    --inference-condition-mask 1.0
+  )
+  EVAL_CONDITION_DESCRIPTION="condition=1 condition_mask=1"
 else
-  EVAL_CONDITION_ARGS=(--no-require-success-condition-adapter "${EVAL_CONDITION_ARGS[@]}")
+  EVAL_CONDITION_ARGS=(
+    --no-require-success-condition-adapter
+    --forbid-success-condition-adapter
+  )
+  EVAL_CONDITION_DESCRIPTION="condition_input=none"
 fi
 
 RESUME_POINT_VALUE="${RESUME_POINT:-${RESUME_CHECKPOINT:-}}"
 RESTART_WITHOUT_LAST=${RESTART_WITHOUT_LAST:-1}
 
-filter_exists() {
-  local dataset=$1
-  local filter_key=$2
-  "$PYTHON" -B - "$dataset" "$filter_key" <<'PYCHECK'
-import sys
-import h5py
-
-dataset, filter_key = sys.argv[1], sys.argv[2]
-with h5py.File(dataset, "r") as f:
-    raise SystemExit(0 if f"mask/{filter_key}" in f else 1)
-PYCHECK
-}
-
-write_success_selection_manifest() {
-  "$PYTHON" -B - \
-    "$ROLLOUT_DATASET" \
-    "$SUCCESS_SOURCE_FILTER_KEY" \
-    "$SUCCESS_FILTER_KEY" \
-    "$SUCCESS_FILTER_SIZE" \
-    "$SUCCESS_SELECTION_MANIFEST" <<'PYMANIFEST'
-import json
-import sys
-from pathlib import Path
-
-import h5py
-
-dataset, source_key, filter_key, requested_size, manifest_path = sys.argv[1:6]
-
-def decode(items):
-    return [x.decode("utf-8") if isinstance(x, bytes) else str(x) for x in items]
-
-with h5py.File(dataset, "r") as f:
-    source_path = f"mask/{source_key}"
-    filter_path = f"mask/{filter_key}"
-    if source_path not in f:
-        raise KeyError(f"{source_path} not found in {dataset}")
-    if filter_path not in f:
-        raise KeyError(f"{filter_path} not found in {dataset}")
-    source_demos = decode(f[source_path][:])
-    selected_demos = decode(f[filter_path][:])
-    selected_lengths = {
-        key: int(f["data"][key].attrs["num_samples"])
-        for key in selected_demos
-    }
-
-manifest = {
-    "dataset": dataset,
-    "source_filter_key": source_key,
-    "fixed_filter_key": filter_key,
-    "requested_num_demos": int(requested_size),
-    "source_num_demos": len(source_demos),
-    "selected_num_demos": len(selected_demos),
-    "selected_num_samples": int(sum(selected_lengths.values())),
-    "selection_seed": 0,
-    "selection_method": "robomimic/scripts/filter_dataset_size.py with np.random.seed(0)",
-    "selection_storage": f"mask/{filter_key}",
-    "physically_copied": False,
-    "selected_demos": selected_demos,
-    "selected_lengths": selected_lengths,
-}
-
-path = Path(manifest_path)
-path.parent.mkdir(parents=True, exist_ok=True)
-path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-print(f"[prepare_filters] wrote fixed success selection manifest to {path}", file=sys.stderr)
-PYMANIFEST
+prepare_fixed_filter() {
+  local label=$1
+  local dataset=$2
+  local source_key=$3
+  local output_key=$4
+  local filter_size=$5
+  local selection_seed=$6
+  local manifest=$7
+  local force_filter=$8
+  local -a force_args=()
+  if [[ "$force_filter" == "1" ]]; then
+    force_args=(--force)
+  fi
+  echo "[prepare_filters] $label: mask/$output_key from mask/$source_key, size=$filter_size seed=$selection_seed" >&2
+  "$PYTHON" -B scripts/prepare_rgb_dp_rollout_filter.py \
+    --dataset "$dataset" \
+    --source-filter-key "$source_key" \
+    --output-filter-key "$output_key" \
+    --num-demos "$filter_size" \
+    --seed "$selection_seed" \
+    --manifest "$manifest" \
+    "${force_args[@]}"
 }
 
 prepare_success_filter() {
-  if [[ "$SUCCESS_DATASET" != "$ROLLOUT_DATASET" ]]; then
-    echo "[prepare_filters] SUCCESS_DATASET differs from ROLLOUT_DATASET; skipping automatic filter creation" >&2
-    return
-  fi
-  if filter_exists "$ROLLOUT_DATASET" "$SUCCESS_FILTER_KEY" && [[ "${FORCE_SUCCESS_FILTER:-0}" != "1" ]]; then
-    echo "[prepare_filters] mask/$SUCCESS_FILTER_KEY already exists in $ROLLOUT_DATASET" >&2
-    write_success_selection_manifest
-    return
-  fi
-  local expected_prefix="${SUCCESS_SOURCE_FILTER_KEY}_"
-  if [[ "$SUCCESS_FILTER_KEY" != "$expected_prefix"* ]]; then
-    echo "[prepare_filters] cannot infer output key suffix for SUCCESS_FILTER_KEY=$SUCCESS_FILTER_KEY" >&2
-    echo "[prepare_filters] expected a key like ${SUCCESS_SOURCE_FILTER_KEY}_${SUCCESS_FILTER_SUFFIX}" >&2
-    exit 2
-  fi
-  local output_suffix="${SUCCESS_FILTER_KEY#${expected_prefix}}"
-  echo "[prepare_filters] creating mask/$SUCCESS_FILTER_KEY from mask/$SUCCESS_SOURCE_FILTER_KEY with $SUCCESS_FILTER_SIZE demos" >&2
-  "$PYTHON" -B robomimic/scripts/filter_dataset_size.py \
-    --dataset "$ROLLOUT_DATASET" \
-    --input_filter_key "$SUCCESS_SOURCE_FILTER_KEY" \
-    --num_demos "$SUCCESS_FILTER_SIZE" \
-    --output_filter_key "$output_suffix"
-  write_success_selection_manifest
+  prepare_fixed_filter \
+    success \
+    "$SUCCESS_DATASET" \
+    "$SUCCESS_SOURCE_FILTER_KEY" \
+    "$SUCCESS_FILTER_KEY" \
+    "$SUCCESS_FILTER_SIZE" \
+    "$SUCCESS_SELECTION_SEED" \
+    "$SUCCESS_SELECTION_MANIFEST" \
+    "${FORCE_SUCCESS_FILTER:-0}"
+}
+
+prepare_failure_filter() {
+  prepare_fixed_filter \
+    failure \
+    "$FAILURE_DATASET" \
+    "$FAILURE_SOURCE_FILTER_KEY" \
+    "$FAILURE_FILTER_KEY" \
+    "$FAILURE_FILTER_SIZE" \
+    "$FAILURE_SELECTION_SEED" \
+    "$FAILURE_SELECTION_MANIFEST" \
+    "${FORCE_FAILURE_FILTER:-0}"
 }
 
 check_datasets() {
@@ -361,13 +396,25 @@ check_datasets() {
     "$IMITATION_DEMO_WEIGHT_VALUE" \
     "$IMITATION_SUCCESS_WEIGHT_VALUE" \
     "$IMITATION_FAILURE_WEIGHT_VALUE" \
-    "${ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE:-1}" \
-    "$SUCCESS_SELECTION_MANIFEST" <<'PYCHECK'
+    "$ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE" \
+    "$SUCCESS_SELECTION_MANIFEST" \
+    "$FAILURE_SELECTION_MANIFEST" \
+    "$ACTOR_BATCH_SIZE" \
+    "$ACTOR_LR" \
+    "${ACTOR_DISABLE_LR_SCHEDULER:-0}" \
+    "$IMITATION_SEED" \
+    "$ACTOR_HDF5_CACHE_MODE" \
+    "${IMITATION_STEPS_PER_EPOCH:-auto}" \
+    "$IMITATION_EPOCHS" \
+    "$ACTOR_UNIFORM_SAMPLE_POOL" \
+    "$CONDITION_LABEL_MODE" \
+    "${CONDITIONED_MIXED_IMITATION:-0}" <<'PYCHECK'
 import json
 import sys
 from pathlib import Path
 
 import h5py
+import torch
 
 (
     checkpoint,
@@ -382,7 +429,78 @@ import h5py
     failure_weight,
     normalize_by_ds_size,
     success_selection_manifest,
-) = sys.argv[1:13]
+    failure_selection_manifest,
+    actor_batch_size,
+    actor_lr,
+    disable_lr_scheduler,
+    imitation_seed,
+    actor_hdf5_cache_mode,
+    steps_per_epoch,
+    epochs,
+    actor_uniform_sample_pool,
+    condition_label_mode,
+    conditioned_mixed_imitation,
+) = sys.argv[1:24]
+
+checkpoint_dict = torch.load(checkpoint, map_location="cpu", weights_only=False)
+checkpoint_config = json.loads(checkpoint_dict["config"])
+checkpoint_train = checkpoint_config["train"]
+checkpoint_policy_optim = checkpoint_config["algo"]["optim_params"]["policy"]
+
+def jsonable(value):
+    if isinstance(value, dict):
+        return {str(key): jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(item) for item in value]
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return value
+
+source_weights = {
+    "human_demo": float(demo_weight),
+    "success_rollout": float(success_weight),
+    "failure_rollout": float(failure_weight),
+}
+uniform_sample_pool = actor_uniform_sample_pool == "1"
+conditioned = conditioned_mixed_imitation == "1"
+checkpoint_has_condition_adapter = any(
+    key.startswith("policy.condition_adapter.")
+    for key in checkpoint_dict["model"]["nets"]
+)
+if not conditioned and checkpoint_has_condition_adapter:
+    raise ValueError(
+        "standard mixed imitation requires an unconditioned checkpoint, but "
+        f"{checkpoint} contains a condition adapter"
+    )
+active_source_count = sum(weight > 0.0 for weight in source_weights.values())
+effective_hdf5_cache_mode = (
+    actor_hdf5_cache_mode
+    or (
+        checkpoint_train["hdf5_cache_mode"]
+        if active_source_count == 1
+        else "low_dim"
+    )
+)
+if uniform_sample_pool:
+    effective_normalize_by_ds_size = False
+elif normalize_by_ds_size == "auto":
+    effective_normalize_by_ds_size = (
+        bool(checkpoint_train["normalize_weights_by_ds_size"])
+        if active_source_count == 1
+        else True
+    )
+else:
+    effective_normalize_by_ds_size = normalize_by_ds_size != "0"
+
+source_conditions = None
+source_condition_masks = None
+if conditioned:
+    source_conditions = {
+        "human_demo": 1.0,
+        "success_rollout": 0.0 if condition_label_mode == "human_only" else 1.0,
+        "failure_rollout": 0.0,
+    }
+    source_condition_masks = {key: 1.0 for key in source_conditions}
 
 def decode(items):
     return [x.decode("utf-8") if isinstance(x, bytes) else str(x) for x in items]
@@ -406,20 +524,114 @@ def masks(path):
             return {}
         return {k: len(f[f"mask/{k}"]) for k in sorted(f["mask"].keys())}
 
+def selected_num_samples(path, key):
+    with h5py.File(path, "r") as f:
+        if key:
+            demos = decode(f[f"mask/{key}"][:])
+        else:
+            demos = list(f["data"].keys())
+        return sum(int(f[f"data/{demo}"].attrs["num_samples"]) for demo in demos)
+
+source_num_sequences = {
+    "human_demo": selected_num_samples(demo_dataset, demo_filter),
+    "success_rollout": selected_num_samples(rollout_dataset, success_filter),
+    "failure_rollout": selected_num_samples(failure_dataset, failure_filter),
+}
+pooled_num_sequences = sum(
+    source_num_sequences[source]
+    for source, weight in source_weights.items()
+    if weight > 0.0
+)
+effective_batch_size = int(actor_batch_size or checkpoint_train["batch_size"])
+drop_last = pooled_num_sequences >= effective_batch_size
+auto_steps_per_epoch = (
+    pooled_num_sequences // effective_batch_size
+    if drop_last
+    else int(pooled_num_sequences > 0)
+)
+effective_steps_per_epoch = (
+    auto_steps_per_epoch if steps_per_epoch == "auto" else int(steps_per_epoch)
+)
+
 report = {
     "checkpoint": {"path": checkpoint, "exists": Path(checkpoint).exists()},
+    "effective_dp_training_parameters": {
+        "optimizer_type": checkpoint_policy_optim["optimizer_type"],
+        "initial_learning_rate": float(
+            actor_lr or checkpoint_policy_optim["learning_rate"]["initial"]
+        ),
+        "learning_rate_source": "environment_override" if actor_lr else "pretrained_dp_checkpoint",
+        "scheduler_type": checkpoint_policy_optim["learning_rate"]["scheduler_type"],
+        "scheduler_enabled": disable_lr_scheduler != "1",
+        "scheduler_step_every_batch": bool(
+            checkpoint_policy_optim["learning_rate"]["step_every_batch"]
+        ),
+        "scheduler_warmup_steps": int(
+            checkpoint_policy_optim["learning_rate"]["warmup_steps"]
+        ),
+        "scheduler_num_cycles": float(
+            checkpoint_policy_optim["learning_rate"]["num_cycles"]
+        ),
+        "weight_decay": float(checkpoint_policy_optim["regularization"]["L2"]),
+        "batch_size": effective_batch_size,
+        "batch_size_source": "environment_override" if actor_batch_size else "pretrained_dp_checkpoint",
+        "seed": int(imitation_seed or checkpoint_train["seed"]),
+        "seed_source": "environment_override" if imitation_seed else "pretrained_dp_checkpoint",
+        "hdf5_cache_mode": effective_hdf5_cache_mode,
+        "hdf5_cache_mode_source": (
+            "environment_override"
+            if actor_hdf5_cache_mode
+            else ("pretrained_dp_checkpoint" if active_source_count == 1 else "multi_source_requirement")
+        ),
+        "pooled_num_training_sequences": pooled_num_sequences,
+        "source_num_training_sequences": source_num_sequences,
+        "drop_last": drop_last,
+        "dropped_sequences_per_epoch": (
+            pooled_num_sequences % effective_batch_size if drop_last else 0
+        ),
+        "steps_per_epoch": effective_steps_per_epoch,
+        "steps_per_epoch_source": "environment_override" if steps_per_epoch != "auto" else "dataloader_length",
+        "epochs": int(epochs),
+        "total_training_steps": effective_steps_per_epoch * int(epochs),
+    },
+    "effective_dp_normalization": {
+        "hdf5_normalize_obs": bool(checkpoint_train["hdf5_normalize_obs"]),
+        "action_config": checkpoint_train["action_config"],
+        "action_stats_source": "pretrained_dp_checkpoint",
+        "action_normalization_stats": jsonable(
+            checkpoint_dict.get("action_normalization_stats")
+        ),
+    },
+    "observation_modalities": checkpoint_config["observation"]["modalities"]["obs"],
     "sampler": {
-        "source_weights": {
-            "human_demo": float(demo_weight),
-            "success_rollout": float(success_weight),
-            "failure_rollout": float(failure_weight),
-        },
+        "mode": (
+            "uniform_sample_pool_without_replacement"
+            if uniform_sample_pool
+            else "weighted_random_sampler_with_replacement"
+        ),
+        "source_weighting_enabled": not uniform_sample_pool,
+        "source_inclusion_values": source_weights,
+        "source_weights": None if uniform_sample_pool else source_weights,
         "source_distribution": {},
-        "normalize_weights_by_dataset_size": normalize_by_ds_size != "0",
+        "normalize_weights_by_dataset_size": effective_normalize_by_ds_size,
+    },
+    "success_conditioning": {
+        "enabled": conditioned,
+        "condition_input_used": conditioned,
+        "condition_adapter_in_pretrained_checkpoint": checkpoint_has_condition_adapter,
+        "label_mode": condition_label_mode if conditioned else None,
+        "source_conditions": source_conditions,
+        "source_condition_masks": source_condition_masks,
+        "inference_condition": 1.0 if conditioned else None,
+        "inference_condition_mask": 1.0 if conditioned else None,
     },
     "success_selection_manifest": {
         "path": success_selection_manifest,
         "exists": Path(success_selection_manifest).exists(),
+    },
+    "failure_selection_manifest": {
+        "path": failure_selection_manifest,
+        "exists": Path(failure_selection_manifest).exists(),
     },
     "human_demos": {
         "path": demo_dataset,
@@ -443,11 +655,12 @@ report = {
         "masks": masks(failure_dataset),
     },
 }
-weight_total = sum(report["sampler"]["source_weights"].values())
-if weight_total > 0.0:
-    report["sampler"]["source_distribution"] = {
-        key: value / weight_total for key, value in report["sampler"]["source_weights"].items()
-    }
+if not uniform_sample_pool:
+    weight_total = sum(source_weights.values())
+    if weight_total > 0.0:
+        report["sampler"]["source_distribution"] = {
+            key: value / weight_total for key, value in source_weights.items()
+        }
 print(json.dumps(report, indent=2, sort_keys=True))
 PYCHECK
 }
@@ -455,12 +668,15 @@ PYCHECK
 maybe_prepare_filters() {
   if [[ "${AUTO_PREPARE_FILTERS:-1}" == "1" ]]; then
     prepare_success_filter
+    if [[ "$IMITATION_KIND" == "mixed" ]]; then
+      prepare_failure_filter
+    fi
   fi
 }
 
 run_train() {
   local -a resume_args=("$@")
-  "$PYTHON" -B scripts/train_rgb_dp_self_imitation.py \
+  "$PYTHON" -B scripts/train_rgb_dp_mixed_imitation.py \
     --checkpoint "$DP_CHECKPOINT" \
     --demo-dataset "$DEMO_DATASET" \
     --success-dataset "$SUCCESS_DATASET" \
@@ -468,17 +684,18 @@ run_train() {
     --output-dir "$IMITATION_OUTPUT_DIR" \
     "${resume_args[@]}" \
     --device cuda \
-    --seed "$IMITATION_SEED" \
+    "${IMITATION_SEED_ARGS[@]}" \
     --epochs "$IMITATION_EPOCHS" \
-    --steps-per-epoch "$IMITATION_STEPS_PER_EPOCH" \
-    --actor-batch-size "$ACTOR_BATCH_SIZE" \
+    "${IMITATION_STEPS_PER_EPOCH_ARGS[@]}" \
+    "${ACTOR_BATCH_SIZE_ARGS[@]}" \
     --actor-num-workers "$ACTOR_NUM_WORKERS" \
     --prefetch-factor "$PREFETCH_FACTOR" \
     "${PIN_MEMORY_ARGS[@]}" \
     "${PERSISTENT_WORKERS_ARGS[@]}" \
-    --actor-hdf5-cache-mode "$ACTOR_HDF5_CACHE_MODE" \
+    "${ACTOR_HDF5_CACHE_MODE_ARGS[@]}" \
     --demo-filter-key "$DEMO_FILTER_KEY" \
     --success-filter-key "$SUCCESS_FILTER_KEY" \
+    "${ACTOR_SAMPLE_POOL_ARGS[@]}" \
     --failure-filter-key "$FAILURE_FILTER_KEY" \
     --actor-demo-weight "$IMITATION_DEMO_WEIGHT_VALUE" \
     --actor-success-weight "$IMITATION_SUCCESS_WEIGHT_VALUE" \
@@ -488,7 +705,7 @@ run_train() {
     --mode-name "$IMITATION_MODE_NAME_VALUE" \
     --experiment-name "$IMITATION_EXPERIMENT_NAME_VALUE" \
     "${ACTOR_NORMALIZE_WEIGHTS_ARGS[@]}" \
-    --actor-lr "$ACTOR_LR" \
+    "${ACTOR_LR_ARGS[@]}" \
     "${ACTOR_LR_SCHEDULER_ARGS[@]}" \
     --save-every-epochs "$IMITATION_SAVE_EVERY_EPOCHS" \
     --save-latest-every-epochs "$IMITATION_SAVE_LATEST_EVERY_EPOCHS" \
@@ -500,7 +717,7 @@ run_resilient_train() {
   local retry_sleep="${RETRY_SLEEP:-5}"
   local attempt=1
   local resume_for_attempt="$RESUME_POINT_VALUE"
-  local save_latest_every=1
+  local save_latest_every=5
   if [[ -z "$resume_for_attempt" && -f "$IMITATION_OUTPUT_DIR/last.pth" ]]; then
     resume_for_attempt="$IMITATION_OUTPUT_DIR/last.pth"
   fi
@@ -558,7 +775,7 @@ run_eval_grid_resilient() {
     ckpt_name=$(basename "${IDQL_CHECKPOINT:?IDQL_CHECKPOINT is required when ACTOR_SOURCE is not plain_dp}" .pt)
   fi
   grid_dir="${EVAL_OUTPUT}_${ckpt_name}"
-  echo "[eval_grid_resilient] checkpoint=$EVAL_DP_CHECKPOINT output=$grid_dir seeds=${EVAL_SEED_ARGS[*]} rollouts_per_seed=${N_ROLLOUTS:-50} success_condition=1 condition_mask=1" >&2
+  echo "[eval_grid_resilient] checkpoint=$EVAL_DP_CHECKPOINT output=$grid_dir seeds=${EVAL_SEED_ARGS[*]} rollouts_per_seed=${N_ROLLOUTS:-50} $EVAL_CONDITION_DESCRIPTION" >&2
   "$PYTHON" -B scripts/run_square_rgb_dp_one_step_idql_eval_grid.py \
     --idql-checkpoint "${IDQL_CHECKPOINT:-$EVAL_DP_CHECKPOINT}" \
     --dp-checkpoint "$EVAL_DP_CHECKPOINT" \
@@ -566,7 +783,7 @@ run_eval_grid_resilient() {
     --device cuda \
     --actor-source "$ACTOR_SOURCE" \
     --n-rollouts "${N_ROLLOUTS:-50}" \
-    --horizon "${HORIZON:-400}" \
+    --horizon "$HORIZON" \
     --num-candidates "${EVAL_NUM_CANDIDATE_ARGS[@]}" \
     --seeds "${EVAL_SEED_ARGS[@]}" \
     --rollouts-per-chunk "${ROLLOUTS_PER_CHUNK:-10}" \
@@ -585,6 +802,9 @@ case "$STAGE" in
     ;;
   prepare_filters)
     prepare_success_filter
+    if [[ "$IMITATION_KIND" == "mixed" ]]; then
+      prepare_failure_filter
+    fi
     check_datasets
     ;;
   train)
@@ -601,6 +821,9 @@ case "$STAGE" in
     ;;
   all)
     prepare_success_filter
+    if [[ "$IMITATION_KIND" == "mixed" ]]; then
+      prepare_failure_filter
+    fi
     check_datasets
     run_resilient_train
     ;;
@@ -608,7 +831,7 @@ case "$STAGE" in
     run_eval_grid_resilient
     ;;
   *)
-    echo "Usage: $0 [can|square] {check|check_self|check_mixed|prepare_filters|prepare_self_filters|prepare_mixed_filters|train_self_imitation|train_self_imitation_resilient|train_mixed_imitation|train_mixed_imitation_resilient|train_conditioned|train_conditioned_resilient|train_conditioned_mixed_imitation|train_conditioned_mixed_imitation_resilient|eval_self_grid_resilient|eval_mixed_grid_resilient|eval_conditioned_grid_resilient|eval_grid_resilient|all|all_self|all_mixed}" >&2
+    echo "Usage: $0 [can|square|transport] {check|check_self|check_mixed|prepare_filters|prepare_self_filters|prepare_mixed_filters|train_self_imitation|train_self_imitation_resilient|train_mixed_imitation|train_mixed_imitation_resilient|train_conditioned|train_conditioned_resilient|train_conditioned_mixed_imitation|train_conditioned_imitation_resilient|eval_self_grid_resilient|eval_mixed_grid_resilient|eval_conditioned_grid_resilient|eval_grid_resilient|all|all_self|all_mixed}" >&2
     exit 2
     ;;
 esac
