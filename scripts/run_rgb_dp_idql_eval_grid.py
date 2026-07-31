@@ -15,6 +15,7 @@ import math
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,10 @@ DEFAULT_IDQL = (
     ROOT
     / "trained_models/square_rgb_dp_idql/default_reward_one_step_idql_paper_faithful"
     / "best_success_auc.pt"
+)
+DEFAULT_DP = (
+    ROOT
+    / "trained_models/square_rgb_dp/square_ph_rgb_dp_official_s1/20260629231002/last.pth"
 )
 DEFAULT_OUTPUT = ROOT / "rollouts/square_rgb_dp/one_step_idql_resilient_eval"
 
@@ -74,6 +79,39 @@ class TeeLogger:
 
     def close(self) -> None:
         self.file.close()
+
+
+def load_json_object(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w") as stream:
+            json.dump(payload, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def completed_partial(path: Path) -> dict | None:
+    partial = load_json_object(path)
+    if partial is None:
+        return None
+    rollouts = partial.get("rollouts")
+    if not isinstance(rollouts, list) or not rollouts:
+        return None
+    completed = int(partial.get("completed_rollouts", len(rollouts)))
+    if completed != len(rollouts):
+        return None
+    return partial
 
 
 def wilson_interval(successes: int, total: int, z: float = 1.959963984540054) -> tuple[float, float]:
@@ -129,9 +167,13 @@ def eval_command(
     cmd = [
         str(PYTHON),
         "-B",
-        "scripts/eval_square_rgb_dp_one_step_idql.py",
+        "scripts/eval_rgb_dp_idql.py",
         "--idql-checkpoint",
         str(args.idql_checkpoint),
+        "--dp-checkpoint",
+        str(args.dp_checkpoint),
+        "--expected-task",
+        args.expected_task,
         "--output-dir",
         str(output_dir),
         "--device",
@@ -152,17 +194,39 @@ def eval_command(
         str(args.candidate_batch_size),
         "--num-inference-steps",
         str(args.num_inference_steps),
+        "--execution-horizon",
+        str(args.execution_horizon),
         "--selection",
         args.selection,
         "--softmax-temperature",
         str(args.softmax_temperature),
     ]
+    if not args.forbid_success_condition_adapter:
+        cmd.extend(
+            [
+                "--inference-success-condition",
+                str(args.inference_success_condition),
+                "--inference-condition-mask",
+                str(args.inference_condition_mask),
+            ]
+        )
     cmd.append("--clip-actions" if args.clip_actions else "--no-clip-actions")
     cmd.append("--diffusion-clip-sample" if args.diffusion_clip_sample else "--no-diffusion-clip-sample")
+    cmd.append("--env-hard-reset" if args.env_hard_reset else "--no-env-hard-reset")
+    cmd.append(
+        "--reset-to-initial-state"
+        if args.reset_to_initial_state
+        else "--no-reset-to-initial-state"
+    )
     cmd.append(
         "--require-success-condition-adapter"
         if args.require_success_condition_adapter
         else "--no-require-success-condition-adapter"
+    )
+    cmd.append(
+        "--forbid-success-condition-adapter"
+        if args.forbid_success_condition_adapter
+        else "--no-forbid-success-condition-adapter"
     )
     return cmd
 
@@ -180,8 +244,21 @@ def run_chunk(
     chunk_dir = args.output_dir / "chunks" / f"N{num_candidates}_seed{seed}_chunk{chunk_index:03d}"
     chunk_json = chunk_dir / f"one_step_idql_N{num_candidates}_seed{chunk_seed}.json"
     if chunk_json.exists() and not args.force:
-        logger.line(f"[resume chunk] {chunk_json}")
-        return json.loads(chunk_json.read_text())
+        completed = load_json_object(chunk_json)
+        if completed is not None and completed.get("rollouts"):
+            logger.line(f"[resume chunk] {chunk_json}")
+            return completed
+        logger.line(f"[ignore invalid chunk json] {chunk_json}")
+
+    partial_json = chunk_dir / f"one_step_idql_N{num_candidates}_seed{chunk_seed}_partial.json"
+    if args.accept_partial and partial_json.exists() and not args.force:
+        partial = completed_partial(partial_json)
+        if partial is not None:
+            completed = len(partial["rollouts"])
+            logger.line(
+                f"[resume chunk partial] {partial_json} completed={completed}/{n_rollouts}"
+            )
+            return partial
 
     last_stdout = ""
     for attempt in range(1, args.max_retries + 1):
@@ -218,14 +295,18 @@ def run_chunk(
         proc.stdout = None
         last_stdout = "".join(output_parts)
         if proc.returncode == 0 and chunk_json.exists():
-            logger.line(f"[chunk ok] {chunk_json}")
-            return json.loads(chunk_json.read_text())
-        partial_json = chunk_dir / f"one_step_idql_N{num_candidates}_seed{chunk_seed}_partial.json"
+            completed = load_json_object(chunk_json)
+            if completed is not None and completed.get("rollouts"):
+                logger.line(f"[chunk ok] {chunk_json}")
+                return completed
+            logger.line(f"[ignore invalid chunk json] {chunk_json}")
         if args.accept_partial and partial_json.exists():
-            partial = json.loads(partial_json.read_text())
-            completed = int(partial.get("completed_rollouts", 0))
-            if completed > 0:
-                logger.line(f"[chunk partial accepted] {partial_json} completed={completed}/{n_rollouts}")
+            partial = completed_partial(partial_json)
+            if partial is not None:
+                completed = len(partial["rollouts"])
+                logger.line(
+                    f"[chunk partial accepted] {partial_json} completed={completed}/{n_rollouts}"
+                )
                 return partial
         logger.line(
             f"[chunk failed] returncode={proc.returncode}; expected={chunk_json}\n"
@@ -297,9 +378,17 @@ def run_pair(args: argparse.Namespace, num_candidates: int, seed: int) -> dict:
                 }
             )
             remaining -= len(rollouts)
+            if remaining < 0:
+                raise RuntimeError(
+                    f"resumed chunks exceed requested rollouts: completed={len(all_rollouts)} "
+                    f"requested={args.n_rollouts}"
+                )
             partial = aggregate_rollouts(all_rollouts)
             logger.line("[pair partial] " + json.dumps(partial, sort_keys=True))
             chunk_index += 1
+            if args.inter_chunk_sleep > 0 and remaining > 0:
+                logger.line(f"[inter-chunk sleep] {args.inter_chunk_sleep:.1f}s")
+                time.sleep(args.inter_chunk_sleep)
     finally:
         logger.close()
 
@@ -308,24 +397,45 @@ def run_pair(args: argparse.Namespace, num_candidates: int, seed: int) -> dict:
     total = int(stats["Num_Rollouts"])
     ci_low, ci_high = wilson_interval(successes, total)
     result = {
-        "idql_checkpoint": str(args.idql_checkpoint),
+        "idql_checkpoint": None if args.actor_source == "plain_dp" else str(args.idql_checkpoint),
+        "dp_checkpoint": (
+            str(args.dp_checkpoint)
+            if args.actor_source in ("plain_dp", "external_dp_chunk_critic")
+            else None
+        ),
         "actor_source": args.actor_source,
-        "critic_source": args.critic_source,
+        "expected_task": args.expected_task,
+        "critic_source": None if args.actor_source == "plain_dp" else args.critic_source,
         "num_candidates": num_candidates,
         "num_inference_steps": args.num_inference_steps,
+        "execution_horizon": args.execution_horizon,
         "diffusion_clip_sample": bool(args.diffusion_clip_sample),
-        "selection": args.selection,
+        "success_condition_adapter_required": bool(args.require_success_condition_adapter),
+        "success_condition_adapter_forbidden": bool(args.forbid_success_condition_adapter),
+        "inference_success_condition": (
+            None
+            if args.forbid_success_condition_adapter
+            else float(args.inference_success_condition)
+        ),
+        "inference_condition_mask": (
+            None
+            if args.forbid_success_condition_adapter
+            else float(args.inference_condition_mask)
+        ),
+        "selection": None if args.actor_source == "plain_dp" else args.selection,
         "seed": seed,
         "n_rollouts": args.n_rollouts,
         "completed_rollouts": total,
         "horizon": args.horizon,
+        "env_hard_reset": bool(args.env_hard_reset),
+        "reset_to_initial_state": bool(args.reset_to_initial_state),
         "average_rollout_stats": stats,
         "wilson_95_interval": [ci_low, ci_high],
         "log": str(log_path),
         "chunks": chunk_records,
         "rollouts": all_rollouts,
     }
-    final_json.write_text(json.dumps(result, indent=2))
+    atomic_write_json(final_json, result)
     print(f"[pair wrote] {final_json}", flush=True)
     return result
 
@@ -397,22 +507,44 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
             }
         )
     summary = {
-        "idql_checkpoint": str(args.idql_checkpoint),
+        "idql_checkpoint": None if args.actor_source == "plain_dp" else str(args.idql_checkpoint),
+        "dp_checkpoint": (
+            str(args.dp_checkpoint)
+            if args.actor_source in ("plain_dp", "external_dp_chunk_critic")
+            else None
+        ),
         "actor_source": args.actor_source,
-        "critic_source": args.critic_source,
+        "expected_task": args.expected_task,
+        "critic_source": None if args.actor_source == "plain_dp" else args.critic_source,
         "num_inference_steps": args.num_inference_steps,
+        "execution_horizon": args.execution_horizon,
         "diffusion_clip_sample": bool(args.diffusion_clip_sample),
+        "success_condition_adapter_required": bool(args.require_success_condition_adapter),
+        "success_condition_adapter_forbidden": bool(args.forbid_success_condition_adapter),
+        "inference_success_condition": (
+            None
+            if args.forbid_success_condition_adapter
+            else float(args.inference_success_condition)
+        ),
+        "inference_condition_mask": (
+            None
+            if args.forbid_success_condition_adapter
+            else float(args.inference_condition_mask)
+        ),
         "horizon": args.horizon,
         "n_rollouts_per_seed": args.n_rollouts,
         "rollouts_per_chunk": args.rollouts_per_chunk,
-        "candidate_batch_size": args.candidate_batch_size,
-        "selection": args.selection,
+        "inter_chunk_sleep": args.inter_chunk_sleep,
+        "env_hard_reset": bool(args.env_hard_reset),
+        "reset_to_initial_state": bool(args.reset_to_initial_state),
+        "candidate_batch_size": None if args.actor_source == "plain_dp" else args.candidate_batch_size,
+        "selection": None if args.actor_source == "plain_dp" else args.selection,
         "num_candidates": args.num_candidates,
         "seeds": args.seeds,
         "by_num_candidates": by_n,
     }
     path = args.output_dir / "one_step_idql_eval_grid_summary.json"
-    path.write_text(json.dumps(summary, indent=2))
+    atomic_write_json(path, summary)
     print(json.dumps(summary, indent=2), flush=True)
     print(f"Wrote {path}", flush=True)
     return summary
@@ -421,16 +553,39 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--idql-checkpoint", type=Path, default=DEFAULT_IDQL)
+    parser.add_argument("--dp-checkpoint", type=Path, default=DEFAULT_DP)
+    parser.add_argument(
+        "--expected-task",
+        choices=("square", "can", "transport", "tool_hang"),
+        default="square",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--num-candidates", type=int, nargs="+", default=[1, 16, 64])
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--n-rollouts", type=int, default=50)
     parser.add_argument("--rollouts-per-chunk", type=int, default=5)
+    parser.add_argument("--inter-chunk-sleep", type=float, default=0.0)
     parser.add_argument("--horizon", type=int, default=400)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--accept-partial", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--env-hard-reset",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--reset-to-initial-state",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--candidate-batch-size", type=int, default=16)
     parser.add_argument("--num-inference-steps", type=int, default=100)
+    parser.add_argument(
+        "--execution-horizon",
+        type=int,
+        default=8,
+        help="For DP-proposal actors, execute this many selected trajectory actions before replanning.",
+    )
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument(
         "--actor-source",
@@ -439,20 +594,42 @@ def main() -> None:
             "idql_one_step_mlp",
             "pretrained_dp_first_action",
             "hybrid_dp_chunk_actor",
+            "external_dp_chunk_critic",
+            "plain_dp",
         ),
-        default="idql_target_one_step_mlp",
+        default="hybrid_dp_chunk_actor",
     )
-    parser.add_argument("--critic-source", choices=("target", "online"), default="target")
+    parser.add_argument("--critic-source", choices=("target", "online"), default="online")
     parser.add_argument("--selection", choices=("argmax", "greedy", "softmax", "advantage_softmax"), default="argmax")
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
     parser.add_argument("--clip-actions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--diffusion-clip-sample", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--require-success-condition-adapter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--forbid-success-condition-adapter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--inference-success-condition", type=float, default=1.0)
+    parser.add_argument("--inference-condition-mask", type=float, default=1.0)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    if args.require_success_condition_adapter and args.forbid_success_condition_adapter:
+        parser.error(
+            "--require-success-condition-adapter and "
+            "--forbid-success-condition-adapter are mutually exclusive"
+        )
 
     args.idql_checkpoint = args.idql_checkpoint.resolve()
+    args.dp_checkpoint = args.dp_checkpoint.resolve()
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.actor_source == "plain_dp" and any(int(n) != 1 for n in args.num_candidates):
+        parser.error("actor_source=plain_dp evaluates the standard DP queue; use --num-candidates 1")
     if args.rollouts_per_chunk <= 0:
         args.rollouts_per_chunk = args.n_rollouts
 

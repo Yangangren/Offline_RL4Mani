@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-if [[ "${1:-}" == "can" || "${1:-}" == "Can" || "${1:-}" == "square" || "${1:-}" == "Square" || "${1:-}" == "transport" || "${1:-}" == "Transport" ]]; then
+if [[ "${1:-}" == "can" || "${1:-}" == "Can" || "${1:-}" == "square" || "${1:-}" == "Square" || "${1:-}" == "transport" || "${1:-}" == "Transport" || "${1:-}" == "tool_hang" || "${1:-}" == "ToolHang" ]]; then
   TASK=$1
   shift
 fi
@@ -68,8 +68,21 @@ case "$TASK" in
     DEFAULT_EVAL_OUTPUT=rollouts/transport_rgb_dp/imitation_eval
     DEFAULT_HORIZON=700
     ;;
+  tool_hang)
+    TASK_RGB_PREFIX=tool_hang_rgb_dp
+    DEFAULT_DP_CHECKPOINT=trained_models/tool_hang_rgb_dp/tool_hang_ph_rgb_dp_official_s1/models/model_epoch_200.pth
+    DEFAULT_DEMO_DATASET=datasets/tool_hang/ph/image_v15.hdf5
+    DEFAULT_ROLLOUT_DATASET=rollouts/tool_hang_rgb_dp/epoch200_collection/tool_hang_rgb_dp_rollouts_rgb2.hdf5
+    DEFAULT_FAILURE_FILTER_SIZE=50
+    DEFAULT_FAILURE_FILTER_KEY=failure_50
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/mixed_imitation/200demo_100success
+    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/mixed_imitation/200demo_100success_50failure
+    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/mixed_imitation/200demo_100success_50failure_conditioned
+    DEFAULT_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/imitation_eval
+    DEFAULT_HORIZON=700
+    ;;
   *)
-    echo "Unsupported TASK=$TASK. Use TASK=can, TASK=square, or TASK=transport." >&2
+    echo "Unsupported TASK=$TASK. Use TASK=can, TASK=square, TASK=transport, or TASK=tool_hang." >&2
     exit 2
     ;;
 esac
@@ -776,9 +789,10 @@ run_eval_grid_resilient() {
   fi
   grid_dir="${EVAL_OUTPUT}_${ckpt_name}"
   echo "[eval_grid_resilient] checkpoint=$EVAL_DP_CHECKPOINT output=$grid_dir seeds=${EVAL_SEED_ARGS[*]} rollouts_per_seed=${N_ROLLOUTS:-50} $EVAL_CONDITION_DESCRIPTION" >&2
-  "$PYTHON" -B scripts/run_square_rgb_dp_one_step_idql_eval_grid.py \
+  "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
     --idql-checkpoint "${IDQL_CHECKPOINT:-$EVAL_DP_CHECKPOINT}" \
     --dp-checkpoint "$EVAL_DP_CHECKPOINT" \
+    --expected-task "$TASK" \
     --output-dir "$grid_dir" \
     --device cuda \
     --actor-source "$ACTOR_SOURCE" \
@@ -831,7 +845,7 @@ case "$STAGE" in
     run_eval_grid_resilient
     ;;
   *)
-    echo "Usage: $0 [can|square|transport] {check|check_self|check_mixed|prepare_filters|prepare_self_filters|prepare_mixed_filters|train_self_imitation|train_self_imitation_resilient|train_mixed_imitation|train_mixed_imitation_resilient|train_conditioned|train_conditioned_resilient|train_conditioned_mixed_imitation|train_conditioned_imitation_resilient|eval_self_grid_resilient|eval_mixed_grid_resilient|eval_conditioned_grid_resilient|eval_grid_resilient|all|all_self|all_mixed}" >&2
+    echo "Usage: $0 [can|square|transport|tool_hang] {check|check_self|check_mixed|prepare_filters|prepare_self_filters|prepare_mixed_filters|train_self_imitation|train_self_imitation_resilient|train_mixed_imitation|train_mixed_imitation_resilient|train_conditioned|train_conditioned_resilient|train_conditioned_mixed_imitation|train_conditioned_imitation_resilient|eval_self_grid_resilient|eval_mixed_grid_resilient|eval_conditioned_grid_resilient|eval_grid_resilient|all|all_self|all_mixed}" >&2
     exit 2
     ;;
 esac
