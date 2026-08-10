@@ -68,6 +68,7 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
 export PYTHONPYCACHEPREFIX="/tmp/robomimic_${TASK}_gt_good_failure_pycache_${USER}_$$"
+export NUMBA_DISABLE_JIT=1
 
 PYTHON=${ROBOMIMIC_PYTHON:-/home/ryan/miniconda3/envs/robomimic_stable/bin/python}
 DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
@@ -80,11 +81,162 @@ GT_GOOD_FAILURE_CHUNKS=${GT_GOOD_FAILURE_CHUNKS:-$TASK_GT_CHUNKS}
 GT_GOOD_FAILURE_OUTPUT_DIR=${GT_GOOD_FAILURE_OUTPUT_DIR:-$TASK_OUTPUT_DIR}
 EVAL_OUTPUT=${EVAL_OUTPUT:-$TASK_EVAL_OUTPUT}
 HORIZON=${HORIZON:-$TASK_HORIZON}
+if [[ "$TASK" == "can" ]]; then
+  EXPECTED_FILTER_VERSION=can_privileged_stage_v1
+  DEFAULT_FILTER_MINIMUM_SPACING=16
+elif [[ "$TASK" == "transport" ]]; then
+  EXPECTED_FILTER_VERSION=transport_privileged_stage_v1
+  DEFAULT_FILTER_MINIMUM_SPACING=16
+elif [[ "$TASK" == "tool_hang" ]]; then
+  EXPECTED_FILTER_VERSION=tool_hang_privileged_stage_v1
+  DEFAULT_FILTER_MINIMUM_SPACING=16
+else
+  EXPECTED_FILTER_VERSION=goal_endpoint_progress_v1
+  DEFAULT_FILTER_MINIMUM_SPACING=8
+fi
+
+validate_chunks() {
+  "$PYTHON" -B - \
+    "$GT_GOOD_FAILURE_CHUNKS" \
+    "$ROLLOUT_DATASET" \
+    "$TASK" \
+    "$SUCCESS_MASK" \
+    "$FAILURE_MASK" \
+    "${GT_GOOD_PREDICTION_HORIZON:-16}" \
+    "$EXPECTED_FILTER_VERSION" <<'PYCHECK'
+import sys
+from pathlib import Path
+
+import h5py
+
+(
+    artifact,
+    source,
+    task,
+    success_mask,
+    failure_mask,
+    prediction_horizon,
+    filter_version,
+) = sys.argv[1:]
+artifact_path = Path(artifact).expanduser().resolve()
+if not artifact_path.is_file():
+    raise FileNotFoundError(artifact_path)
+with h5py.File(artifact_path, "r") as handle:
+    expected = {
+        "task": task,
+        "source_path": str(Path(source).expanduser().resolve()),
+        "source_success_mask": success_mask,
+        "source_failure_mask": failure_mask,
+        "prediction_horizon": int(prediction_horizon),
+        "filter_version": filter_version,
+    }
+    actual = {key: handle.attrs.get(key) for key in expected}
+    mismatches = {
+        key: {"expected": value, "actual": actual[key]}
+        for key, value in expected.items()
+        if actual[key] != value
+    }
+    if mismatches:
+        raise ValueError(
+            f"incompatible filtered chunk artifact {artifact_path}: {mismatches}"
+        )
+    if "mask/gt_good_failure" not in handle:
+        raise KeyError(f"{artifact_path} has no mask/gt_good_failure")
+    if len(handle["mask/gt_good_failure"]) == 0:
+        raise ValueError(f"{artifact_path} contains no filtered chunks")
+    chunk_count = len(handle["mask/gt_good_failure"])
+print(
+    f"[validated chunks] {artifact_path}: "
+    f"version={filter_version} chunks={chunk_count}"
+)
+PYCHECK
+}
 
 build_chunks() {
   local -a overwrite_args=()
+  local -a task_filter_args=()
   if [[ "${OVERWRITE_GT_GOOD_FAILURE_CHUNKS:-0}" == "1" ]]; then
     overwrite_args=(--overwrite)
+  fi
+  if [[ "$TASK" == "can" ]]; then
+    task_filter_args=(
+      --can-success-calibration-limit "${CAN_SUCCESS_CALIBRATION_LIMIT:-100}"
+      --can-max-chunks-per-stage-per-failure "${CAN_MAX_CHUNKS_PER_STAGE_PER_FAILURE:-2}"
+      --can-safe-min-start-distance "${CAN_SAFE_MIN_START_DISTANCE:-0.10}"
+      --can-safe-min-distance "${CAN_SAFE_MIN_DISTANCE:-0.05}"
+      --can-safe-min-reach-gain "${CAN_SAFE_MIN_REACH_GAIN:-0.04}"
+      --can-safe-min-progress-fraction "${CAN_SAFE_MIN_PROGRESS_FRACTION:-0.75}"
+      --can-safe-progress-tolerance "${CAN_SAFE_PROGRESS_TOLERANCE:-0.001}"
+      --can-safe-max-regression "${CAN_SAFE_MAX_REGRESSION:-0.015}"
+      --can-safe-max-can-displacement "${CAN_SAFE_MAX_CAN_DISPLACEMENT:-0.01}"
+      --can-grasp-min-frames "${CAN_GRASP_MIN_FRAMES:-6}"
+      --can-grasp-min-lift-gain "${CAN_GRASP_MIN_LIFT_GAIN:-0.025}"
+      --can-grasp-max-drop "${CAN_GRASP_MAX_DROP:-0.015}"
+      --can-transport-min-grasp-fraction "${CAN_TRANSPORT_MIN_GRASP_FRACTION:-0.75}"
+      --can-transport-min-lift-height "${CAN_TRANSPORT_MIN_LIFT_HEIGHT:-0.04}"
+      --can-transport-min-bin-progress "${CAN_TRANSPORT_MIN_BIN_PROGRESS:-0.04}"
+      --can-transport-min-progress-fraction "${CAN_TRANSPORT_MIN_PROGRESS_FRACTION:-0.65}"
+      --can-transport-progress-tolerance "${CAN_TRANSPORT_PROGRESS_TOLERANCE:-0.002}"
+      --can-transport-max-regression "${CAN_TRANSPORT_MAX_REGRESSION:-0.025}"
+      --can-transport-max-drop "${CAN_TRANSPORT_MAX_DROP:-0.025}"
+    )
+  elif [[ "$TASK" == "transport" ]]; then
+    task_filter_args=(
+      --transport-success-calibration-limit "${TRANSPORT_SUCCESS_CALIBRATION_LIMIT:-100}"
+      --transport-max-chunks-per-stage-per-failure "${TRANSPORT_MAX_CHUNKS_PER_STAGE_PER_FAILURE:-1}"
+      --transport-safe-min-start-distance "${TRANSPORT_SAFE_MIN_START_DISTANCE:-0.10}"
+      --transport-safe-min-distance "${TRANSPORT_SAFE_MIN_DISTANCE:-0.05}"
+      --transport-safe-min-reach-gain "${TRANSPORT_SAFE_MIN_REACH_GAIN:-0.04}"
+      --transport-safe-min-progress-fraction "${TRANSPORT_SAFE_MIN_PROGRESS_FRACTION:-0.70}"
+      --transport-safe-progress-tolerance "${TRANSPORT_SAFE_PROGRESS_TOLERANCE:-0.001}"
+      --transport-safe-max-regression "${TRANSPORT_SAFE_MAX_REGRESSION:-0.015}"
+      --transport-lid-min-clearance "${TRANSPORT_LID_MIN_CLEARANCE:-0.10}"
+      --transport-lid-min-clearance-gain "${TRANSPORT_LID_MIN_CLEARANCE_GAIN:-0.04}"
+      --transport-lid-max-clearance-regression "${TRANSPORT_LID_MAX_CLEARANCE_REGRESSION:-0.03}"
+      --transport-lid-max-drop "${TRANSPORT_LID_MAX_DROP:-0.04}"
+      --transport-grasp-min-frames "${TRANSPORT_GRASP_MIN_FRAMES:-6}"
+      --transport-grasp-min-lift-gain "${TRANSPORT_GRASP_MIN_LIFT_GAIN:-0.025}"
+      --transport-grasp-max-drop "${TRANSPORT_GRASP_MAX_DROP:-0.02}"
+      --transport-target-min-grasp-fraction "${TRANSPORT_TARGET_MIN_GRASP_FRACTION:-0.75}"
+      --transport-target-min-lift-height "${TRANSPORT_TARGET_MIN_LIFT_HEIGHT:-0.04}"
+      --transport-target-min-bin-progress "${TRANSPORT_TARGET_MIN_BIN_PROGRESS:-0.04}"
+      --transport-target-min-progress-fraction "${TRANSPORT_TARGET_MIN_PROGRESS_FRACTION:-0.65}"
+      --transport-target-progress-tolerance "${TRANSPORT_TARGET_PROGRESS_TOLERANCE:-0.002}"
+      --transport-target-max-regression "${TRANSPORT_TARGET_MAX_REGRESSION:-0.025}"
+      --transport-target-max-drop "${TRANSPORT_TARGET_MAX_DROP:-0.025}"
+      --transport-place-min-bin-progress "${TRANSPORT_PLACE_MIN_BIN_PROGRESS:-0.02}"
+      --transport-place-score-bonus "${TRANSPORT_PLACE_SCORE_BONUS:-0.10}"
+      --transport-secondary-max-static-displacement "${TRANSPORT_SECONDARY_MAX_STATIC_DISPLACEMENT:-0.015}"
+      --transport-secondary-min-grasp-fraction "${TRANSPORT_SECONDARY_MIN_GRASP_FRACTION:-0.50}"
+    )
+  elif [[ "$TASK" == "tool_hang" ]]; then
+    task_filter_args=(
+      --tool-hang-success-calibration-limit "${TOOL_HANG_SUCCESS_CALIBRATION_LIMIT:-100}"
+      --tool-hang-max-chunks-per-stage-per-failure "${TOOL_HANG_MAX_CHUNKS_PER_STAGE_PER_FAILURE:-1}"
+      --tool-hang-safe-min-start-distance "${TOOL_HANG_SAFE_MIN_START_DISTANCE:-0.10}"
+      --tool-hang-safe-min-distance "${TOOL_HANG_SAFE_MIN_DISTANCE:-0.05}"
+      --tool-hang-safe-min-reach-gain "${TOOL_HANG_SAFE_MIN_REACH_GAIN:-0.04}"
+      --tool-hang-safe-min-progress-fraction "${TOOL_HANG_SAFE_MIN_PROGRESS_FRACTION:-0.70}"
+      --tool-hang-safe-max-regression "${TOOL_HANG_SAFE_MAX_REGRESSION:-0.015}"
+      --tool-hang-progress-tolerance "${TOOL_HANG_PROGRESS_TOLERANCE:-0.001}"
+      --tool-hang-grasp-min-frames "${TOOL_HANG_GRASP_MIN_FRAMES:-6}"
+      --tool-hang-grasp-min-lift-gain "${TOOL_HANG_GRASP_MIN_LIFT_GAIN:-0.025}"
+      --tool-hang-grasp-max-drop "${TOOL_HANG_GRASP_MAX_DROP:-0.02}"
+      --tool-hang-transport-min-grasp-fraction "${TOOL_HANG_TRANSPORT_MIN_GRASP_FRACTION:-0.75}"
+      --tool-hang-transport-min-lift-height "${TOOL_HANG_TRANSPORT_MIN_LIFT_HEIGHT:-0.04}"
+      --tool-hang-transport-min-progress "${TOOL_HANG_TRANSPORT_MIN_PROGRESS:-0.04}"
+      --tool-hang-transport-min-progress-fraction "${TOOL_HANG_TRANSPORT_MIN_PROGRESS_FRACTION:-0.65}"
+      --tool-hang-transport-max-regression "${TOOL_HANG_TRANSPORT_MAX_REGRESSION:-0.025}"
+      --tool-hang-transport-max-drop "${TOOL_HANG_TRANSPORT_MAX_DROP:-0.025}"
+      --tool-hang-frame-insert-max-distance "${TOOL_HANG_FRAME_INSERT_MAX_DISTANCE:-0.05}"
+      --tool-hang-frame-insert-score-bonus "${TOOL_HANG_FRAME_INSERT_SCORE_BONUS:-0.10}"
+      --tool-hang-align-max-endpoint-distance "${TOOL_HANG_ALIGN_MAX_ENDPOINT_DISTANCE:-0.06}"
+      --tool-hang-align-min-error-progress "${TOOL_HANG_ALIGN_MIN_ERROR_PROGRESS:-0.015}"
+      --tool-hang-align-min-progress-fraction "${TOOL_HANG_ALIGN_MIN_PROGRESS_FRACTION:-0.60}"
+      --tool-hang-align-max-regression "${TOOL_HANG_ALIGN_MAX_REGRESSION:-0.02}"
+      --tool-hang-hook-contact-score-bonus "${TOOL_HANG_HOOK_CONTACT_SCORE_BONUS:-0.05}"
+      --tool-hang-max-static-object-displacement "${TOOL_HANG_MAX_STATIC_OBJECT_DISPLACEMENT:-0.01}"
+    )
   fi
   "$PYTHON" -B scripts/build_rgb_dp_failure_filter_dataset.py \
     --task "$TASK" \
@@ -96,14 +248,16 @@ build_chunks() {
     --stride "${GT_GOOD_STRIDE:-1}" \
     --min-start-step "${GT_GOOD_MIN_START_STEP:-0}" \
     --max-chunks-per-failure "${GT_GOOD_MAX_CHUNKS_PER_FAILURE:-4}" \
-    --minimum-spacing "${GT_GOOD_MINIMUM_SPACING:-8}" \
+    --minimum-spacing "${GT_GOOD_MINIMUM_SPACING:-$DEFAULT_FILTER_MINIMUM_SPACING}" \
     --prefer "${GT_GOOD_PREFER:-progress}" \
     --min-goal-progress "${GT_GOOD_MIN_GOAL_PROGRESS:-0.05}" \
     --min-normalized-displacement "${GT_GOOD_MIN_NORMALIZED_DISPLACEMENT:-0.05}" \
     --goal-progress-weight "${GT_GOOD_PROGRESS_WEIGHT:-1.0}" \
     --displacement-weight "${GT_GOOD_DISPLACEMENT_WEIGHT:-0.1}" \
     --position-scale-floor "${GT_GOOD_POSITION_SCALE_FLOOR:-0.01}" \
+    "${task_filter_args[@]}" \
     "${overwrite_args[@]}"
+  validate_chunks
 }
 
 ensure_chunks() {
@@ -111,6 +265,7 @@ ensure_chunks() {
     echo "[gt_good_failure task=$TASK] building missing chunks: $GT_GOOD_FAILURE_CHUNKS" >&2
     build_chunks
   fi
+  validate_chunks
 }
 
 run_imitation() {
@@ -128,6 +283,11 @@ run_imitation() {
   MIXED_IMITATION_FAILURE_DEMO_START_ONLY=1 \
   MIXED_IMITATION_FAILURE_SAMPLE_START_OFFSET=1 \
   MIXED_IMITATION_FAILURE_ANTI_FAILURE_LABEL=0.0 \
+  ACTOR_UNIFORM_SAMPLE_POOL="${GT_GOOD_ACTOR_UNIFORM_SAMPLE_POOL:-0}" \
+  ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE="${GT_GOOD_ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE:-1}" \
+  MIXED_IMITATION_DEMO_WEIGHT="${GT_GOOD_IMITATION_DEMO_WEIGHT:-1.0}" \
+  MIXED_IMITATION_SUCCESS_WEIGHT="${GT_GOOD_IMITATION_SUCCESS_WEIGHT:-1.0}" \
+  MIXED_IMITATION_FAILURE_WEIGHT="${GT_GOOD_IMITATION_FAILURE_WEIGHT:-0.02}" \
   MIXED_IMITATION_OUTPUT_DIR="$GT_GOOD_FAILURE_OUTPUT_DIR" \
   IMITATION_OUTPUT_DIR="$GT_GOOD_FAILURE_OUTPUT_DIR" \
   MIXED_IMITATION_MODE_NAME=gt_good_failure_mixed_imitation_learning \
@@ -157,12 +317,9 @@ case "$STAGE" in
   eval_grid_resilient)
     run_imitation eval_mixed_grid_resilient
     ;;
-  all)
-    ensure_chunks
-    run_imitation train_mixed_imitation_resilient
-    ;;
+
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang] {build_chunks|check|train|train_resilient|eval_grid_resilient|all}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang] {build_chunks|check|train|train_resilient|eval_grid_resilient}" >&2
     exit 2
     ;;
 esac

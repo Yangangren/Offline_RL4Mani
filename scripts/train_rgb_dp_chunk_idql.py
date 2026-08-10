@@ -69,8 +69,9 @@ DEFAULT_OUTPUT = (
     / "200demo_100success_94failure_h8_dynamics_task_reward"
 )
 ACTOR_CONDITION_DEFINITION = (
-    "human_demo=1; success_rollout=1; failure_rollout=0"
+    "human_demo=1; success_rollout=0; failure_rollout=0"
 )
+DYNAMICS_PREDICTION_MODE = "actor_encoder_direct"
 
 
 class RiseChunkActionValueNetwork(nn.Module):
@@ -91,8 +92,6 @@ class RiseChunkActionValueNetwork(nn.Module):
         num_action_conv_layers: int,
         dropout: float,
         late_fusion_key: str | None,
-        q_head_uses_delta: bool = False,
-        dynamics_prediction_mode: str = DYNAMICS_PREDICTION_MODE,
     ):
         super().__init__()
         observation_group_shapes = OrderedDict(obs=OrderedDict(obs_shapes))
@@ -109,17 +108,6 @@ class RiseChunkActionValueNetwork(nn.Module):
         self.chunk_horizon = int(chunk_horizon)
         self.latent_dim = int(latent_dim)
         self.encoder_output_dim = int(self.nets["encoder"].output_shape()[0])
-        self.q_head_uses_delta = bool(q_head_uses_delta)
-        self.dynamics_prediction_mode = str(dynamics_prediction_mode)
-
-        if (
-            self.dynamics_prediction_mode == DYNAMICS_PREDICTION_MODE
-            and self.q_head_uses_delta
-        ):
-            raise ValueError(
-                "actor-encoder dynamics prediction cannot supply a latent "
-                "delta to the Q head"
-            )
         self.late_fusion_keys = tuple(
             key.strip()
             for key in str(late_fusion_key or "").split(",")
@@ -157,27 +145,14 @@ class RiseChunkActionValueNetwork(nn.Module):
             dropout=float(dropout),
             final_layer_norm=True,
         )
-        if self.dynamics_prediction_mode == DYNAMICS_PREDICTION_MODE:
-            self.nets["dynamics_predictor"] = make_mlp(
-                self.latent_dim,
-                hidden_dims,
-                self.encoder_output_dim,
-                dropout=float(dropout),
-            )
-        else:
-            self.nets["transition_delta"] = make_mlp(
-                self.latent_dim,
-                hidden_dims,
-                self.latent_dim,
-                dropout=float(dropout),
-            )
-            self.nets["transition_gate"] = nn.Sequential(
-                nn.Linear(self.latent_dim, self.latent_dim),
-                nn.Sigmoid(),
-            )
-            self.nets["next_context_norm"] = nn.LayerNorm(self.latent_dim)
+        self.nets["dynamics_predictor"] = make_mlp(
+            self.latent_dim,
+            hidden_dims,
+            self.encoder_output_dim,
+            dropout=float(dropout),
+        )
         self.nets["q_head"] = make_mlp(
-            (3 if self.q_head_uses_delta else 2) * self.latent_dim,
+            2 * self.latent_dim,
             hidden_dims,
             1,
             dropout=float(dropout),
@@ -1099,6 +1074,120 @@ def validate_source(source: dict, args: argparse.Namespace) -> None:
         )
 
 
+def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
+    """Validate a complete chunk checkpoint before round-to-round warm start."""
+    if not source.get("rise_style_rgb_chunk_idql", False):
+        raise ValueError(
+            "source-chunk-idql-checkpoint is not a chunk IDQL checkpoint"
+        )
+    if str(source.get("task", "")) != str(args.task):
+        raise ValueError(
+            f"source task={source.get('task')!r} does not match task={args.task!r}"
+        )
+    source_reward_mode = str(source.get("reward_mode", "rise"))
+    if source_reward_mode != str(args.reward_mode):
+        raise ValueError(
+            f"source reward_mode={source_reward_mode!r} does not match "
+            f"requested reward_mode={args.reward_mode!r}"
+        )
+    if not bool(source.get("conditioned_actor", False)):
+        raise ValueError(
+            "round-2 joint warm start requires a conditioned source actor"
+        )
+    source_condition_definition = str(
+        source.get("actor_condition_label_definition", "")
+    )
+    if source_condition_definition != ACTOR_CONDITION_DEFINITION:
+        raise ValueError(
+            "source actor condition definition="
+            f"{source_condition_definition!r} does not match required "
+            f"{ACTOR_CONDITION_DEFINITION!r}"
+        )
+    if not bool(args.conditioned_actor):
+        raise ValueError(
+            "source_chunk_idql_joint requires --conditioned-actor so human "
+            "demonstrations remain condition 1 and every rollout remains 0"
+        )
+
+    source_args = source.get("args", {})
+    source_condition_hidden_dim = int(
+        source_args.get(
+            "condition_hidden_dim",
+            source.get("actor_condition_hidden_dim", -1),
+        )
+    )
+    if source_condition_hidden_dim != int(args.condition_hidden_dim):
+        raise ValueError(
+            "condition-hidden-dim must match source chunk checkpoint: "
+            f"requested={args.condition_hidden_dim}, "
+            f"source={source_condition_hidden_dim}"
+        )
+
+    expected_fields = {
+        "critic_chunk_horizon": int(args.chunk_horizon),
+        "critic_hidden_dims": tuple(int(x) for x in args.critic_hidden_dims),
+        "critic_latent_dim": int(args.latent_dim),
+        "critic_action_hidden_dim": int(args.action_hidden_dim),
+        "critic_num_attention_heads": int(args.num_attention_heads),
+        "critic_num_action_conv_layers": int(args.num_action_conv_layers),
+        "critic_dropout": float(args.dropout),
+        "num_critics": int(args.num_critics),
+        "critic_group_norm": bool(args.critic_group_norm),
+        "critic_late_fusion_key": args.critic_late_fusion_key,
+    }
+    integer_fields = {
+        "critic_chunk_horizon",
+        "critic_latent_dim",
+        "critic_action_hidden_dim",
+        "critic_num_attention_heads",
+        "critic_num_action_conv_layers",
+        "num_critics",
+    }
+    for field, expected in expected_fields.items():
+        value = source.get(field)
+        if field == "critic_hidden_dims":
+            value = tuple(value or ())
+        elif field in integer_fields:
+            value = int(value if value is not None else -1)
+        elif field == "critic_dropout":
+            value = float(value if value is not None else float("nan"))
+        elif field == "critic_group_norm":
+            value = bool(value)
+        if value != expected:
+            raise ValueError(
+                f"{field}={expected!r} does not match source value {value!r}"
+            )
+
+    if str(source.get("dynamics_prediction_mode", "")) != DYNAMICS_PREDICTION_MODE:
+        raise ValueError(
+            "source dynamics prediction mode does not match the current "
+            f"{DYNAMICS_PREDICTION_MODE!r} architecture"
+        )
+    if tuple(source.get("critic_q_head_inputs", ())) != (
+        "context",
+        "action_repr",
+    ):
+        raise ValueError("source chunk checkpoint uses an incompatible Q head")
+    required_keys = (
+        "actor_model",
+        "critics",
+        "critic_targets",
+        "dynamics_target_encoder",
+        "vf",
+        "pretrained_dp_checkpoint",
+        "action_normalization_stats",
+    )
+    missing = [key for key in required_keys if key not in source]
+    if missing:
+        raise ValueError(
+            f"source chunk checkpoint is missing required fields: {missing}"
+        )
+    if len(source["critics"]) != int(args.num_critics):
+        raise ValueError("source checkpoint critic count is inconsistent")
+    if len(source["critic_targets"]) != int(args.num_critics):
+        raise ValueError("source checkpoint target critic count is inconsistent")
+
+
 def checkpoint_payload(
     *,
     args: argparse.Namespace,
@@ -1125,7 +1214,6 @@ def checkpoint_payload(
         "rise_style_rgb_chunk_idql": True,
         "hybrid_dp_chunk_actor_iql": True,
         "visual_critic_idql": True,
-        "critic_q_head_uses_delta": False,
         "critic_q_head_inputs": ("context", "action_repr"),
         "critic_representation_modules": (
             "encoder",
@@ -1165,6 +1253,11 @@ def checkpoint_payload(
             if args.source_idql_checkpoint is not None
             else None
         ),
+        "source_chunk_idql_checkpoint": (
+            str(args.source_chunk_idql_checkpoint)
+            if args.source_chunk_idql_checkpoint is not None
+            else None
+        ),
         "pretrained_dp_checkpoint": str(pretrained_dp_checkpoint),
         "task": str(args.task),
         "dataset": str(args.dataset),
@@ -1172,27 +1265,33 @@ def checkpoint_payload(
         "sampling": "uniform_shuffled_SequenceDataset_indices",
         "reward_mode": str(args.reward_mode),
         "reward_definition": REWARD_DEFINITIONS[args.reward_mode],
+        "critic_reward_source": (
+            "rewards=source_environment_task_reward"
+            if args.reward_mode == "task"
+            else "rewards=expert_1_non_expert_0"
+        ),
         "actor_training_objective": (
             (
-                (
-                    "human_conditioned_diffusion_BC_all_mixed_rows_"
-                    "human_1_rollout_0_from_pretrained_DP_ema"
-                )
-                if args.conditioned_actor
-                else (
-                    "full_diffusion_BC_human_demo_rows_from_pretrained_DP_ema"
-                    if args.actor_demo_only
-                    else "full_diffusion_BC_all_mixed_rows_from_pretrained_DP_ema"
+                "human_conditioned_diffusion_BC_all_mixed_rows_"
+                "human_1_all_rollouts_0_"
+                + (
+                    "from_source_chunk_IDQL_actor"
+                    if args.initialization == "source_chunk_idql_joint"
+                    else "from_pretrained_DP_ema"
                 )
             )
-            if args.initialization == "pretrained_dp_joint"
+            if trains_joint_actor(args) and args.conditioned_actor
             else (
-                "frozen_deployed_dp_actor_from_pretrained_checkpoint"
-                if args.initialization == "pretrained_dp_frozen"
-                else "frozen_one_step_idql_posttrained_ema_actor"
+                "full_diffusion_BC_all_mixed_rows"
+                if trains_joint_actor(args)
+                else (
+                    "frozen_deployed_dp_actor_from_pretrained_checkpoint"
+                    if args.initialization == "pretrained_dp_frozen"
+                    else "frozen_one_step_idql_posttrained_ema_actor"
+                )
+                )
             )
         ),
-        "actor_demo_only": bool(args.actor_demo_only),
         "conditioned_actor": bool(args.conditioned_actor),
         "actor_condition_label_definition": (
             ACTOR_CONDITION_DEFINITION
@@ -1220,12 +1319,8 @@ def checkpoint_payload(
             int(args.condition_hidden_dim) if args.conditioned_actor else None
         ),
         "actor_source_mask": (
-            (
-                "source_is_expert_at_current_transition_equals_1"
-                if args.actor_demo_only
-                else "none_all_shared_batch_rows"
-            )
-            if args.initialization == "pretrained_dp_joint"
+            "none_all_shared_batch_rows"
+            if trains_joint_actor(args)
             else "none_actor_frozen"
         ),
         "critic_source_mask": "none_all_shared_batch_rows",
@@ -1254,8 +1349,14 @@ def checkpoint_payload(
         "discount": float(args.discount),
         "expectile": float(args.expectile),
         "target_tau": float(args.target_tau),
-        "dynamics_target_tau": float(args.dynamics_target_tau),
-        "dynamics_target_source": "separate_slow_polyak_context_encoder",
+        "dynamics_target_source": (
+            "periodic_deployed_actor_ema_obs_encoder"
+            if trains_joint_actor(args)
+            else "fixed_deployed_actor_ema_obs_encoder"
+        ),
+        "dynamics_target_sync_interval": int(
+            args.dynamics_target_sync_interval
+        ),
         "dynamics_weight": float(args.dynamics_weight),
         "dynamics_cosine_weight": float(args.dynamics_cosine_weight),
         "dynamics_warmup_steps": int(args.dynamics_warmup_steps),
@@ -1280,10 +1381,8 @@ def checkpoint_payload(
         "actor_lr_warmup_steps": int(args.actor_lr_warmup_steps),
         "actor_lr_total_steps": int(args.actor_lr_total_steps),
         "actor_lr_num_cycles": float(args.actor_lr_num_cycles),
-        "actor_frozen": bool(args.initialization != "pretrained_dp_joint"),
-        "actor_encoder_trainable": bool(
-            args.initialization == "pretrained_dp_joint"
-        ),
+        "actor_frozen": bool(not trains_joint_actor(args)),
+        "actor_encoder_trainable": bool(trains_joint_actor(args)),
         "actor_ema_optimization_step": int(actor_ema_optimization_step),
         "rng_state": rng_state(),
         "loader_generator_state": loader_generator.get_state(),
@@ -1309,18 +1408,32 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         )
         if not resume_state.get("rise_style_rgb_chunk_idql", False):
             raise ValueError("resume checkpoint is not a chunk IDQL checkpoint")
-        saved_pipeline_version = int(
-            resume_state.get("chunk_training_pipeline_version", 1)
-        )
-        saved_q_head_uses_delta = bool(
-            resume_state.get("critic_q_head_uses_delta", True)
-        )
-        if saved_q_head_uses_delta:
-            raise ValueError(
-                "resume checkpoint uses the legacy Q head with transition delta "
-                "input; the current chunk critic uses only context and "
-                "action_repr, so start a fresh output directory"
+
+        saved_dynamics_mode = str(
+            resume_state.get(
+                "dynamics_prediction_mode",
+                "",
             )
+        )
+        if saved_dynamics_mode != DYNAMICS_PREDICTION_MODE:
+            raise ValueError(
+                f"resume dynamics_prediction_mode={saved_dynamics_mode!r} "
+                f"does not match {DYNAMICS_PREDICTION_MODE!r}; start a "
+                "fresh output directory"
+            )
+        saved_sync_interval = int(
+            resume_state.get("args", {}).get(
+                "dynamics_target_sync_interval",
+                -1,
+            )
+        )
+        if saved_sync_interval != int(args.dynamics_target_sync_interval):
+            raise ValueError(
+                "resume dynamics_target_sync_interval="
+                f"{saved_sync_interval} does not match requested "
+                f"{args.dynamics_target_sync_interval}"
+            )
+
         saved_initialization = str(
             resume_state.get("chunk_initialization", "source_idql_frozen")
         )
@@ -1337,7 +1450,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"resume reward_mode={saved_reward_mode} does not match "
                 f"requested reward_mode={args.reward_mode}"
             )
-        if saved_initialization == "pretrained_dp_joint":
+        if saved_initialization in JOINT_ACTOR_INITIALIZATIONS:
             saved_args = resume_state.get("args", {})
             saved_actor_scheduler = str(
                 saved_args.get("actor_lr_scheduler", "constant")
@@ -1366,14 +1479,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     "not match requested "
                     f"actor_lr_num_cycles={args.actor_lr_num_cycles}"
                 )
-        saved_actor_demo_only = bool(
-            resume_state.get("args", {}).get("actor_demo_only", False)
-        )
-        if saved_actor_demo_only != bool(args.actor_demo_only):
-            raise ValueError(
-                f"resume actor_demo_only={saved_actor_demo_only} does not "
-                f"match requested actor_demo_only={args.actor_demo_only}"
-            )
         saved_conditioned_actor = bool(
             resume_state.get("args", {}).get("conditioned_actor", False)
         )
@@ -1383,6 +1488,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"match requested conditioned_actor={args.conditioned_actor}"
             )
         if saved_conditioned_actor:
+            saved_condition_definition = str(
+                resume_state.get("actor_condition_label_definition", "")
+            )
+            if saved_condition_definition != ACTOR_CONDITION_DEFINITION:
+                raise ValueError(
+                    "resume actor condition definition="
+                    f"{saved_condition_definition!r} does not match requested "
+                    f"{ACTOR_CONDITION_DEFINITION!r}; start a fresh output "
+                    "directory for the human-only condition"
+                )
             saved_condition_hidden_dim = int(
                 resume_state.get("args", {}).get("condition_hidden_dim", 128)
             )
@@ -1404,16 +1519,32 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         pretrained_dp_checkpoint = str(
             resume_state["pretrained_dp_checkpoint"]
         )
-    elif args.initialization == "source_idql_frozen":
+    elif args.initialization in (
+        "source_idql_frozen",
+        "source_chunk_idql_joint",
+    ):
+        source_checkpoint = (
+            args.source_idql_checkpoint
+            if args.initialization == "source_idql_frozen"
+            else args.source_chunk_idql_checkpoint
+        )
         source_for_warm_start = torch.load(
-            args.source_idql_checkpoint,
+            source_checkpoint,
             map_location="cpu",
             weights_only=False,
         )
-        validate_source(source_for_warm_start, args)
+        if args.initialization == "source_idql_frozen":
+            validate_source(source_for_warm_start, args)
+        else:
+            validate_chunk_source(source_for_warm_start, args)
         pretrained_dp_checkpoint = str(
             source_for_warm_start["pretrained_dp_checkpoint"]
         )
+        if not Path(pretrained_dp_checkpoint).is_file():
+            raise FileNotFoundError(
+                "pretrained DP checkpoint referenced by source checkpoint "
+                f"does not exist: {pretrained_dp_checkpoint}"
+            )
     else:
         pretrained_dp_checkpoint = str(args.checkpoint)
 
@@ -1440,11 +1571,33 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "initial action normalization does not match the pretrained DP"
         )
     actor_algo = actor_policy.policy
-    if args.initialization == "pretrained_dp_joint":
+    if trains_joint_actor(args):
         if resume_state is None:
-            initialized_from_ema = initialize_actor_from_deployed_ema(actor_algo)
-            if actor_algo.ema is not None and not initialized_from_ema:
-                raise RuntimeError("failed to initialize actor from deployed DP EMA")
+            if args.initialization == "source_chunk_idql_joint":
+                actor_algo.deserialize(
+                    source_for_warm_start["actor_model"],
+                    load_optimizers=False,
+                )
+                if actor_algo.ema is not None:
+                    actor_algo.ema.optimization_step = int(
+                        source_for_warm_start.get(
+                            "actor_ema_optimization_step",
+                            0,
+                        )
+                    )
+            else:
+                initialized_from_ema = initialize_actor_from_deployed_ema(
+                    actor_algo
+                )
+                if actor_algo.ema is not None and not initialized_from_ema:
+                    raise RuntimeError(
+                        "failed to initialize actor from deployed DP EMA"
+                    )
+                if not actor_matches_deployed_ema(actor_algo):
+                    raise RuntimeError(
+                        "trainable actor does not exactly match the pretrained "
+                        "deployed DP EMA"
+                    )
         configure_conditioned_actor(actor_algo, args)
         actor_audit = None
     elif args.initialization == "source_idql_frozen":
@@ -1480,11 +1633,28 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         actor_algo.algo_config.horizon.prediction_horizon
     )
     args.actor_action_horizon = actor_horizon
+    if (
+        args.initialization == "source_chunk_idql_joint"
+        and int(source_for_warm_start.get("action_dim", -1))
+        != int(args.action_dim)
+    ):
+        raise ValueError(
+            f"source action_dim={source_for_warm_start.get('action_dim')} "
+            f"does not match actor action_dim={args.action_dim}"
+        )
 
     sequence_length = (
         int(args.actor_prediction_horizon)
-        if args.initialization == "pretrained_dp_joint"
+        if trains_joint_actor(args)
         else int(args.chunk_horizon)
+    )
+    condition_audit = (
+        audit_actor_conditions(
+            args.dataset,
+            reward_mode=str(args.reward_mode),
+        )
+        if args.conditioned_actor
+        else None
     )
     dataset, loader, loader_generator, _ = build_single_loader(
         args,
@@ -1528,7 +1698,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     f"resume {field}={saved_value} does not match requested "
                     f"{field}={requested_value}"
                 )
-    if args.initialization == "pretrained_dp_joint":
+    if trains_joint_actor(args):
         if (
             args.actor_lr_scheduler == "cosine"
             and int(args.actor_lr_warmup_steps)
@@ -1602,6 +1772,28 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             ),
         }
         targets = copy.deepcopy(critics)
+    elif (
+        source_for_warm_start is not None
+        and args.initialization == "source_chunk_idql_joint"
+    ):
+        warm_start_audit = {
+            "mode": "source_chunk_idql_complete_model",
+            "checkpoint": str(args.source_chunk_idql_checkpoint),
+            "fresh_optimizers_and_schedulers": True,
+            "fresh_epoch_and_global_step": True,
+            "critics": [
+                match_encoder_normalization_to_checkpoint(critic, state)
+                for critic, state in zip(
+                    critics,
+                    source_for_warm_start["critics"],
+                )
+            ],
+            "vf": match_encoder_normalization_to_checkpoint(
+                vf,
+                source_for_warm_start["vf"],
+            ),
+        }
+        targets = copy.deepcopy(critics)
     elif source_for_warm_start is not None:
         warm_start_audit = {
             "mode": "source_one_step_idql_representations",
@@ -1626,11 +1818,25 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         }
         targets = copy.deepcopy(critics)
 
-    dynamics_targets = copy.deepcopy(critics)
+    dynamics_target_encoder = copy.deepcopy(
+        deployed_actor_obs_encoder(actor_algo)
+    )
     critics = critics.float().to(device)
     targets = targets.float().to(device)
-    dynamics_targets = dynamics_targets.float().to(device)
+    dynamics_target_encoder = dynamics_target_encoder.float().to(device)
     vf = vf.float().to(device)
+    target_encoder_output_dim = int(
+        dynamics_target_encoder.output_shape()[0]
+    )
+    critic_encoder_output_dims = {
+        int(critic.encoder_output_dim) for critic in critics
+    }
+    if critic_encoder_output_dims != {target_encoder_output_dim}:
+        raise RuntimeError(
+            "actor dynamics target and critic raw encoder output dimensions "
+            f"differ: target={target_encoder_output_dim}, "
+            f"critics={sorted(critic_encoder_output_dims)}"
+        )
     critic_optimizers = [
         make_critic_optimizer(critic, args.critic_lr, args.encoder_lr)
         for critic in critics
@@ -1656,18 +1862,17 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     start_epoch = 0
     global_step = 0
+    dynamics_target_last_sync_step = 0
     history: list[dict] = []
     if resume_state is not None:
         for critic, state in zip(critics, resume_state["critics"]):
             critic.load_state_dict(state)
         for target, state in zip(targets, resume_state["critic_targets"]):
             target.load_state_dict(state)
-        dynamics_target_states = resume_state.get(
-            "dynamics_targets",
-            resume_state["critic_targets"],
+        dynamics_target_encoder.load_state_dict(
+            resume_state["dynamics_target_encoder"],
+            strict=True,
         )
-        for target, state in zip(dynamics_targets, dynamics_target_states):
-            target.load_state_dict(state)
         vf.load_state_dict(resume_state["vf"])
         for optimizer, state in zip(
             critic_optimizers, resume_state["critic_optimizers"]
@@ -1702,6 +1907,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             vf_lr_scheduler.load_state_dict(vf_scheduler_state)
         start_epoch = int(resume_state["epoch"])
         global_step = int(resume_state["step"])
+        dynamics_target_last_sync_step = int(
+            resume_state["dynamics_target_last_sync_step"]
+        )
         if scheduler_enabled:
             scheduler_steps = [
                 *[
@@ -1726,11 +1934,37 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             f"step={global_step}",
             flush=True,
         )
+    elif (
+        source_for_warm_start is not None
+        and args.initialization == "source_chunk_idql_joint"
+    ):
+        for critic, state in zip(
+            critics,
+            source_for_warm_start["critics"],
+        ):
+            critic.load_state_dict(state, strict=True)
+        for target, state in zip(
+            targets,
+            source_for_warm_start["critic_targets"],
+        ):
+            target.load_state_dict(state, strict=True)
+        dynamics_target_encoder.load_state_dict(
+            source_for_warm_start["dynamics_target_encoder"],
+            strict=True,
+        )
+        vf.load_state_dict(source_for_warm_start["vf"], strict=True)
+        print(
+            "Warm-started actor, actor EMA, twin critics, target critics, VF, "
+            "and dynamics target from "
+            f"{args.source_chunk_idql_checkpoint}; starting fresh optimizers, "
+            "LR schedules, epoch=0, and global_step=0",
+            flush=True,
+        )
     configure_target_random_crops(targets)
-    configure_target_random_crops(dynamics_targets)
+    configure_encoder_target_random_crops(dynamics_target_encoder)
     del resume_state, source_for_warm_start
 
-    if args.initialization != "pretrained_dp_joint":
+    if not trains_joint_actor(args):
         actor_algo.nets.cpu()
         if actor_algo.ema is not None:
             actor_algo.ema.averaged_model.cpu()
@@ -1755,7 +1989,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "independent_raw_obs_encoders": True,
         "critic_chunk_horizon": int(args.chunk_horizon),
         "critic_q_head_inputs": ["context", "action_repr"],
-        "critic_q_head_uses_delta": False,
         "critic_representation_modules": [
             "encoder",
             "context",
@@ -1770,7 +2003,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "dynamics_target_encoder": "shared_deployed_actor_ema_obs_encoder",
         "dynamics_target_update": (
             "periodic_hard_sync"
-            if args.initialization == "pretrained_dp_joint"
+            if trains_joint_actor(args)
             else "fixed_after_initialization"
         ),
         "dynamics_target_context_mlp": False,
@@ -1793,11 +2026,22 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             if args.source_idql_checkpoint is not None
             else None
         ),
+        "source_chunk_idql_checkpoint": (
+            str(args.source_chunk_idql_checkpoint)
+            if args.source_chunk_idql_checkpoint is not None
+            else None
+        ),
         "pretrained_dp_checkpoint": pretrained_dp_checkpoint,
         "actor_initialization_audit": {
             "loaded_with_policy_from_checkpoint": True,
             "trainable_actor_initialized_from_deployed_ema": bool(
                 args.initialization == "pretrained_dp_joint"
+            ),
+            "trainable_actor_initialized_from_source_chunk": bool(
+                args.initialization == "source_chunk_idql_joint"
+            ),
+            "source_actor_ema_optimization_step_preserved": bool(
+                args.initialization == "source_chunk_idql_joint"
             ),
         },
         "dataset": {
@@ -1824,12 +2068,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 else "rewards=expert_1_non_expert_0"
             ),
             "actor_rows": (
-                (
-                    "human_demo_only_source_is_expert_equals_1"
-                    if args.actor_demo_only
-                    else "all_human_success_failure"
-                )
-                if args.initialization == "pretrained_dp_joint"
+                "all_human_success_failure"
+                if trains_joint_actor(args)
                 else "none_actor_frozen"
             ),
             "actor_condition_labels": (
@@ -1874,7 +2114,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "actor_lr_warmup_steps": int(args.actor_lr_warmup_steps),
             "actor_lr_total_steps": int(args.actor_lr_total_steps),
             "actor_lr_num_cycles": float(args.actor_lr_num_cycles),
-            "actor_demo_only": bool(args.actor_demo_only),
             "conditioned_actor": bool(args.conditioned_actor),
             "condition_dropout": float(args.condition_dropout),
             "condition_hidden_dim": int(args.condition_hidden_dim),
@@ -1933,6 +2172,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 obs_stats,
                 chunk_horizon=args.chunk_horizon,
                 discount=args.discount,
+                reward_mode=args.reward_mode,
             )
             encoder_trainable = global_step >= int(args.encoder_freeze_steps)
             vf_encoder_trainable = (
@@ -1977,57 +2217,38 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
             # update condition diffusion actor
             actor_info: dict[str, float] = {}
-            if args.initialization == "pretrained_dp_joint":
+            if trains_joint_actor(args):
                 current_index = int(args.observation_horizon) - 1
                 condition_labels = source_condition_labels(
                     raw_batch,
                     current_index=current_index,
                 )
-                actor_batch, actor_rows = select_actor_rows(
-                    raw_batch,
-                    current_index=current_index,
-                    demo_only=args.actor_demo_only,
-                )
-                selected_conditions = condition_labels[actor_rows]
+                actor_batch = raw_batch
                 if args.conditioned_actor:
                     actor_batch = add_actor_condition(
                         actor_batch,
-                        selected_conditions,
+                        condition_labels,
                     )
-                actor_row_count = int(actor_rows.sum().item())
+                actor_row_count = int(raw_batch["actions"].shape[0])
                 actor_info = {
                     "actor/data_rows": float(actor_row_count),
-                    "actor/filtered_rows": float(
-                        int(actor_rows.numel()) - actor_row_count
-                    ),
-                    "actor/data_fraction": float(
-                        actor_row_count / max(int(actor_rows.numel()), 1)
-                    ),
-                    "actor/update_skipped": float(actor_row_count == 0),
-                    "actor/demo_only_mask": float(args.actor_demo_only),
                     "actor/conditioned": float(args.conditioned_actor),
                     "actor/condition_mean": float(
-                        selected_conditions.mean().item()
-                        if actor_row_count > 0
-                        else 0.0
+                        condition_labels.mean().item()
                     ),
                     "actor/zero_condition_fraction": float(
-                        (selected_conditions < 0.5).float().mean().item()
-                        if actor_row_count > 0
-                        else 0.0
+                        (condition_labels < 0.5).float().mean().item()
                     ),
                 }
-                if actor_row_count > 0:
-                    actor_info.update(
-                        actor_train_step(
-                            actor_algo,
-                            actor_batch,
-                            epoch,
-                            obs_stats,
-                        )
+                actor_info.update(
+                    actor_train_step(
+                        actor_algo,
+                        actor_batch,
+                        epoch,
+                        obs_stats,
                     )
-                del actor_batch, actor_rows, condition_labels
-                del selected_conditions
+                )
+                del actor_batch, condition_labels
             for scheduler in critic_lr_schedulers:
                 if scheduler is not None:
                     scheduler.step()
@@ -2037,7 +2258,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             global_step += 1
             dynamics_target_synced = False
             if (
-                args.initialization == "pretrained_dp_joint"
+                trains_joint_actor(args)
                 and global_step % int(args.dynamics_target_sync_interval) == 0
             ):
                 sync_actor_dynamics_target_encoder(
@@ -2064,7 +2285,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             metrics["vf/encoder_trainable"] = float(
                 vf_encoder_trainable
             )
-            if args.initialization == "pretrained_dp_joint":
+            if trains_joint_actor(args):
                 metrics["lr/actor"] = float(
                     actor_algo.optimizers["policy"].param_groups[0]["lr"]
                 )
@@ -2184,19 +2405,29 @@ def make_parser() -> argparse.ArgumentParser:
             "pretrained_dp_joint",
             "pretrained_dp_frozen",
             "source_idql_frozen",
+            "source_chunk_idql_joint",
         ),
         default="pretrained_dp_joint",
     )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_DP)
     parser.add_argument("--source-idql-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--source-chunk-idql-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Complete chunk IDQL checkpoint used to warm-start a fresh "
+            "joint actor-critic training round."
+        ),
+    )
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
@@ -2239,15 +2470,6 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--actor-lr-warmup-steps", type=int, default=500)
     parser.add_argument("--actor-lr-num-cycles", type=float, default=0.5)
-    parser.add_argument(
-        "--actor-demo-only",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Update the actor only with human-demo rows (source label 1) "
-            "while critics still use the full shared batch."
-        ),
-    )
     parser.add_argument(
         "--conditioned-actor",
         action=argparse.BooleanOptionalAction,
@@ -2328,6 +2550,7 @@ def main() -> None:
     for key in (
         "checkpoint",
         "source_idql_checkpoint",
+        "source_chunk_idql_checkpoint",
         "dataset",
         "output_dir",
         "resume_checkpoint",
@@ -2341,13 +2564,22 @@ def main() -> None:
                 parser.error(
                     f"pretrained DP checkpoint does not exist: {args.checkpoint}"
                 )
+        elif args.initialization == "source_idql_frozen":
+            if (
+                args.source_idql_checkpoint is None
+                or not args.source_idql_checkpoint.is_file()
+            ):
+                parser.error(
+                    f"source IDQL checkpoint does not exist: "
+                    f"{args.source_idql_checkpoint}"
+                )
         elif (
-            args.source_idql_checkpoint is None
-            or not args.source_idql_checkpoint.is_file()
+            args.source_chunk_idql_checkpoint is None
+            or not args.source_chunk_idql_checkpoint.is_file()
         ):
             parser.error(
-                f"source IDQL checkpoint does not exist: "
-                f"{args.source_idql_checkpoint}"
+                f"source chunk IDQL checkpoint does not exist: "
+                f"{args.source_chunk_idql_checkpoint}"
             )
     if not args.dataset.is_file():
         parser.error(f"dataset does not exist: {args.dataset}")
@@ -2362,7 +2594,10 @@ def main() -> None:
         parser.error("steps-per-epoch must be positive when specified")
     if args.num_critics < 2:
         parser.error("RISE clipped double Q requires at least two critics")
-
+    if args.dynamics_target_sync_interval <= 0:
+        parser.error("dynamics-target-sync-interval must be positive")
+    if not 0.0 <= args.condition_dropout < 1.0:
+        parser.error("condition-dropout must be in [0, 1)")
     if args.hdf5_cache_mode == "none":
         args.hdf5_cache_mode = None
     if not args.critic_late_fusion_key:

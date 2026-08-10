@@ -30,7 +30,7 @@ case "$TASK" in
     TASK_IDQL_DATASET=datasets/can/idql/can_rgb_dp_idql_200demo_100success_33failure.hdf5
     TASK_DQL_OUTPUT_DIR=trained_models/can_rgb_dp/dql/200demo_100success_33failure
     TASK_EVAL_OUTPUT=rollouts/can_rgb_dp/dql/200demo_100success_33failure
-    TASK_CRITIC_GROUP_NORM=0
+    TASK_CRITIC_GROUP_NORM=1
     TASK_EVAL_HORIZON=400
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
     ;;
@@ -39,7 +39,7 @@ case "$TASK" in
     TASK_IDQL_DATASET=datasets/transport/idql/transport_rgb_dp_idql_200demo_100success_50failure.hdf5
     TASK_DQL_OUTPUT_DIR=trained_models/transport_rgb_dp/dql/200demo_100success_50failure
     TASK_EVAL_OUTPUT=rollouts/transport_rgb_dp/dql/200demo_100success_50failure
-    TASK_CRITIC_GROUP_NORM=0
+    TASK_CRITIC_GROUP_NORM=1
     TASK_EVAL_HORIZON=700
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos,robot1_gripper_qpos
     ;;
@@ -48,7 +48,7 @@ case "$TASK" in
     TASK_IDQL_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_100success_50failure.hdf5
     TASK_DQL_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/dql/200demo_100success_50failure
     TASK_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/dql/200demo_100success_50failure
-    TASK_CRITIC_GROUP_NORM=0
+    TASK_CRITIC_GROUP_NORM=1
     TASK_EVAL_HORIZON=700
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
     ;;
@@ -122,6 +122,10 @@ DQL_CLIP_ACTIONS_ARG=--dql-clip-actions
 if [[ "${DQL_CLIP_ACTIONS:-1}" == "0" ]]; then
   DQL_CLIP_ACTIONS_ARG=--no-dql-clip-actions
 fi
+VALIDATION_HOLDOUT_ARG=--no-validation-holdout
+if [[ "${VALIDATION_HOLDOUT:-0}" == "1" ]]; then
+  VALIDATION_HOLDOUT_ARG=--validation-holdout
+fi
 
 require_training_data() {
   if [[ ! -f "$DP_CHECKPOINT" ]]; then
@@ -155,7 +159,7 @@ run_train() {
     --seed "${SEED:-0}" \
     --epochs "${EPOCHS:-50}" \
     "${steps_per_epoch_args[@]}" \
-    --batch-size "${BATCH_SIZE:-64}" \
+    --batch-size "${BATCH_SIZE:-100}" \
     --num-workers "${NUM_WORKERS:-4}" \
     --prefetch-factor "${PREFETCH_FACTOR:-2}" \
     "$PIN_MEMORY_ARG" \
@@ -174,15 +178,21 @@ run_train() {
     "$CRITIC_GROUP_NORM_ARG" \
     --critic-late-fusion-key "$CRITIC_LATE_FUSION_KEY" \
     "$USE_HUBER_ARG" \
-    --max-gradient-norm "${MAX_GRADIENT_NORM:-10.0}" \
+    --actor-max-gradient-norm "${ACTOR_MAX_GRADIENT_NORM:-1.0}" \
+    --critic-max-gradient-norm "${CRITIC_MAX_GRADIENT_NORM:-10.0}" \
     --dql-eta "${DQL_ETA:-1.0}" \
     --dql-bc-weight "${DQL_BC_WEIGHT:-1.0}" \
     --dql-q-batch-size "${DQL_Q_BATCH_SIZE:-8}" \
     --dql-num-inference-steps "${DQL_NUM_INFERENCE_STEPS:-5}" \
     --dql-target-num-candidates "${DQL_TARGET_NUM_CANDIDATES:-1}" \
     --dql-q-head "${DQL_Q_HEAD:-random}" \
-    --dql-q-denominator-floor "${DQL_Q_DENOMINATOR_FLOOR:-1e-6}" \
+    --dql-q-denominator-floor "${DQL_Q_DENOMINATOR_FLOOR:-1.0}" \
+    --dql-critic-warmup-steps "${DQL_CRITIC_WARMUP_STEPS:-1000}" \
+    --dql-actor-ema-update-every "${DQL_ACTOR_EMA_UPDATE_EVERY:-5}" \
     "$DQL_CLIP_ACTIONS_ARG" \
+    --validation-fraction "${VALIDATION_FRACTION:-0.1}" \
+    "$VALIDATION_HOLDOUT_ARG" \
+    --validation-batches "${VALIDATION_BATCHES:-32}" \
     --log-every "${LOG_EVERY:-100}" \
     --save-every-epochs "${SAVE_EVERY_EPOCHS:-1}" \
     --snapshot-every-epochs "${SNAPSHOT_EVERY_EPOCHS:-10}"

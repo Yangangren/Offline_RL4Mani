@@ -234,11 +234,11 @@ else
     IMITATION_MODE_NAME_VALUE="${MIXED_IMITATION_MODE_NAME:-${IMITATION_MODE_NAME:-mixed_quality_imitation_learning}}"
     IMITATION_EXPERIMENT_NAME_VALUE="${MIXED_IMITATION_EXPERIMENT_NAME:-${IMITATION_EXPERIMENT_NAME:-${TASK_RGB_PREFIX}_mixed_imitation_200demo_${SUCCESS_FILTER_SIZE}success_${FAILURE_FILTER_SIZE}failure}}"
   fi
-  # Mixed-imitation weights are inclusion flags only. With the default uniform
-  # sample pool, every selected sequence is shuffled without source weighting.
-  IMITATION_DEMO_WEIGHT_VALUE=1.0
-  IMITATION_SUCCESS_WEIGHT_VALUE=1.0
-  IMITATION_FAILURE_WEIGHT_VALUE=1.0
+  # The uniform sample pool treats positive weights as inclusion flags. The
+  # weighted sampler additionally uses these values to set source probability.
+  IMITATION_DEMO_WEIGHT_VALUE="${MIXED_IMITATION_DEMO_WEIGHT:-${IMITATION_DEMO_WEIGHT:-1.0}}"
+  IMITATION_SUCCESS_WEIGHT_VALUE="${MIXED_IMITATION_SUCCESS_WEIGHT:-${IMITATION_SUCCESS_WEIGHT:-1.0}}"
+  IMITATION_FAILURE_WEIGHT_VALUE="${MIXED_IMITATION_FAILURE_WEIGHT:-${IMITATION_FAILURE_WEIGHT:-1.0}}"
 fi
 SUCCESS_SELECTION_MANIFEST=${SUCCESS_SELECTION_MANIFEST:-${ROLLOUT_DATASET%.hdf5}_${SUCCESS_FILTER_KEY}_selection.json}
 FAILURE_SELECTION_MANIFEST=${FAILURE_SELECTION_MANIFEST:-${FAILURE_DATASET%.hdf5}_${FAILURE_FILTER_KEY}_selection.json}
@@ -421,7 +421,9 @@ check_datasets() {
     "$IMITATION_EPOCHS" \
     "$ACTOR_UNIFORM_SAMPLE_POOL" \
     "$CONDITION_LABEL_MODE" \
-    "${CONDITIONED_MIXED_IMITATION:-0}" <<'PYCHECK'
+    "${CONDITIONED_MIXED_IMITATION:-0}" \
+    "${MIXED_IMITATION_FAILURE_DEMO_START_ONLY:-0}" \
+    "${MIXED_IMITATION_FAILURE_SAMPLE_START_OFFSET:-0}" <<'PYCHECK'
 import json
 import sys
 from pathlib import Path
@@ -453,7 +455,9 @@ import torch
     actor_uniform_sample_pool,
     condition_label_mode,
     conditioned_mixed_imitation,
-) = sys.argv[1:24]
+    failure_demo_start_only,
+    failure_sample_start_offset,
+) = sys.argv[1:26]
 
 checkpoint_dict = torch.load(checkpoint, map_location="cpu", weights_only=False)
 checkpoint_config = json.loads(checkpoint_dict["config"])
@@ -537,18 +541,24 @@ def masks(path):
             return {}
         return {k: len(f[f"mask/{k}"]) for k in sorted(f["mask"].keys())}
 
-def selected_num_samples(path, key):
+def selected_num_sequences(path, key, demo_start_only=False):
     with h5py.File(path, "r") as f:
         if key:
             demos = decode(f[f"mask/{key}"][:])
         else:
             demos = list(f["data"].keys())
+        if demo_start_only:
+            return len(demos)
         return sum(int(f[f"data/{demo}"].attrs["num_samples"]) for demo in demos)
 
 source_num_sequences = {
-    "human_demo": selected_num_samples(demo_dataset, demo_filter),
-    "success_rollout": selected_num_samples(rollout_dataset, success_filter),
-    "failure_rollout": selected_num_samples(failure_dataset, failure_filter),
+    "human_demo": selected_num_sequences(demo_dataset, demo_filter),
+    "success_rollout": selected_num_sequences(rollout_dataset, success_filter),
+    "failure_rollout": selected_num_sequences(
+        failure_dataset,
+        failure_filter,
+        demo_start_only=failure_demo_start_only == "1",
+    ),
 }
 pooled_num_sequences = sum(
     source_num_sequences[source]
@@ -627,6 +637,8 @@ report = {
         "source_weights": None if uniform_sample_pool else source_weights,
         "source_distribution": {},
         "normalize_weights_by_dataset_size": effective_normalize_by_ds_size,
+        "failure_demo_start_only": failure_demo_start_only == "1",
+        "failure_sample_start_offset": int(failure_sample_start_offset),
     },
     "success_conditioning": {
         "enabled": conditioned,
@@ -668,12 +680,23 @@ report = {
         "masks": masks(failure_dataset),
     },
 }
-if not uniform_sample_pool:
-    weight_total = sum(source_weights.values())
-    if weight_total > 0.0:
-        report["sampler"]["source_distribution"] = {
-            key: value / weight_total for key, value in source_weights.items()
-        }
+if uniform_sample_pool:
+    source_mass = {
+        key: source_num_sequences[key] if value > 0.0 else 0.0
+        for key, value in source_weights.items()
+    }
+elif effective_normalize_by_ds_size:
+    source_mass = source_weights
+else:
+    source_mass = {
+        key: value * source_num_sequences[key]
+        for key, value in source_weights.items()
+    }
+mass_total = sum(source_mass.values())
+if mass_total > 0.0:
+    report["sampler"]["source_distribution"] = {
+        key: value / mass_total for key, value in source_mass.items()
+    }
 print(json.dumps(report, indent=2, sort_keys=True))
 PYCHECK
 }
@@ -800,7 +823,7 @@ run_eval_grid_resilient() {
     --horizon "$HORIZON" \
     --num-candidates "${EVAL_NUM_CANDIDATE_ARGS[@]}" \
     --seeds "${EVAL_SEED_ARGS[@]}" \
-    --rollouts-per-chunk "${ROLLOUTS_PER_CHUNK:-10}" \
+    --rollouts-per-chunk "${ROLLOUTS_PER_CHUNK:-25}" \
     --max-retries "${EVAL_MAX_RETRIES:-3}" \
     --candidate-batch-size "${CANDIDATE_BATCH_SIZE:-16}" \
     --num-inference-steps "${NUM_INFERENCE_STEPS:-100}" \

@@ -35,6 +35,7 @@ from train_rgb_dp_chunk_idql import (
     match_encoder_normalization_to_checkpoint,
 )
 from train_rgb_dp_idql import action_normalization_stats_match, make_rise_value_networks
+from train_rgb_dp_dql import make_dql_value_networks
 
 
 ROOT = Path(__file__).resolve().parents[1]

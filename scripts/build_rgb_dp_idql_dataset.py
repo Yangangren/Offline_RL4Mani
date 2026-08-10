@@ -4,11 +4,10 @@
 The default ``task`` reward mode keeps each source trajectory's environment
 reward. The optional ``rise`` mode reproduces the prior binary imitation reward
 (human transition 1, rollout transition 0). Source identity and the actor's
-outcome condition are stored separately so actor conditioning never depends on
-the critic reward definition: human and successful rollout transitions use
-condition 1, while failed rollout transitions use condition 0. Large arrays
-stay in their source HDF5 files through external links; shifted ``next_obs``
-arrays are HDF5 virtual datasets.
+human-demo condition are stored separately from critic rewards: human
+transitions use condition 1 and every deployment rollout transition uses
+condition 0. Large arrays stay in their source HDF5 files through external
+links; shifted ``next_obs`` arrays are HDF5 virtual datasets.
 """
 
 from __future__ import annotations
@@ -164,7 +163,7 @@ def add_episode(
             "actor_condition",
             data=np.full(
                 count,
-                source_label in {"expert", "non_expert_success"},
+                source_label == "expert",
                 dtype=np.uint8,
             ),
         )
@@ -267,7 +266,7 @@ def build(args: argparse.Namespace) -> dict:
             "source_is_expert=1 for human demo; 0 for deployment rollout"
         )
         output.attrs["actor_condition_definition"] = (
-            "human_demo=1; success_rollout=1; failure_rollout=0"
+            "human_demo=1; success_rollout=0; failure_rollout=0"
         )
         output.attrs["sampling_definition"] = (
             "one concatenated dataset; uniform over SequenceDataset indices"
@@ -287,7 +286,7 @@ def build(args: argparse.Namespace) -> dict:
             "source_is_expert=1 for human demo; 0 for deployment rollout"
         ),
         "actor_condition_definition": (
-            "human_demo=1; success_rollout=1; failure_rollout=0"
+            "human_demo=1; success_rollout=0; failure_rollout=0"
         ),
         "sampling_definition": "one dataset; uniform shuffled transition-window sampling",
         "expert": {

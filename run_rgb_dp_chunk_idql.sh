@@ -12,6 +12,9 @@ if [[ "$first_arg" == "square" || "$first_arg" == "can" || "$first_arg" == "tran
 fi
 TASK=${TASK:-square}
 TASK=${TASK,,}
+STAGE=${1:-train_chunk_idql_resilient}
+ROUND2_CHUNK_TRAINING=0
+TASK_SOURCE_CHUNK_IDQL_CHECKPOINT=
 
 case "$TASK" in
   square)
@@ -28,7 +31,7 @@ case "$TASK" in
     TASK_FAILURE_MASK=failure_50
     TASK_FAILURE_COUNT=-1
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
-    TASK_CHUNK_ACTOR_DEMO_ONLY=0
+    TASK_CHUNK_EPOCHS=50
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=0
@@ -52,7 +55,7 @@ case "$TASK" in
     TASK_FAILURE_MASK=failure
     TASK_FAILURE_COUNT=-1
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
-    TASK_CHUNK_ACTOR_DEMO_ONLY=0
+    TASK_CHUNK_EPOCHS=50
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
@@ -76,7 +79,7 @@ case "$TASK" in
     TASK_FAILURE_MASK=failure_50
     TASK_FAILURE_COUNT=-1
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
-    TASK_CHUNK_ACTOR_DEMO_ONLY=0
+    TASK_CHUNK_EPOCHS=25
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
@@ -100,7 +103,7 @@ case "$TASK" in
     TASK_FAILURE_MASK=failure_50
     TASK_FAILURE_COUNT=-1
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
-    TASK_CHUNK_ACTOR_DEMO_ONLY=0
+    TASK_CHUNK_EPOCHS=20
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
@@ -162,10 +165,16 @@ IDQL_DATASET=${IDQL_DATASET:-$DEFAULT_IDQL_DATASET}
 IDQL_OUTPUT_DIR=${IDQL_OUTPUT_DIR:-$DEFAULT_IDQL_OUTPUT_DIR}
 IDQL_CHECKPOINT=${IDQL_CHECKPOINT:-$IDQL_OUTPUT_DIR/last.pt}
 SOURCE_IDQL_CHECKPOINT=${SOURCE_IDQL_CHECKPOINT:-$IDQL_CHECKPOINT}
+SOURCE_CHUNK_IDQL_CHECKPOINT=${SOURCE_CHUNK_IDQL_CHECKPOINT:-$TASK_SOURCE_CHUNK_IDQL_CHECKPOINT}
 CHUNK_IDQL_OUTPUT_DIR=${CHUNK_IDQL_OUTPUT_DIR:-$DEFAULT_CHUNK_IDQL_OUTPUT_DIR}
 CHUNK_INITIALIZATION=${CHUNK_INITIALIZATION:-$TASK_CHUNK_INITIALIZATION}
-CHUNK_ACTOR_DEMO_ONLY=${CHUNK_ACTOR_DEMO_ONLY:-${ACTOR_DEMO_ONLY:-$TASK_CHUNK_ACTOR_DEMO_ONLY}}
 CHUNK_CONDITIONED_ACTOR=${CHUNK_CONDITIONED_ACTOR:-1}
+if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
+  if [[ "$CHUNK_INITIALIZATION" != "source_chunk_idql_joint" ]]; then
+    echo "Square round-2 chunk IDQL requires CHUNK_INITIALIZATION=source_chunk_idql_joint." >&2
+    exit 2
+  fi
+fi
 CHUNK_IDQL_CHECKPOINT=${CHUNK_IDQL_CHECKPOINT:-$CHUNK_IDQL_OUTPUT_DIR/last.pt}
 CHUNK_EVAL_OUTPUT=${CHUNK_EVAL_OUTPUT:-$DEFAULT_CHUNK_EVAL_OUTPUT}
 COMPOSED_DP_CHECKPOINT=${COMPOSED_DP_CHECKPOINT:-$TASK_COMPOSED_DP_CHECKPOINT}
@@ -181,7 +190,29 @@ SUCCESS_COUNT=${SUCCESS_COUNT:-$TASK_SUCCESS_COUNT}
 FAILURE_MASK=${FAILURE_MASK:-$TASK_FAILURE_MASK}
 FAILURE_COUNT=${FAILURE_COUNT:-$TASK_FAILURE_COUNT}
 
+# Resilient deployment collection defaults. Collection is capped by the total
+# rollout budget and stops earlier, at a shard boundary, once both outcome
+# quotas are available for the next 100-success / 50-failure training split.
+COLLECTION_NUM_CANDIDATES=${COLLECTION_NUM_CANDIDATES:-4}
+COLLECTION_TOTAL_ROLLOUTS=${COLLECTION_TOTAL_ROLLOUTS:-700}
+COLLECTION_SEED_BASE=${COLLECTION_SEED_BASE:-1000}
+COLLECTION_POLICY_SEEDS=${COLLECTION_POLICY_SEEDS-"0 1"}
+COLLECTION_NUM_ENV_SEEDS=${COLLECTION_NUM_ENV_SEEDS:-}
+if [[ -n "$COLLECTION_POLICY_SEEDS" ]]; then
+  COLLECTION_ROLLOUTS_PER_SHARD=${COLLECTION_ROLLOUTS_PER_SHARD:-1}
+else
+  COLLECTION_ROLLOUTS_PER_SHARD=${COLLECTION_ROLLOUTS_PER_SHARD:-25}
+fi
+COLLECTION_MIN_SUCCESS_ROLLOUTS=${COLLECTION_MIN_SUCCESS_ROLLOUTS:-100}
+COLLECTION_MIN_FAILURE_ROLLOUTS=${COLLECTION_MIN_FAILURE_ROLLOUTS:-50}
+COLLECTION_OUTPUT_DIR=${COLLECTION_OUTPUT_DIR:-rollouts/${TASK}_rgb_dp/chunk_idql/round2_N${COLLECTION_NUM_CANDIDATES}_collection}
+COLLECTION_RAW_NAME=${COLLECTION_RAW_NAME:-${TASK}_rgb_dp_chunk_idql_round2_N${COLLECTION_NUM_CANDIDATES}_rollouts_raw.hdf5}
+
 CHUNK_STEPS_PER_EPOCH=${CHUNK_STEPS_PER_EPOCH:-}
+CHUNK_STEPS_PER_EPOCH_ARGS=()
+if [[ -n "$CHUNK_STEPS_PER_EPOCH" ]]; then
+  CHUNK_STEPS_PER_EPOCH_ARGS=(--steps-per-epoch "$CHUNK_STEPS_PER_EPOCH")
+fi
 
 PIN_MEMORY_ARG=--pin-memory
 if [[ "${PIN_MEMORY:-1}" == "0" ]]; then
@@ -195,13 +226,6 @@ CRITIC_GROUP_NORM=${CRITIC_GROUP_NORM:-$TASK_CRITIC_GROUP_NORM}
 CRITIC_GROUP_NORM_ARG=--no-critic-group-norm
 if [[ "$CRITIC_GROUP_NORM" == "1" ]]; then
   CRITIC_GROUP_NORM_ARG=--critic-group-norm
-fi
-CHUNK_ACTOR_DEMO_ONLY_ARG=--no-actor-demo-only
-if [[ "$CHUNK_ACTOR_DEMO_ONLY" == "1" ]]; then
-  CHUNK_ACTOR_DEMO_ONLY_ARG=--actor-demo-only
-fi
-if [[ "$CHUNK_INITIALIZATION" != "pretrained_dp_joint" ]]; then
-  CHUNK_ACTOR_DEMO_ONLY_ARG=--no-actor-demo-only
 fi
 USE_HUBER_ARG=--use-huber
 if [[ "${USE_HUBER:-1}" == "0" ]]; then
@@ -268,7 +292,10 @@ build_dataset() {
 }
 
 ensure_dataset() {
-  if [[ ! -f "$IDQL_DATASET" ]]; then
+  if [[ "${OVERWRITE_DATASET:-0}" == "1" ]]; then
+    echo "[rgb_dp_chunk_idql] rebuilding mixed dataset: $IDQL_DATASET" >&2
+    build_dataset
+  elif [[ ! -f "$IDQL_DATASET" ]]; then
     echo "[rgb_dp_chunk_idql] building missing mixed dataset: $IDQL_DATASET" >&2
     build_dataset
   fi
@@ -300,6 +327,12 @@ run_chunk_train() {
         --source-idql-checkpoint "$SOURCE_IDQL_CHECKPOINT"
       )
       ;;
+    source_chunk_idql_joint)
+      initialization_args=(
+        --initialization source_chunk_idql_joint
+        --source-chunk-idql-checkpoint "$SOURCE_CHUNK_IDQL_CHECKPOINT"
+      )
+      ;;
     *)
       echo "Unsupported CHUNK_INITIALIZATION=$CHUNK_INITIALIZATION" >&2
       return 2
@@ -313,10 +346,10 @@ run_chunk_train() {
     "${resume_args[@]}" \
     --device "${DEVICE:-cuda}" \
     --seed "${CHUNK_SEED:-${SEED:-0}}" \
-    --epochs "${CHUNK_EPOCHS:-50}" \
-    --steps-per-epoch "$CHUNK_STEPS_PER_EPOCH" \
-    --batch-size "${CHUNK_BATCH_SIZE:-${BATCH_SIZE:-64}}" \
-    --num-workers "${CHUNK_NUM_WORKERS:-${NUM_WORKERS:-4}}" \
+    --epochs "${CHUNK_EPOCHS:-$TASK_CHUNK_EPOCHS}" \
+    "${CHUNK_STEPS_PER_EPOCH_ARGS[@]}" \
+    --batch-size "${CHUNK_BATCH_SIZE:-${BATCH_SIZE:-100}}" \
+    --num-workers "${CHUNK_NUM_WORKERS:-${NUM_WORKERS:-6}}" \
     --prefetch-factor "${CHUNK_PREFETCH_FACTOR:-${PREFETCH_FACTOR:-2}}" \
     "$PIN_MEMORY_ARG" \
     "$PERSISTENT_WORKERS_ARG" \
@@ -331,7 +364,6 @@ run_chunk_train() {
     --actor-lr-scheduler "${CHUNK_ACTOR_LR_SCHEDULER:-cosine}" \
     --actor-lr-warmup-steps "${CHUNK_ACTOR_LR_WARMUP_STEPS:-1000}" \
     --actor-lr-num-cycles "${CHUNK_ACTOR_LR_NUM_CYCLES:-0.5}" \
-    "$CHUNK_ACTOR_DEMO_ONLY_ARG" \
     "${CHUNK_CONDITION_ARGS[@]}" \
     --condition-dropout "${CHUNK_CONDITION_DROPOUT:-${CONDITION_DROPOUT:-0.0}}" \
     --condition-hidden-dim "${CHUNK_CONDITION_HIDDEN_DIM:-${CONDITION_HIDDEN_DIM:-128}}" \
@@ -362,14 +394,13 @@ run_chunk_train() {
     --snapshot-every-epochs "${CHUNK_SNAPSHOT_EVERY_EPOCHS:-5}"
 }
 
-STAGE=${1:-train_chunk_idql_resilient}
 case "$STAGE" in
-  train_chunk_idql)
+  train_chunk_idql|train_chunk_idql_round2)
     ensure_dataset
     run_chunk_train "${CHUNK_RESUME_CHECKPOINT:-}"
     ;;
 
-  train_chunk_idql_resilient)
+  train_chunk_idql_resilient|train_chunk_idql_round2_resilient)
     ensure_dataset
     max_restarts=${MAX_RESTARTS:-20}
     retry_sleep=${RETRY_SLEEP:-5}
@@ -425,6 +456,75 @@ case "$STAGE" in
       --clip-actions
     ;;
 
+  collect_chunk_idql_rollouts_resilient)
+    if (( COLLECTION_TOTAL_ROLLOUTS <= 0 || COLLECTION_ROLLOUTS_PER_SHARD <= 0 )); then
+      echo "COLLECTION_TOTAL_ROLLOUTS and COLLECTION_ROLLOUTS_PER_SHARD must be positive." >&2
+      exit 2
+    fi
+    collection_seed_args=()
+    if [[ -n "$COLLECTION_POLICY_SEEDS" ]]; then
+      if (( COLLECTION_ROLLOUTS_PER_SHARD != 1 )); then
+        echo "Dedicated environment/policy seeds require COLLECTION_ROLLOUTS_PER_SHARD=1." >&2
+        exit 2
+      fi
+      read -r -a collection_policy_seed_args <<< "$COLLECTION_POLICY_SEEDS"
+      if (( ${#collection_policy_seed_args[@]} == 0 )); then
+        echo "COLLECTION_POLICY_SEEDS must contain at least one integer seed." >&2
+        exit 2
+      fi
+      if [[ -z "$COLLECTION_NUM_ENV_SEEDS" ]]; then
+        if (( COLLECTION_TOTAL_ROLLOUTS % ${#collection_policy_seed_args[@]} != 0 )); then
+          echo "COLLECTION_TOTAL_ROLLOUTS must be divisible by the number of policy seeds." >&2
+          exit 2
+        fi
+        COLLECTION_NUM_ENV_SEEDS=$((COLLECTION_TOTAL_ROLLOUTS / ${#collection_policy_seed_args[@]}))
+      fi
+      collection_num_shards=$((COLLECTION_NUM_ENV_SEEDS * ${#collection_policy_seed_args[@]}))
+      if (( collection_num_shards != COLLECTION_TOTAL_ROLLOUTS )); then
+        echo "COLLECTION_TOTAL_ROLLOUTS must equal COLLECTION_NUM_ENV_SEEDS times the number of policy seeds." >&2
+        exit 2
+      fi
+      collection_seed_args=(
+        --num-env-seeds "$COLLECTION_NUM_ENV_SEEDS"
+        --policy-seeds "${collection_policy_seed_args[@]}"
+      )
+    else
+    if (( COLLECTION_TOTAL_ROLLOUTS % COLLECTION_ROLLOUTS_PER_SHARD != 0 )); then
+      echo "COLLECTION_TOTAL_ROLLOUTS must be divisible by COLLECTION_ROLLOUTS_PER_SHARD." >&2
+      exit 2
+    fi
+    collection_num_shards=$((COLLECTION_TOTAL_ROLLOUTS / COLLECTION_ROLLOUTS_PER_SHARD))
+    fi
+    "$PYTHON" -B scripts/collect_rollout_shards.py \
+      --idql-checkpoint "$CHUNK_IDQL_CHECKPOINT" \
+      --dp-checkpoint "$DP_CHECKPOINT" \
+      --expected-task "$TASK" \
+      --device "${DEVICE:-cuda}" \
+      --actor-source hybrid_dp_chunk_actor \
+      --critic-source "${CRITIC_SOURCE:-online}" \
+      --num-candidates "$COLLECTION_NUM_CANDIDATES" \
+      --candidate-batch-size "${CANDIDATE_BATCH_SIZE:-16}" \
+      --execution-horizon "${EXECUTION_HORIZON:-8}" \
+      --selection "${SELECTION:-argmax}" \
+      "${CHUNK_EVAL_CONDITION_ARGS[@]}" \
+      --clip-actions \
+      --no-env-hard-reset \
+      --no-reset-to-initial-state \
+      --output-dir "$COLLECTION_OUTPUT_DIR" \
+      --merged-name "$COLLECTION_RAW_NAME" \
+      --num-shards "$collection_num_shards" \
+      --rollouts-per-shard "$COLLECTION_ROLLOUTS_PER_SHARD" \
+      --horizon "$EVAL_HORIZON" \
+      --seed-base "$COLLECTION_SEED_BASE" \
+      "${collection_seed_args[@]}" \
+      --max-retries "${COLLECTION_MAX_RETRIES:-5}" \
+      --retry-seed-offset "${COLLECTION_RETRY_SEED_OFFSET:-100000}" \
+      --success-return-threshold "${COLLECTION_SUCCESS_RETURN_THRESHOLD:-0.0}" \
+      --min-success-rollouts "$COLLECTION_MIN_SUCCESS_ROLLOUTS" \
+      --min-failure-rollouts "$COLLECTION_MIN_FAILURE_ROLLOUTS" \
+      --force-merge
+    ;;
+
   eval_composed_chunk_grid_resilient)
     read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-1 8 16}"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
@@ -451,7 +551,7 @@ case "$STAGE" in
     ;;
 
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang] {train_chunk_idql|train_chunk_idql_resilient|eval_chunk_grid_resilient|eval_composed_chunk_grid_resilient}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang] {train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
     exit 2
     ;;
 esac

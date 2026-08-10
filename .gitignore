@@ -125,3 +125,5 @@ rollouts/
 trained_models/
 datasets/
 robomimic/exps/
+
+*.txt

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Collect policy rollouts in restart-safe shards and merge them.
 
-Each shard is produced by ``robomimic.scripts.run_trained_agent`` in a fresh
-process, so simulator / renderer crashes only invalidate a small shard. The
-merged output follows robomimic's normal HDF5 structure and adds masks:
+Each shard is produced in a fresh process, either by
+``robomimic.scripts.run_trained_agent`` for a standard policy checkpoint or by
+``scripts/eval_rgb_dp_idql.py`` for a chunk-IDQL checkpoint. Simulator /
+renderer crashes therefore only invalidate a small shard. The merged output
+follows robomimic's normal HDF5 structure and adds masks:
 
 * ``mask/all_rollouts``
 * ``mask/all``
@@ -84,23 +86,41 @@ def sorted_demo_keys(dataset: h5py.File) -> list[str]:
     )
 
 
-def valid_shard(path: Path, expected: int, require_obs: bool) -> bool:
+def valid_shard(
+    path: Path,
+    expected: int,
+    require_obs: bool,
+    require_idql_diagnostics: bool = False,
+) -> bool:
     if not path.exists():
         return False
     try:
         with h5py.File(path, "r") as dataset:
             if "data" not in dataset or len(dataset["data"]) != expected:
                 return False
+            if "env_args" not in dataset["data"].attrs:
+                return False
             keys = sorted_demo_keys(dataset)
             if len(keys) == 0:
                 return False
             required = ("actions", "states", "rewards", "dones")
-            if any(name not in dataset[f"data/{keys[0]}"] for name in required):
-                return False
-            if require_obs and "obs" not in dataset[f"data/{keys[0]}"]:
-                return False
+            if require_idql_diagnostics:
+                required += ("q_selected", "selected_index")
+            for key in keys:
+                episode = dataset[f"data/{key}"]
+                if any(name not in episode for name in required):
+                    return False
+                if require_obs and "obs" not in episode:
+                    return False
+                if "model_file" not in episode.attrs:
+                    return False
+                num_samples = int(episode.attrs.get("num_samples", -1))
+                if num_samples < 0:
+                    return False
+                if any(int(episode[name].shape[0]) != num_samples for name in required):
+                    return False
             return True
-    except OSError:
+    except (OSError, KeyError, TypeError, ValueError):
         return False
 
 
@@ -111,6 +131,39 @@ def parse_stats(text: str) -> dict | None:
         return None
     match = re.search(r"\{.*?\}", text[index + len(marker) :], re.S)
     return json.loads(match.group(0)) if match else None
+
+
+def shard_outcome_counts(path: Path, success_return_threshold: float) -> tuple[int, int]:
+    success = 0
+    failure = 0
+    with h5py.File(path, "r") as dataset:
+        for key in sorted_demo_keys(dataset):
+            episode_return = float(np.sum(dataset[f"data/{key}/rewards"][:]))
+            if episode_return > success_return_threshold:
+                success += 1
+            else:
+                failure += 1
+    return success, failure
+
+
+def outcome_targets_reached(args, success: int, failure: int) -> bool:
+    configured = False
+    if args.min_success_rollouts is not None:
+        configured = True
+        if success < args.min_success_rollouts:
+            return False
+    if args.min_failure_rollouts is not None:
+        configured = True
+        if failure < args.min_failure_rollouts:
+            return False
+    return configured
+
+
+def seed_group_complete(args, spec: dict) -> bool:
+    """Only stop after all policy seeds for the current environment seed."""
+    if args.policy_seeds is None:
+        return True
+    return (int(spec["shard_index"]) + 1) % len(args.policy_seeds) == 0
 
 
 def build_shard_specs(args) -> list[dict]:
@@ -142,6 +195,78 @@ def build_shard_specs(args) -> list[dict]:
 
 
 def rollout_command(args, shard: Path, spec: dict, attempt: int) -> list[str]:
+    if spec.get("policy_seed") is None:
+        attempt_seed = int(spec["seed"]) + (attempt - 1) * args.retry_seed_offset
+    else:
+        attempt_seed = int(spec["seed"])
+
+    if args.idql_checkpoint is not None:
+        eval_output = (
+            args.output_dir
+            / "eval_shards"
+            / f"shard_{int(spec['shard_index']):03d}_attempt_{attempt}"
+        )
+        command = [
+            str(PYTHON),
+            "-B",
+            "scripts/eval_rgb_dp_idql.py",
+            "--idql-checkpoint",
+            str(args.idql_checkpoint),
+            "--dp-checkpoint",
+            str(args.dp_checkpoint),
+            "--output-dir",
+            str(eval_output),
+            "--device",
+            args.device,
+            "--actor-source",
+            args.actor_source,
+            "--critic-source",
+            args.critic_source,
+            "--n-rollouts",
+            str(args.rollouts_per_shard),
+            "--horizon",
+            str(args.horizon),
+            "--seed",
+            str(attempt_seed),
+            "--num-candidates",
+            str(args.num_candidates),
+            "--candidate-batch-size",
+            str(args.candidate_batch_size),
+            "--execution-horizon",
+            str(args.execution_horizon),
+            "--selection",
+            args.selection,
+            "--inference-success-condition",
+            str(args.inference_success_condition),
+            "--inference-condition-mask",
+            str(args.inference_condition_mask),
+            "--dataset-path",
+            str(shard),
+            "--clip-actions" if args.clip_actions else "--no-clip-actions",
+            (
+                "--require-success-condition-adapter"
+                if args.require_success_condition_adapter
+                else "--no-require-success-condition-adapter"
+            ),
+            (
+                "--forbid-success-condition-adapter"
+                if args.forbid_success_condition_adapter
+                else "--no-forbid-success-condition-adapter"
+            ),
+            "--env-hard-reset" if args.env_hard_reset else "--no-env-hard-reset",
+            (
+                "--reset-to-initial-state"
+                if args.reset_to_initial_state
+                else "--no-reset-to-initial-state"
+            ),
+        ]
+        if spec.get("policy_seed") is not None:
+            command.extend(["--env-seed", str(spec["env_seed"])])
+            command.extend(["--policy-seed", str(spec["policy_seed"])])
+        if args.expected_task is not None:
+            command.extend(["--expected-task", args.expected_task])
+        return command
+
     command = [
         str(PYTHON),
         "-B",
@@ -157,7 +282,6 @@ def rollout_command(args, shard: Path, spec: dict, attempt: int) -> list[str]:
         str(shard),
     ]
     if spec.get("policy_seed") is None:
-        attempt_seed = int(spec["seed"]) + (attempt - 1) * args.retry_seed_offset
         command.extend(["--seed", str(attempt_seed)])
     else:
         command.extend(["--env_seed", str(spec["env_seed"])])
@@ -192,6 +316,9 @@ def run_shard_attempt(command: list[str], logger: TeeLogger, cache_suffix: str) 
 def collect(args) -> list[dict]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     shard_records = []
+    total_success = 0
+    total_failure = 0
+    require_idql_diagnostics = args.idql_checkpoint is not None
     specs = build_shard_specs(args)
     for spec in specs:
         shard_index = int(spec["shard_index"])
@@ -205,60 +332,63 @@ def collect(args) -> list[dict]:
             "policy_seed": spec.get("policy_seed"),
             "env_index": spec.get("env_index"),
         }
+        record = None
         if (
             not args.force_shards
-            and valid_shard(shard, args.rollouts_per_shard, args.dataset_obs)
+            and valid_shard(
+                shard,
+                args.rollouts_per_shard,
+                args.dataset_obs,
+                require_idql_diagnostics=require_idql_diagnostics,
+            )
         ):
             print(f"[reuse] {shard}", flush=True)
             stats = parse_stats(log.read_text(errors="replace")) if log.exists() else None
-            shard_records.append(
-                {
-                    "shard": str(shard),
-                    "log": str(log),
-                    **base_record,
-                    "attempts": 0,
-                    "stats": stats,
-                }
-            )
-            continue
-
-        if shard.exists():
-            shard.unlink()
-        logger = TeeLogger(log, mode="w")
-        try:
-            for attempt in range(1, args.max_retries + 1):
-                command = rollout_command(args, shard, spec, attempt)
-                if spec.get("policy_seed") is None:
-                    attempt_seed = seed + (attempt - 1) * args.retry_seed_offset
-                    seed_desc = f"seed={seed} attempt_seed={attempt_seed}"
-                    record_seed = attempt_seed
-                else:
-                    seed_desc = (
-                        f"env_seed={spec['env_seed']} "
-                        f"policy_seed={spec['policy_seed']}"
+            record = {
+                "shard": str(shard),
+                "log": str(log),
+                **base_record,
+                "attempts": 0,
+                "stats": stats,
+            }
+        else:
+            if shard.exists():
+                shard.unlink()
+            logger = TeeLogger(log, mode="w")
+            try:
+                for attempt in range(1, args.max_retries + 1):
+                    command = rollout_command(args, shard, spec, attempt)
+                    if spec.get("policy_seed") is None:
+                        attempt_seed = seed + (attempt - 1) * args.retry_seed_offset
+                        seed_desc = f"seed={seed} attempt_seed={attempt_seed}"
+                        record_seed = attempt_seed
+                    else:
+                        seed_desc = (
+                            f"env_seed={spec['env_seed']} "
+                            f"policy_seed={spec['policy_seed']}"
+                        )
+                        record_seed = seed
+                    logger.line(
+                        f"\n[collect shard={shard_index} {seed_desc} "
+                        f"attempt={attempt}/{args.max_retries}]"
                     )
-                    record_seed = seed
-                logger.line(
-                    f"\n[collect shard={shard_index} {seed_desc} "
-                    f"attempt={attempt}/{args.max_retries}]"
-                )
-                if shard.exists():
-                    shard.unlink()
-                returncode, stdout = run_shard_attempt(
-                    command,
-                    logger,
-                    cache_suffix=f"shard_{shard_index}_attempt_{attempt}",
-                )
-                ok = returncode == 0 and valid_shard(
-                    shard,
-                    args.rollouts_per_shard,
-                    args.dataset_obs,
-                )
-                if ok:
-                    stats = parse_stats(stdout)
-                    logger.line(f"[complete] {shard} stats={json.dumps(stats)}")
-                    shard_records.append(
-                        {
+                    if shard.exists():
+                        shard.unlink()
+                    returncode, stdout = run_shard_attempt(
+                        command,
+                        logger,
+                        cache_suffix=f"shard_{shard_index}_attempt_{attempt}",
+                    )
+                    ok = returncode == 0 and valid_shard(
+                        shard,
+                        args.rollouts_per_shard,
+                        args.dataset_obs,
+                        require_idql_diagnostics=require_idql_diagnostics,
+                    )
+                    if ok:
+                        stats = parse_stats(stdout)
+                        logger.line(f"[complete] {shard} stats={json.dumps(stats)}")
+                        record = {
                             "shard": str(shard),
                             "log": str(log),
                             **base_record,
@@ -266,18 +396,57 @@ def collect(args) -> list[dict]:
                             "attempts": attempt,
                             "stats": stats,
                         }
+                        break
+                    logger.line(
+                        f"[retry] shard={shard_index} returncode={returncode}; "
+                        "removing incomplete shard"
                     )
-                    break
-                logger.line(
-                    f"[retry] shard={shard_index} returncode={returncode}; "
-                    "removing incomplete shard"
-                )
-                if shard.exists():
-                    shard.unlink()
-            else:
-                raise RuntimeError(f"failed to collect shard {shard_index}")
-        finally:
-            logger.close()
+                    if shard.exists():
+                        shard.unlink()
+                else:
+                    raise RuntimeError(f"failed to collect shard {shard_index}")
+            finally:
+                logger.close()
+
+        assert record is not None
+        shard_success, shard_failure = shard_outcome_counts(
+            shard,
+            args.success_return_threshold,
+        )
+        record["num_success"] = shard_success
+        record["num_failure"] = shard_failure
+        shard_records.append(record)
+        total_success += shard_success
+        total_failure += shard_failure
+        print(
+            f"[outcomes] shards={len(shard_records)} rollouts="
+            f"{total_success + total_failure} success={total_success} "
+            f"failure={total_failure}",
+            flush=True,
+        )
+        if (
+            outcome_targets_reached(args, total_success, total_failure)
+            and seed_group_complete(args, spec)
+        ):
+            print(
+                "[quota complete] "
+                f"success={total_success}/{args.min_success_rollouts} "
+                f"failure={total_failure}/{args.min_failure_rollouts}",
+                flush=True,
+            )
+            break
+
+    if (
+        (args.min_success_rollouts is not None or args.min_failure_rollouts is not None)
+        and not outcome_targets_reached(args, total_success, total_failure)
+    ):
+        print(
+            "[quota warning] maximum configured shards exhausted before all "
+            f"targets were reached: success={total_success}/"
+            f"{args.min_success_rollouts}, failure={total_failure}/"
+            f"{args.min_failure_rollouts}",
+            flush=True,
+        )
     return shard_records
 
 
@@ -319,6 +488,16 @@ def merge(args, shard_records: list[dict]) -> dict:
                     if record.get("env_index") is not None:
                         group.attrs["env_index"] = int(record["env_index"])
 
+                    episode_env_seed = group.attrs.get("env_seed", record.get("env_seed"))
+                    episode_policy_seed = group.attrs.get(
+                        "policy_seed",
+                        record.get("policy_seed"),
+                    )
+                    if episode_env_seed is not None:
+                        episode_env_seed = int(episode_env_seed)
+                    if episode_policy_seed is not None:
+                        episode_policy_seed = int(episode_policy_seed)
+
                     all_keys.append(output_key)
                     if is_success:
                         successes.append(output_key)
@@ -333,8 +512,8 @@ def merge(args, shard_records: list[dict]) -> dict:
                             "horizon": horizon,
                             "source_shard": str(record["shard"]),
                             "source_demo": key,
-                            "env_seed": record.get("env_seed"),
-                            "policy_seed": record.get("policy_seed"),
+                            "env_seed": episode_env_seed,
+                            "policy_seed": episode_policy_seed,
                             "env_index": record.get("env_index"),
                         }
                     )
@@ -351,10 +530,41 @@ def merge(args, shard_records: list[dict]) -> dict:
 
     horizons = np.asarray([ep["horizon"] for ep in episode_records], dtype=np.float64)
     summary = {
-        "agent": str(args.agent),
+        "policy_backend": "chunk_idql" if args.idql_checkpoint is not None else "robomimic_agent",
+        "agent": None if args.agent is None else str(args.agent),
+        "idql_checkpoint": (
+            None if args.idql_checkpoint is None else str(args.idql_checkpoint)
+        ),
+        "dp_checkpoint": None if args.dp_checkpoint is None else str(args.dp_checkpoint),
+        "expected_task": args.expected_task,
+        "actor_source": args.actor_source if args.idql_checkpoint is not None else None,
+        "critic_source": args.critic_source if args.idql_checkpoint is not None else None,
+        "num_candidates": args.num_candidates if args.idql_checkpoint is not None else None,
+        "candidate_batch_size": (
+            args.candidate_batch_size if args.idql_checkpoint is not None else None
+        ),
+        "execution_horizon": (
+            args.execution_horizon if args.idql_checkpoint is not None else None
+        ),
+        "selection": args.selection if args.idql_checkpoint is not None else None,
+        "clip_actions": args.clip_actions if args.idql_checkpoint is not None else None,
+        "inference_success_condition": (
+            args.inference_success_condition if args.idql_checkpoint is not None else None
+        ),
+        "inference_condition_mask": (
+            args.inference_condition_mask if args.idql_checkpoint is not None else None
+        ),
         "merged_dataset": str(merged_path),
         "dataset_obs": bool(args.dataset_obs),
         "success_return_threshold": args.success_return_threshold,
+        "min_success_rollouts": args.min_success_rollouts,
+        "min_failure_rollouts": args.min_failure_rollouts,
+        "outcome_targets_reached": outcome_targets_reached(
+            args,
+            len(successes),
+            len(failures),
+        ),
+        "max_configured_rollouts": args.num_shards * args.rollouts_per_shard,
         "num_rollouts": len(all_keys),
         "num_success": len(successes),
         "num_failure": len(failures),
@@ -377,7 +587,56 @@ def merge(args, shard_records: list[dict]) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--agent", type=Path, required=True)
+    policy_group = parser.add_mutually_exclusive_group(required=True)
+    policy_group.add_argument("--agent", type=Path)
+    policy_group.add_argument("--idql-checkpoint", type=Path)
+    parser.add_argument("--dp-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--expected-task",
+        choices=("square", "can", "transport", "tool_hang"),
+        default=None,
+    )
+    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument(
+        "--actor-source",
+        choices=(
+            "idql_target_one_step_mlp",
+            "idql_one_step_mlp",
+            "pretrained_dp_first_action",
+            "hybrid_dp_chunk_actor",
+            "external_dp_chunk_critic",
+            "plain_dp",
+        ),
+        default="hybrid_dp_chunk_actor",
+    )
+    parser.add_argument("--critic-source", choices=("target", "online"), default="online")
+    parser.add_argument("--num-candidates", type=int, default=4)
+    parser.add_argument("--candidate-batch-size", type=int, default=16)
+    parser.add_argument("--execution-horizon", type=int, default=8)
+    parser.add_argument(
+        "--selection",
+        choices=("argmax", "greedy", "softmax", "advantage_softmax"),
+        default="argmax",
+    )
+    parser.add_argument("--clip-actions", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--require-success-condition-adapter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--forbid-success-condition-adapter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--inference-success-condition", type=float, default=1.0)
+    parser.add_argument("--inference-condition-mask", type=float, default=1.0)
+    parser.add_argument("--env-hard-reset", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--reset-to-initial-state",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--merged-name", default="rollouts_raw.hdf5")
     parser.add_argument("--num-shards", type=int, default=5)
@@ -400,9 +659,46 @@ def main() -> None:
     parser.add_argument("--force-shards", action="store_true")
     parser.add_argument("--force-merge", action="store_true")
     parser.add_argument("--success-return-threshold", type=float, default=0.0)
+    parser.add_argument("--min-success-rollouts", type=int, default=None)
+    parser.add_argument("--min-failure-rollouts", type=int, default=None)
     args = parser.parse_args()
-    args.agent = args.agent.resolve()
+    for key in ("agent", "idql_checkpoint", "dp_checkpoint"):
+        value = getattr(args, key)
+        if value is not None:
+            setattr(args, key, value.resolve())
     args.output_dir = args.output_dir.resolve()
+    for key in ("agent", "idql_checkpoint", "dp_checkpoint"):
+        value = getattr(args, key)
+        if value is not None and not value.is_file():
+            parser.error(f"--{key.replace('_', '-')} does not exist: {value}")
+    if args.idql_checkpoint is not None:
+        if args.dp_checkpoint is None:
+            parser.error("--idql-checkpoint requires --dp-checkpoint")
+        if args.dataset_obs:
+            parser.error(
+                "chunk-IDQL collection writes simulator states; convert them to RGB "
+                "after merging instead of using --dataset-obs"
+            )
+    if args.require_success_condition_adapter and args.forbid_success_condition_adapter:
+        parser.error(
+            "--require-success-condition-adapter and "
+            "--forbid-success-condition-adapter are mutually exclusive"
+        )
+    for key in (
+        "num_shards",
+        "rollouts_per_shard",
+        "horizon",
+        "max_retries",
+        "num_candidates",
+        "candidate_batch_size",
+        "execution_horizon",
+    ):
+        if getattr(args, key) <= 0:
+            parser.error(f"--{key.replace('_', '-')} must be positive")
+    for key in ("min_success_rollouts", "min_failure_rollouts"):
+        value = getattr(args, key)
+        if value is not None and value < 0:
+            parser.error(f"--{key.replace('_', '-')} must be non-negative")
     if args.policy_seeds is not None:
         if len(args.policy_seeds) == 0:
             parser.error("--policy-seeds requires at least one seed")

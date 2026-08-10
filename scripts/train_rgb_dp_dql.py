@@ -27,6 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import robomimic.utils.file_utils as FileUtils
+import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 
 from train_rgb_dp_idql import (
@@ -41,12 +42,11 @@ from train_rgb_dp_idql import (
     initialize_actor_from_deployed_ema,
     jsonable,
     make_tensorboard_writer,
-    make_rise_value_networks,
     make_step_lr_scheduler,
     mean_metrics,
     parameter_count,
-    process_critic_batch,
     replace_with_hardlink,
+    RiseLateFusionMLP,
     restore_rng_state,
     rng_state,
     scalar_metrics,
@@ -67,6 +67,134 @@ DEFAULT_OUTPUT = (
     ROOT
     / "trained_models/square_rgb_dp/dql/200demo_100success_50failure_task_reward"
 )
+class DQLStackedActionValueNetwork(nn.Module):
+    """One-step Q network over the same observation stack as the DP actor.
+
+    The visual encoder is copied from the deployed pretrained actor, which is
+    already GroupNorm based. This avoids randomly initialized BatchNorm target
+    encoders and preserves the actor's observation-horizon state definition.
+    """
+
+    def __init__(
+        self,
+        actor_algo,
+        hidden_dims: tuple[int, ...],
+        observation_horizon: int,
+        late_fusion_key: str | None,
+    ):
+        super().__init__()
+        if int(observation_horizon) <= 0:
+            raise ValueError("observation_horizon must be positive")
+        self.obs_shapes = copy.deepcopy(actor_algo.obs_shapes)
+        self.action_dim = int(actor_algo.ac_dim)
+        self.observation_horizon = int(observation_horizon)
+        self.late_fusion_keys = tuple(
+            key.strip()
+            for key in str(late_fusion_key or "").split(",")
+            if key.strip()
+        )
+        for key in self.late_fusion_keys:
+            if key not in self.obs_shapes:
+                raise KeyError(f"late_fusion_key={key} is absent from obs_shapes")
+
+        self.nets = nn.ModuleDict()
+        self.nets["encoder"] = copy.deepcopy(
+            actor_algo.nets["policy"]["obs_encoder"]
+        )
+        encoded_dim = int(self.nets["encoder"].output_shape()[0])
+        late_fusion_dim = self.observation_horizon * sum(
+            int(np.prod(self.obs_shapes[key]))
+            for key in self.late_fusion_keys
+        )
+        self.nets["mlp"] = RiseLateFusionMLP(
+            input_dim=self.observation_horizon * encoded_dim + self.action_dim,
+            hidden_dims=hidden_dims,
+            late_fusion_dim=late_fusion_dim,
+        )
+        self.nets["decoder"] = nn.Linear(int(hidden_dims[-1]), 1)
+
+    def _stacked_observations(
+        self,
+        obs_dict: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        stacked = {}
+        for key, shape in self.obs_shapes.items():
+            value = obs_dict[key]
+            no_time_ndim = len(shape) + 1
+            if value.ndim == no_time_ndim:
+                value = value.unsqueeze(1).expand(
+                    -1,
+                    self.observation_horizon,
+                    *([-1] * len(shape)),
+                )
+            elif value.ndim == no_time_ndim + 1:
+                if value.shape[1] < self.observation_horizon:
+                    padding = value[:, :1].expand(
+                        -1,
+                        self.observation_horizon - value.shape[1],
+                        *([-1] * len(shape)),
+                    )
+                    value = torch.cat((padding, value), dim=1)
+                else:
+                    value = value[:, -self.observation_horizon :]
+            else:
+                raise ValueError(
+                    f"unexpected DQL observation shape for {key}: "
+                    f"{tuple(value.shape)}"
+                )
+            stacked[key] = value
+        return stacked
+
+    def forward(self, obs_dict, acts, goal_dict=None):
+        del goal_dict
+        if acts.ndim != 2 or acts.shape[-1] != self.action_dim:
+            raise ValueError(
+                "DQL critic requires single-step actions [B, action_dim], got "
+                f"{tuple(acts.shape)}"
+            )
+        stacked = self._stacked_observations(obs_dict)
+        encoded = TensorUtils.time_distributed(
+            {"obs": stacked, "goal": None},
+            self.nets["encoder"],
+            inputs_as_kwargs=True,
+        )
+        if encoded.ndim != 3:
+            raise ValueError(
+                f"expected stacked critic features [B,T,D], got {tuple(encoded.shape)}"
+            )
+        features = torch.cat((encoded.flatten(start_dim=1), acts), dim=-1)
+        late_fusion = None
+        if self.late_fusion_keys:
+            late_fusion = torch.cat(
+                [stacked[key].flatten(start_dim=1) for key in self.late_fusion_keys],
+                dim=-1,
+            )
+        return self.nets["decoder"](
+            self.nets["mlp"](features, late_fusion)
+        )
+
+
+def make_dql_value_networks(
+    actor_algo,
+    hidden_dims: tuple[int, ...],
+    observation_horizon: int,
+    num_critics: int = 2,
+    late_fusion_key: str | None = "robot0_gripper_qpos",
+) -> tuple[nn.ModuleList, nn.ModuleList, None]:
+    critics = nn.ModuleList(
+        [
+            DQLStackedActionValueNetwork(
+                actor_algo=actor_algo,
+                hidden_dims=hidden_dims,
+                observation_horizon=observation_horizon,
+                late_fusion_key=late_fusion_key,
+            )
+            for _ in range(int(num_critics))
+        ]
+    )
+    targets = copy.deepcopy(critics)
+    targets.eval().requires_grad_(False)
+    return critics, targets, None
 
 
 @contextmanager
@@ -114,6 +242,60 @@ def prepare_actor_batch(actor_algo, raw_batch: dict, obs_normalization_stats) ->
         batch,
         obs_normalization_stats=obs_normalization_stats,
     )
+
+
+def process_dql_critic_batch(
+    raw_batch: dict,
+    actor_algo,
+    obs_normalization_stats,
+) -> dict:
+    """Extract an aligned one-step transition with the full DP state stack."""
+    observation_horizon = int(
+        actor_algo.algo_config.horizon.observation_horizon
+    )
+    current_index = observation_horizon - 1
+    critic_batch = {
+        "obs": {
+            key: raw_batch["obs"][key][:, :observation_horizon]
+            for key in actor_algo.obs_shapes
+        },
+        "next_obs": {
+            key: raw_batch["next_obs"][key][:, :observation_horizon]
+            for key in actor_algo.obs_shapes
+        },
+        "actions": raw_batch["actions"][:, current_index],
+        "rewards": raw_batch["rewards"][:, current_index].reshape(-1, 1),
+        "dones": raw_batch["dones"][:, current_index].reshape(-1, 1),
+        "goal_obs": raw_batch.get("goal_obs"),
+    }
+    critic_batch = TensorUtils.to_device(
+        TensorUtils.to_float(critic_batch),
+        actor_algo.device,
+    )
+    critic_batch = actor_algo.postprocess_batch_for_training(
+        critic_batch,
+        obs_normalization_stats=obs_normalization_stats,
+    )
+    actions = critic_batch["actions"]
+    expected_shape = (int(actions.shape[0]), int(actor_algo.ac_dim))
+    if actions.ndim != 2 or tuple(actions.shape) != expected_shape:
+        raise ValueError(
+            "DQL critic requires single-step actions [B, action_dim], got "
+            f"{tuple(actions.shape)}"
+        )
+    if not torch.isfinite(actions).all():
+        raise ValueError("DQL critic actions contain non-finite values")
+    tolerance = 1e-3
+    action_min = float(actions.min())
+    action_max = float(actions.max())
+    if action_min < -1.0 - tolerance or action_max > 1.0 + tolerance:
+        raise ValueError(
+            "DQL critic actions are outside the pretrained DP normalized space: "
+            f"min={action_min:.6f}, max={action_max:.6f}"
+        )
+    if action_min < -1.0 or action_max > 1.0:
+        critic_batch["actions"] = actions.clamp(-1.0, 1.0)
+    return critic_batch
 
 
 def prepare_next_actor_observations(
@@ -397,7 +579,7 @@ def diffusion_q_loss(
     denominator_floor: float,
     clip_actions: bool,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Equation (3), with alpha normalized by dataset-action |Q|."""
+    """Official Diffusion-QL cross-head normalized policy-improvement loss."""
     chunks = sample_action_chunks(
         actor_algo=actor_algo,
         observations=actor_observations,
@@ -409,33 +591,38 @@ def diffusion_q_loss(
 
     previous_grad_state = set_requires_grad(critics, False)
     try:
-        with evaluating(critics):
-            policy_predictions = [
+        policy_predictions = [
+            critic(
+                obs_dict=critic_observations,
+                acts=policy_actions,
+                goal_dict=goal_observations,
+            )
+            for critic in critics
+        ]
+        policy_q, head_index = choose_q_values(policy_predictions, q_head)
+        with torch.no_grad():
+            if head_index < 0:
+                normalization_q = policy_q
+            else:
+                # Match the official implementation: optimize one Q head and
+                # normalize it by another head evaluated on generated actions.
+                other_index = (head_index + 1) % len(policy_predictions)
+                normalization_q = policy_predictions[other_index]
+            denominator = normalization_q.abs().mean().clamp_min(
+                float(denominator_floor)
+            )
+            dataset_predictions = [
                 critic(
                     obs_dict=critic_observations,
-                    acts=policy_actions,
+                    acts=dataset_actions,
                     goal_dict=goal_observations,
                 )
                 for critic in critics
             ]
-            policy_q, head_index = choose_q_values(policy_predictions, q_head)
-            with torch.no_grad():
-                dataset_predictions = [
-                    critic(
-                        obs_dict=critic_observations,
-                        acts=dataset_actions,
-                        goal_dict=goal_observations,
-                    )
-                    for critic in critics
-                ]
-                dataset_q, _ = choose_q_values(
-                    dataset_predictions,
-                    "min" if head_index < 0 else f"q{head_index + 1}",
-                )
-                denominator = dataset_q.abs().mean().clamp_min(
-                    float(denominator_floor)
-                )
-            q_loss = -policy_q.mean() / denominator
+            dataset_q = torch.cat(dataset_predictions, dim=1).min(
+                dim=1, keepdim=True
+            ).values
+        q_loss = -policy_q.mean() / denominator
     finally:
         restore_requires_grad(critics, previous_grad_state)
 
@@ -443,6 +630,7 @@ def diffusion_q_loss(
         "actor/q_loss": q_loss.detach(),
         "actor/policy_q_mean": policy_q.mean().detach(),
         "actor/dataset_abs_q_mean": dataset_q.abs().mean().detach(),
+        "actor/normalization_q_abs_mean": normalization_q.abs().mean().detach(),
         "actor/q_denominator": denominator.detach(),
         "actor/q_head_index": policy_q.new_tensor(float(head_index)),
         "actor/generated_action_abs_mean": policy_actions.abs().mean().detach(),
@@ -456,13 +644,19 @@ def actor_train_step(
     actor_batch: dict,
     critic_batch: dict,
     args: argparse.Namespace,
+    global_step: int,
 ) -> dict[str, float]:
     bc_loss, bc_info = diffusion_bc_loss(actor_algo, actor_batch)
     available = int(next(iter(actor_batch["obs"].values())).shape[0])
     q_batch_size = min(int(args.dql_q_batch_size), available)
     q_loss = bc_loss.new_zeros(())
     q_info: dict[str, torch.Tensor] = {"actor/q_loss": q_loss.detach()}
-    if float(args.dql_eta) > 0.0 and q_batch_size > 0:
+    q_guidance_active = (
+        float(args.dql_eta) > 0.0
+        and q_batch_size > 0
+        and int(global_step) >= int(args.dql_critic_warmup_steps)
+    )
+    if q_guidance_active:
         goal_observations = critic_batch["goal_obs"]
         if goal_observations is not None:
             goal_observations = {
@@ -488,16 +682,22 @@ def actor_train_step(
             clip_actions=bool(args.dql_clip_actions),
         )
 
-    actor_loss = float(args.dql_bc_weight) * bc_loss + float(args.dql_eta) * q_loss
+    active_eta = float(args.dql_eta) if q_guidance_active else 0.0
+    actor_loss = float(args.dql_bc_weight) * bc_loss + active_eta * q_loss
     optimizer = actor_algo.optimizers["policy"]
     optimizer.zero_grad(set_to_none=True)
     actor_loss.backward()
     gradient_norm = torch.nn.utils.clip_grad_norm_(
         actor_algo.nets.parameters(),
-        float(args.max_gradient_norm),
+        float(args.actor_max_gradient_norm),
     )
     optimizer.step()
-    if actor_algo.ema is not None:
+    ema_update_due = (
+        actor_algo.ema is not None
+        and int(global_step) + 1 >= int(args.dql_critic_warmup_steps)
+        and (int(global_step) + 1) % int(args.dql_actor_ema_update_every) == 0
+    )
+    if ema_update_due:
         actor_algo._update_ema()
     actor_algo.on_gradient_step()
 
@@ -506,7 +706,9 @@ def actor_train_step(
             "actor/loss": actor_loss.detach(),
             "actor/gradient_norm": gradient_norm,
             "actor/q_batch_size": float(q_batch_size),
-            "actor/dql_eta": float(args.dql_eta),
+            "actor/dql_eta": active_eta,
+            "actor/q_guidance_active": float(q_guidance_active),
+            "actor/ema_updated": float(ema_update_due),
             "actor/effective_q_scale": (
                 float(args.dql_eta) / q_info["actor/q_denominator"]
                 if "actor/q_denominator" in q_info
@@ -526,6 +728,155 @@ def soft_update_targets(
     with torch.no_grad():
         for critic, target in zip(critics, critic_targets):
             TorchUtils.soft_update(source=critic, target=target, tau=float(tau))
+            source_buffers = dict(critic.named_buffers())
+            for name, target_buffer in target.named_buffers():
+                source_buffer = source_buffers[name]
+                if target_buffer.is_floating_point():
+                    target_buffer.lerp_(source_buffer, float(tau))
+                else:
+                    target_buffer.copy_(source_buffer)
+
+
+def make_train_validation_loaders(
+    dataset,
+    args: argparse.Namespace,
+    loader_generator: torch.Generator,
+):
+    """Create a fixed episode-level validation view of the shared dataset."""
+    validation_fraction = float(args.validation_fraction)
+    if not 0.0 <= validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be in [0, 1)")
+    if validation_fraction == 0.0:
+        return None, None, {
+            "validation_fraction": 0.0,
+            "validation_is_held_out": False,
+            "train_transitions": int(len(dataset)),
+            "validation_transitions": 0,
+            "train_episodes": int(len(dataset.demos)),
+            "validation_episodes": 0,
+        }
+
+    demos = list(dataset.demos)
+    if len(demos) < 2:
+        raise ValueError("episode-level validation requires at least two episodes")
+    split_rng = np.random.RandomState(int(args.seed) + 1701)
+    shuffled = list(demos)
+    split_rng.shuffle(shuffled)
+    validation_count = min(
+        len(shuffled) - 1,
+        max(1, int(round(validation_fraction * len(shuffled)))),
+    )
+    validation_demos = set(shuffled[:validation_count])
+    validation_indices = []
+    for index in range(len(dataset)):
+        demo = dataset._index_to_demo_id[index]
+        if demo in validation_demos:
+            validation_indices.append(index)
+    if bool(args.validation_holdout):
+        train_indices = [
+            index
+            for index in range(len(dataset))
+            if dataset._index_to_demo_id[index] not in validation_demos
+        ]
+    else:
+        # Default: preserve the exact all-transition training set shared by
+        # DQL, IDQL, and chunked IDQL. The validation view is diagnostic.
+        train_indices = list(range(len(dataset)))
+    if not train_indices or not validation_indices:
+        raise RuntimeError("episode-level train/validation split is empty")
+
+    loader_kwargs: dict[str, Any] = {}
+    if int(args.num_workers) > 0:
+        loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
+        loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
+    common = {
+        "batch_size": int(args.batch_size),
+        "num_workers": int(args.num_workers),
+        "pin_memory": bool(args.pin_memory and args.device == "cuda"),
+        **loader_kwargs,
+    }
+    train_loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(dataset, train_indices),
+        shuffle=True,
+        drop_last=len(train_indices) >= int(args.batch_size),
+        generator=loader_generator,
+        **common,
+    )
+    validation_loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(dataset, validation_indices),
+        shuffle=False,
+        drop_last=False,
+        **common,
+    )
+    return train_loader, validation_loader, {
+        "validation_fraction": validation_fraction,
+        "split_unit": "episode",
+        "split_seed": int(args.seed) + 1701,
+        "validation_is_held_out": bool(args.validation_holdout),
+        "train_transitions": int(len(train_indices)),
+        "validation_transitions": int(len(validation_indices)),
+        "train_episodes": int(
+            len(demos) - validation_count
+            if bool(args.validation_holdout)
+            else len(demos)
+        ),
+        "validation_episodes": int(validation_count),
+    }
+
+
+@torch.no_grad()
+def evaluate_critic_loader(
+    *,
+    loader,
+    actor_algo,
+    critics: nn.ModuleList,
+    critic_targets: nn.ModuleList,
+    obs_normalization_stats,
+    args: argparse.Namespace,
+) -> dict[str, float] | None:
+    if loader is None:
+        return None
+    critic_was_training = critics.training
+    critics.eval()
+    critic_targets.eval().requires_grad_(False)
+    records = []
+    saved_rng = rng_state()
+    try:
+        for batch_index, raw_batch in enumerate(loader):
+            if (
+                int(args.validation_batches) > 0
+                and batch_index >= int(args.validation_batches)
+            ):
+                break
+            raw_batch = align_shared_batch_actions(raw_batch)
+            critic_batch = process_dql_critic_batch(
+                raw_batch,
+                actor_algo,
+                obs_normalization_stats,
+            )
+            next_actor_observations = prepare_next_actor_observations(
+                actor_algo,
+                raw_batch,
+                obs_normalization_stats,
+            )
+            loss, info = compute_critic_loss(
+                actor_algo=actor_algo,
+                critics=critics,
+                critic_targets=critic_targets,
+                critic_batch=critic_batch,
+                next_actor_observations=next_actor_observations,
+                discount=float(args.discount),
+                use_huber=bool(args.use_huber),
+                num_inference_steps=int(args.dql_num_inference_steps),
+                num_target_candidates=int(args.dql_target_num_candidates),
+                clip_actions=bool(args.dql_clip_actions),
+            )
+            records.append(scalar_metrics({**info, "critic/loss": loss}))
+    finally:
+        restore_rng_state(saved_rng)
+        critics.train(critic_was_training)
+        critic_targets.eval().requires_grad_(False)
+    return mean_metrics(records) if records else None
 
 
 def dql_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
@@ -535,7 +886,7 @@ def dql_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
         "matched": [
             "diffusion_behavior_cloning_plus_q_maximization_actor_loss",
             "q_gradient_backpropagated_through_full_reverse_diffusion_chain",
-            "alpha_normalized_by_mean_absolute_dataset_action_q",
+            "official_cross_head_generated_action_q_normalization",
             "independent_twin_q_critics_and_target_critics",
             "clipped_double_q_bellman_backup",
             "ema_diffusion_target_actor",
@@ -543,6 +894,8 @@ def dql_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
         ],
         "robot_policy_adaptations": [
             "pretrained_rgb_diffusion_policy_initialization",
+            "pretrained_groupnorm_critic_encoder_initialization",
+            "critic_uses_full_actor_observation_horizon",
             "actor_predicts_a_chunk_but_q_scores_first_executable_action",
             (
                 "source_environment_task_reward"
@@ -568,8 +921,10 @@ def checkpoint_payload(
     global_step: int,
     history: list[dict],
     loader_generator: torch.Generator,
+    best_validation_critic_loss: float,
 ) -> dict[str, Any]:
     return {
+        "stacked_pretrained_dql_critic": True,
         # Reuse the raw-RGB actor / critic evaluator shared with IDQL.
         "rise_style_rgb_idql": True,
         "rise_style_rgb_dql": True,
@@ -588,6 +943,7 @@ def checkpoint_payload(
         "epoch": int(epoch),
         "step": int(global_step),
         "history": history,
+        "best_validation_critic_loss": float(best_validation_critic_loss),
         "pretrained_dp_checkpoint": str(args.checkpoint),
         "task": str(args.task),
         "dataset": str(args.dataset),
@@ -600,9 +956,14 @@ def checkpoint_payload(
         "actor_training_objective": "diffusion_bc_plus_normalized_q_maximization",
         "actor_data_mode": "all_human_success_failure_rows",
         "critic_training_objective": "diffusion_ql_clipped_double_q_td",
-        "critic_input_mode": "independent_raw_observation_encoders",
+        "critic_input_mode": "independent_pretrained_dp_observation_encoders",
         "critic_action_space": "pretrained_dp_normalized_action_space",
         "critic_horizon": 1,
+        "critic_observation_horizon": int(
+            actor_algo.algo_config.horizon.observation_horizon
+        ),
+        "critic_encoder_initialized_from_pretrained_dp": True,
+        "critic_target_mode": "eval",
         "critic_has_value_net": False,
         "critic_hidden_dims": tuple(int(value) for value in args.critic_hidden_dims),
         "num_critics": int(args.num_critics),
@@ -617,7 +978,7 @@ def checkpoint_payload(
         "target_tau": float(args.target_tau),
         "dql_eta": float(args.dql_eta),
         "dql_bc_weight": float(args.dql_bc_weight),
-        "dql_q_normalization": "mean_absolute_dataset_action_q",
+        "dql_q_normalization": "official_cross_head_generated_action_q",
         "dql_reference_alignment": dql_reference_alignment(args),
         "actor_initialized_from_deployed_ema": True,
         "actor_encoder_trainable": True,
@@ -658,6 +1019,12 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "dql_q_head",
         "dql_q_denominator_floor",
         "dql_clip_actions",
+        "dql_critic_warmup_steps",
+        "dql_actor_ema_update_every",
+        "actor_max_gradient_norm",
+        "critic_max_gradient_norm",
+        "validation_fraction",
+        "validation_holdout",
     )
     for key in exact_keys:
         if key not in previous:
@@ -679,6 +1046,10 @@ def train(args: argparse.Namespace) -> dict:
         raise FileNotFoundError(args.checkpoint)
     if int(args.num_critics) < 2:
         raise ValueError("Diffusion-QL requires at least two critics")
+    if not bool(args.critic_group_norm):
+        raise ValueError(
+            "stable RGB DQL requires --critic-group-norm for every task"
+        )
     if float(args.dql_eta) < 0.0:
         raise ValueError("dql_eta must be non-negative")
     if int(args.dql_q_batch_size) < 0:
@@ -687,6 +1058,10 @@ def train(args: argparse.Namespace) -> dict:
         raise ValueError("dql_target_num_candidates must be positive")
     if float(args.dql_q_denominator_floor) <= 0.0:
         raise ValueError("dql_q_denominator_floor must be positive")
+    if int(args.dql_critic_warmup_steps) < 0:
+        raise ValueError("dql_critic_warmup_steps must be non-negative")
+    if int(args.dql_actor_ema_update_every) <= 0:
+        raise ValueError("dql_actor_ema_update_every must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     random.seed(args.seed)
@@ -706,11 +1081,20 @@ def train(args: argparse.Namespace) -> dict:
     if actor_algo.ema is not None and not initialized_from_ema:
         raise RuntimeError("failed to initialize actor from deployed EMA")
 
-    dataset, loader, loader_generator, _ = build_single_loader(
+    dataset, original_loader, loader_generator, _ = build_single_loader(
         args,
         actor_policy,
         dp_checkpoint,
     )
+    loader, validation_loader, split_audit = make_train_validation_loaders(
+        dataset,
+        args,
+        loader_generator,
+    )
+    if loader is None:
+        loader = original_loader
+    else:
+        del original_loader
     if args.steps_per_epoch is None:
         args.steps_per_epoch = int(len(loader))
         args.steps_per_epoch_source = "auto_DataLoader_length"
@@ -749,11 +1133,14 @@ def train(args: argparse.Namespace) -> dict:
         raise ValueError("pretrained DP checkpoint has no action normalization stats")
     obs_normalization_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
 
-    critics, critic_targets, unused_value_net = make_rise_value_networks(
+    observation_horizon = int(
+        actor_algo.algo_config.horizon.observation_horizon
+    )
+    critics, critic_targets, unused_value_net = make_dql_value_networks(
         actor_algo,
         hidden_dims=tuple(int(value) for value in args.critic_hidden_dims),
+        observation_horizon=observation_horizon,
         num_critics=int(args.num_critics),
-        critic_group_norm=bool(args.critic_group_norm),
         late_fusion_key=args.critic_late_fusion_key,
     )
     del unused_value_net
@@ -775,6 +1162,7 @@ def train(args: argparse.Namespace) -> dict:
     start_epoch = 0
     global_step = 0
     history: list[dict] = []
+    best_validation_critic_loss = float("inf")
     if args.resume_checkpoint is not None:
         checkpoint = torch.load(
             args.resume_checkpoint,
@@ -783,6 +1171,15 @@ def train(args: argparse.Namespace) -> dict:
         )
         if not checkpoint.get("rise_style_rgb_dql", False):
             raise ValueError("resume checkpoint is not from train_rgb_dp_dql.py")
+        if not bool(checkpoint.get("stacked_pretrained_dql_critic", False)):
+            incompatibility = {
+                "resume_checkpoint": str(args.resume_checkpoint),
+                "reason": "critic architecture and stable DQL target semantics changed",
+            }
+            write_json(args.output_dir / "resume_incompatible.json", incompatibility)
+            raise ValueError(
+                "cannot resume a pre-fix DQL checkpoint; use a new DQL_OUTPUT_DIR"
+            )
         validate_resume_args(args, checkpoint)
         checkpoint_action_stats = checkpoint.get("action_normalization_stats")
         if checkpoint_action_stats is None or not action_normalization_stats_match(
@@ -814,6 +1211,9 @@ def train(args: argparse.Namespace) -> dict:
         start_epoch = int(checkpoint["epoch"])
         global_step = int(checkpoint["step"])
         history = list(checkpoint.get("history", []))
+        best_validation_critic_loss = float(
+            checkpoint.get("best_validation_critic_loss", float("inf"))
+        )
         loader_generator.set_state(checkpoint["loader_generator_state"].cpu())
         restore_rng_state(checkpoint.get("rng_state"))
         del checkpoint
@@ -824,9 +1224,10 @@ def train(args: argparse.Namespace) -> dict:
 
     actor_algo.set_train()
     critics.train()
-    critic_targets.train().requires_grad_(False)
+    critic_targets.eval().requires_grad_(False)
     trainability = actor_trainability(actor_algo)
     startup = {
+        "stacked_pretrained_dql_critic": True,
         "task": str(args.task),
         "dataset": audit,
         "data_routing": {
@@ -834,10 +1235,11 @@ def train(args: argparse.Namespace) -> dict:
             "actor_rows": "all_human_success_failure",
             "critic_rows": "all_human_success_failure",
             "source_masking": False,
+            "split": split_audit,
         },
         "loader": {
             "class": dataset.__class__.__name__,
-            "num_loaders": 1,
+            "num_loaders": 1 + int(validation_loader is not None),
             "sampler": "RandomSampler_without_replacement",
             "batch_size": int(args.batch_size),
             "num_batches": int(len(loader)),
@@ -862,8 +1264,13 @@ def train(args: argparse.Namespace) -> dict:
             "target_critic_parameter_counts": [
                 parameter_count(target) for target in critic_targets
             ],
-            "independent_raw_obs_encoders": True,
-            "critic_group_norm": bool(args.critic_group_norm),
+            "independent_raw_obs_encoders": False,
+            "independent_pretrained_dp_obs_encoders": True,
+            "critic_encoder_initialized_from_pretrained_dp": True,
+            "critic_observation_horizon": observation_horizon,
+            "critic_normalization": "group_norm_from_pretrained_dp",
+            "critic_group_norm": True,
+            "target_critic_mode": "eval",
             "critic_late_fusion_key": args.critic_late_fusion_key,
         },
         "dql_reference_alignment": dql_reference_alignment(args),
@@ -880,7 +1287,14 @@ def train(args: argparse.Namespace) -> dict:
             "dql_num_inference_steps": int(args.dql_num_inference_steps),
             "dql_target_num_candidates": int(args.dql_target_num_candidates),
             "dql_q_head": str(args.dql_q_head),
-            "dql_q_normalization": "mean_absolute_dataset_action_q",
+            "dql_q_normalization": "official_cross_head_generated_action_q",
+            "dql_q_denominator_floor": float(args.dql_q_denominator_floor),
+            "dql_critic_warmup_steps": int(args.dql_critic_warmup_steps),
+            "dql_actor_ema_update_every": int(
+                args.dql_actor_ema_update_every
+            ),
+            "actor_max_gradient_norm": float(args.actor_max_gradient_norm),
+            "critic_max_gradient_norm": float(args.critic_max_gradient_norm),
             "lr_scheduler": str(args.lr_scheduler),
             "lr_total_steps": int(args.lr_total_steps),
         },
@@ -906,7 +1320,7 @@ def train(args: argparse.Namespace) -> dict:
                 "lr/critic": float(critic_optimizer.param_groups[0]["lr"]),
             }
 
-            critic_batch = process_critic_batch(
+            critic_batch = process_dql_critic_batch(
                 raw_batch,
                 actor_algo,
                 obs_normalization_stats,
@@ -933,7 +1347,7 @@ def train(args: argparse.Namespace) -> dict:
             critic_loss.backward()
             critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
                 critics.parameters(),
-                float(args.max_gradient_norm),
+                float(args.critic_max_gradient_norm),
             )
             critic_optimizer.step()
 
@@ -948,6 +1362,7 @@ def train(args: argparse.Namespace) -> dict:
                 actor_batch=actor_batch,
                 critic_batch=critic_batch,
                 args=args,
+                global_step=global_step,
             )
             soft_update_targets(critics, critic_targets, float(args.target_tau))
             if critic_lr_scheduler is not None:
@@ -979,10 +1394,27 @@ def train(args: argparse.Namespace) -> dict:
                     flush=True,
                 )
 
+        validation_metrics = evaluate_critic_loader(
+            loader=validation_loader,
+            actor_algo=actor_algo,
+            critics=critics,
+            critic_targets=critic_targets,
+            obs_normalization_stats=obs_normalization_stats,
+            args=args,
+        )
+        validation_loss = (
+            float(validation_metrics["critic/loss"])
+            if validation_metrics is not None
+            else float("inf")
+        )
+        is_best_validation = validation_loss < best_validation_critic_loss
+        if is_best_validation:
+            best_validation_critic_loss = validation_loss
         epoch_summary = {
             "epoch": int(epoch),
             "global_step": int(global_step),
             "metrics": mean_metrics(epoch_records),
+            "validation": validation_metrics,
         }
         history.append(epoch_summary)
         partial_summary = {
@@ -990,9 +1422,18 @@ def train(args: argparse.Namespace) -> dict:
             "last_completed_epoch": int(epoch),
             "global_step": int(global_step),
             "last_epoch_metrics": epoch_summary["metrics"],
+            "last_validation_metrics": validation_metrics,
+            "best_validation_critic_loss": (
+                best_validation_critic_loss
+                if np.isfinite(best_validation_critic_loss)
+                else None
+            ),
             "history": history,
             "checkpoints": {
                 "latest": str(args.output_dir / "latest.pt"),
+                "best_critic_loss": str(
+                    args.output_dir / "best_critic_loss.pt"
+                ),
                 "last": str(args.output_dir / "last.pt"),
             },
         }
@@ -1001,6 +1442,7 @@ def train(args: argparse.Namespace) -> dict:
         should_save = (
             epoch % int(args.save_every_epochs) == 0
             or epoch == int(args.epochs)
+            or is_best_validation
         )
         if should_save:
             payload = checkpoint_payload(
@@ -1015,9 +1457,15 @@ def train(args: argparse.Namespace) -> dict:
                 global_step=global_step,
                 history=history,
                 loader_generator=loader_generator,
+                best_validation_critic_loss=best_validation_critic_loss,
             )
             latest_path = args.output_dir / "latest.pt"
             atomic_torch_save(payload, latest_path)
+            if is_best_validation:
+                replace_with_hardlink(
+                    latest_path,
+                    args.output_dir / "best_critic_loss.pt",
+                )
             if (
                 int(args.snapshot_every_epochs) > 0
                 and epoch % int(args.snapshot_every_epochs) == 0
@@ -1064,7 +1512,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
@@ -1085,22 +1533,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-num-cycles", type=float, default=0.5)
     parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=(300, 400, 300))
     parser.add_argument("--num-critics", type=int, default=2)
-    parser.add_argument("--critic-group-norm", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--critic-group-norm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--critic-late-fusion-key",
         default="robot0_gripper_qpos",
         help="One observation key or a comma-separated key list.",
     )
     parser.add_argument("--use-huber", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--max-gradient-norm", type=float, default=10.0)
+    parser.add_argument("--actor-max-gradient-norm", type=float, default=1.0)
+    parser.add_argument("--critic-max-gradient-norm", type=float, default=10.0)
     parser.add_argument("--dql-eta", type=float, default=1.0)
     parser.add_argument("--dql-bc-weight", type=float, default=1.0)
     parser.add_argument("--dql-q-batch-size", type=int, default=8)
     parser.add_argument("--dql-num-inference-steps", type=int, default=5)
     parser.add_argument("--dql-target-num-candidates", type=int, default=1)
     parser.add_argument("--dql-q-head", choices=("random", "q1", "q2", "min"), default="random")
-    parser.add_argument("--dql-q-denominator-floor", type=float, default=1e-6)
+    parser.add_argument("--dql-q-denominator-floor", type=float, default=1.0)
+    parser.add_argument("--dql-critic-warmup-steps", type=int, default=1000)
+    parser.add_argument("--dql-actor-ema-update-every", type=int, default=5)
     parser.add_argument("--dql-clip-actions", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--validation-holdout",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Exclude validation episodes from training. Disabled by default so "
+            "DQL trains on the same transitions as IDQL and chunked IDQL."
+        ),
+    )
+    parser.add_argument("--validation-batches", type=int, default=32)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--snapshot-every-epochs", type=int, default=10)
@@ -1117,6 +1579,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("lr-warmup-steps must be non-negative")
     if args.lr_num_cycles <= 0.0:
         parser.error("lr-num-cycles must be positive")
+    if args.actor_max_gradient_norm <= 0.0:
+        parser.error("actor-max-gradient-norm must be positive")
+    if args.critic_max_gradient_norm <= 0.0:
+        parser.error("critic-max-gradient-norm must be positive")
+    if not 0.0 <= args.validation_fraction < 1.0:
+        parser.error("validation-fraction must be in [0, 1)")
+    if args.validation_batches < 0:
+        parser.error("validation-batches must be non-negative")
     return args
 
 
