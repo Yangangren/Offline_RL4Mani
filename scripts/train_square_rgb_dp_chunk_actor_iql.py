@@ -86,18 +86,152 @@ def cycle(loader):
             yield batch
 
 
-def configure_actor_optimizer(actor_algo, lr: float, disable_lr_scheduler: bool) -> None:
-    for group in actor_algo.optimizers["policy"].param_groups:
-        group["lr"] = float(lr)
+def initialize_actor_from_deployed_ema(actor_algo) -> bool:
+    if actor_algo.ema is None:
+        return False
+    ema_state = copy.deepcopy(actor_algo.ema.averaged_model.state_dict())
+    actor_algo.nets.load_state_dict(ema_state)
+    actor_algo.ema.averaged_model.load_state_dict(actor_algo.nets.state_dict())
+    if hasattr(actor_algo, "_refresh_ema_parameter_views"):
+        actor_algo._refresh_ema_parameter_views()
+    return True
+
+
+def apply_pretrained_action_normalization(actor_dataset, checkpoint_dict: dict) -> str:
+    action_stats = checkpoint_dict.get("action_normalization_stats")
+    if action_stats is None:
+        raise ValueError(
+            "pretrained DP checkpoint is missing action_normalization_stats; "
+            "refusing to normalize actor data with mixed-dataset statistics"
+        )
+    if not hasattr(actor_dataset, "set_action_normalization_stats"):
+        raise TypeError("actor dataset does not support set_action_normalization_stats")
+    actor_dataset.set_action_normalization_stats(copy.deepcopy(action_stats))
+    source = "pretrained_dp_checkpoint_action_normalization_stats"
+    setattr(actor_dataset, "actor_action_normalization_source", source)
+    return source
+
+
+def action_normalization_stats_match(left: dict, right: dict) -> bool:
+    if set(left.keys()) != set(right.keys()):
+        return False
+    for action_key in left:
+        if set(left[action_key].keys()) != set(right[action_key].keys()):
+            return False
+        for stat_key in left[action_key]:
+            if not np.allclose(
+                np.asarray(left[action_key][stat_key]),
+                np.asarray(right[action_key][stat_key]),
+            ):
+                return False
+    return True
+
+
+def configure_actor_optimizer(
+    actor_algo,
+    lr: float | None,
+    disable_lr_scheduler: bool,
+    *,
+    num_train_batches: int | None = None,
+    num_epochs: int | None = None,
+    reset_scheduler: bool = False,
+    preserve_current_lr: bool = False,
+) -> None:
+    optim_params = actor_algo.optim_params["policy"]
+    if num_train_batches is not None:
+        optim_params.num_train_batches = int(num_train_batches)
+    if num_epochs is not None:
+        optim_params.num_epochs = int(num_epochs)
+    configured_lr = float(
+        optim_params.learning_rate.initial if lr is None else lr
+    )
+    if lr is not None:
+        optim_params.learning_rate.initial = configured_lr
+
+    optimizer = actor_algo.optimizers["policy"]
+    optim_param_ids = {id(param) for group in optimizer.param_groups for param in group["params"]}
+    missing = [
+        param
+        for param in actor_algo.nets["policy"].parameters()
+        if param.requires_grad and id(param) not in optim_param_ids
+    ]
+    if missing:
+        optimizer.add_param_group({"params": missing, "lr": configured_lr})
+    if not preserve_current_lr:
+        for group in optimizer.param_groups:
+            group["lr"] = configured_lr
+            group["initial_lr"] = configured_lr
     if disable_lr_scheduler:
         actor_algo.lr_schedulers["policy"] = None
         actor_algo.step_lr_schedulers_every_batch["policy"] = False
+    elif reset_scheduler:
+        actor_algo.lr_schedulers["policy"] = TorchUtils.lr_scheduler_from_optim_params(
+            net_optim_params=optim_params,
+            net=actor_algo.nets["policy"],
+            optimizer=optimizer,
+        )
+        actor_algo.step_lr_schedulers_every_batch["policy"] = bool(
+            optim_params.learning_rate.get("step_every_batch", False)
+        )
+
+
+def actor_trainability_summary(actor_algo) -> dict[str, Any]:
+    policy = actor_algo.nets["policy"]
+    obs_encoder = policy["obs_encoder"]
+    optim_param_ids = {
+        id(param)
+        for group in actor_algo.optimizers["policy"].param_groups
+        for param in group["params"]
+    }
+
+    def module_summary(module: nn.Module) -> dict[str, Any]:
+        params = list(module.named_parameters())
+        total = sum(param.numel() for _, param in params)
+        trainable = sum(param.numel() for _, param in params if param.requires_grad)
+        optimized = sum(param.numel() for _, param in params if id(param) in optim_param_ids)
+        frozen_names = [name for name, param in params if not param.requires_grad]
+        missing_names = [name for name, param in params if id(param) not in optim_param_ids]
+        return {
+            "num_parameters": int(total),
+            "num_trainable_parameters": int(trainable),
+            "num_optimizer_parameters": int(optimized),
+            "all_trainable": len(frozen_names) == 0,
+            "all_in_optimizer": len(missing_names) == 0,
+            "num_frozen_tensors": int(len(frozen_names)),
+            "num_missing_optimizer_tensors": int(len(missing_names)),
+            "first_frozen_tensors": frozen_names[:10],
+            "first_missing_optimizer_tensors": missing_names[:10],
+        }
+
+    summary = {
+        "scope": "full_pretrained_dp_policy",
+        "policy": module_summary(policy),
+        "obs_encoder": module_summary(obs_encoder),
+    }
+    if not summary["policy"]["all_trainable"] or not summary["policy"]["all_in_optimizer"]:
+        raise RuntimeError(
+            "DP actor is not fully trainable. "
+            f"trainability={json.dumps(jsonable(summary), indent=2)}"
+        )
+    if not summary["obs_encoder"]["all_trainable"] or not summary["obs_encoder"]["all_in_optimizer"]:
+        raise RuntimeError(
+            "DP actor obs encoder is not fully trainable. "
+            f"trainability={json.dumps(jsonable(summary), indent=2)}"
+        )
+    return summary
 
 
 def actor_source_entries(args: argparse.Namespace) -> list[dict]:
+    conditioned = bool(getattr(args, "conditioned_mixed_imitation", False))
+    condition_label_mode = str(getattr(args, "condition_label_mode", "outcome"))
+    human_only_condition = conditioned and condition_label_mode == "human_only"
     entries = []
     if float(args.actor_demo_weight) > 0.0:
-        demo = {"path": str(args.demo_dataset), "weight": float(args.actor_demo_weight)}
+        demo = {
+            "path": str(args.demo_dataset),
+            "weight": float(args.actor_demo_weight),
+            "anti_failure": 0.0,
+        }
         if args.demo_filter_key:
             demo["filter_key"] = args.demo_filter_key
         entries.append(demo)
@@ -107,16 +241,23 @@ def actor_source_entries(args: argparse.Namespace) -> list[dict]:
                 "path": str(args.success_dataset),
                 "filter_key": args.success_filter_key,
                 "weight": float(args.actor_success_weight),
+                "anti_failure": 1.0 if human_only_condition else 0.0,
             }
         )
     if float(args.actor_failure_weight) > 0.0:
-        entries.append(
-            {
-                "path": str(args.failure_dataset),
-                "filter_key": args.failure_filter_key,
-                "weight": float(args.actor_failure_weight),
-            }
-        )
+        failure = {
+            "path": str(args.failure_dataset),
+            "weight": float(args.actor_failure_weight),
+            "anti_failure": float(getattr(args, "actor_failure_anti_failure_label", 1.0)),
+        }
+        if args.failure_filter_key:
+            failure["filter_key"] = args.failure_filter_key
+        if bool(getattr(args, "actor_failure_demo_start_only", False)):
+            failure["demo_start_only"] = True
+        sample_start_offset = int(getattr(args, "actor_failure_sample_start_offset", 0))
+        if sample_start_offset != 0:
+            failure["sample_start_offset"] = sample_start_offset
+        entries.append(failure)
     if not entries:
         raise ValueError("at least one actor dataset weight must be positive")
     return entries
@@ -138,9 +279,19 @@ def build_actor_loader(
             f"actor_seq_length={seq_length} must be >= DP prediction_horizon={prediction_horizon}"
         )
 
+    source_entries = actor_source_entries(args)
+    if args.actor_hdf5_cache_mode == "all" and len(source_entries) > 1:
+        raise ValueError(
+            "actor_hdf5_cache_mode=all is unsupported for multi-source MetaDataset training; "
+            "use low_dim or no cache"
+        )
+
     with config.values_unlocked():
-        config.train.data = actor_source_entries(args)
-        config.train.normalize_weights_by_ds_size = bool(args.actor_normalize_weights_by_ds_size)
+        config.train.data = source_entries
+        config.train.normalize_weights_by_ds_size = bool(
+            args.actor_normalize_weights_by_ds_size
+            and not bool(getattr(args, "actor_uniform_sample_pool", False))
+        )
         config.train.hdf5_cache_mode = args.actor_hdf5_cache_mode
         config.train.hdf5_load_next_obs = False
         config.train.seq_length = seq_length
@@ -151,7 +302,22 @@ def build_actor_loader(
         config.train.num_data_workers = int(args.actor_num_workers)
 
     dataset = TrainUtils.dataset_factory(config, obs_keys=list(actor_algo.obs_shapes.keys()))
-    sampler = dataset.get_dataset_sampler() if hasattr(dataset, "get_dataset_sampler") else None
+    if args.actor_hdf5_cache_mode == "all":
+        cached_action_stats = dataset.get_action_normalization_stats()
+        checkpoint_action_stats = checkpoint_dict.get("action_normalization_stats")
+        if checkpoint_action_stats is None or not action_normalization_stats_match(
+            cached_action_stats,
+            checkpoint_action_stats,
+        ):
+            raise ValueError(
+                "actor_hdf5_cache_mode=all requires dataset action normalization "
+                "to match the pretrained DP checkpoint"
+            )
+    action_normalization_source = apply_pretrained_action_normalization(dataset, checkpoint_dict)
+    print(json.dumps({"actor_action_normalization_source": action_normalization_source}), flush=True)
+    sampler = None
+    if not bool(getattr(args, "actor_uniform_sample_pool", False)):
+        sampler = dataset.get_dataset_sampler() if hasattr(dataset, "get_dataset_sampler") else None
     generator = torch.Generator()
     generator.manual_seed(int(args.seed))
     loader_kwargs: dict[str, Any] = {}
@@ -400,6 +566,12 @@ def save_checkpoint(
         "critic_encoder_initialized_from_dp": True,
         "actor_initialized_from_dp": True,
         "actor_training_objective": "diffusion_bc_full_chunk",
+        "actor_trainability": actor_trainability_summary(actor_algo),
+        "actor_encoder_trainable": True,
+        "critic_input_mode": "raw_hdf5_observations",
+        "critic_feature_index_usage": "transition_metadata_actions_rewards_splits_only",
+        "critic_uses_cached_latents": False,
+        "feature_index_contains_cached_latents": bool("obs_features" in data),
         "actor_lr_scheduler_disabled": bool(args.actor_disable_lr_scheduler),
         "critic_training_objective": "one_step_iql",
         "actor_source_weights": {
@@ -443,6 +615,14 @@ def make_summary(
         "pretrained_dp_checkpoint": str(args.checkpoint),
         "actor_data": jsonable(actor_config.train.data),
         "actor_dataset_size": int(len(actor_dataset)),
+        "actor_action_normalization_source": getattr(
+            actor_dataset,
+            "actor_action_normalization_source",
+            None,
+        ),
+        "actor_initialized_from_deployed_ema": bool(
+            getattr(args, "actor_initialized_from_deployed_ema", False)
+        ),
         "critic_num_train": int(len(critic_datasets["train"])),
         "critic_num_val": int(len(critic_datasets["val"])),
         "critic_num_test": int(len(critic_datasets["test"])),
@@ -454,8 +634,14 @@ def make_summary(
         "gamma": float(gamma),
         "normalize_actions_for_critic": bool(args.normalize_actions),
         "actor_training_objective": "diffusion_bc_full_chunk",
+        "actor_training_scope": "full_pretrained_dp_policy_including_obs_encoder",
+        "actor_encoder_trainable": True,
         "actor_lr_scheduler_disabled": bool(args.actor_disable_lr_scheduler),
         "critic_training_objective": "one_step_iql",
+        "critic_input_mode": "raw_hdf5_observations",
+        "critic_feature_index_usage": "transition_metadata_actions_rewards_splits_only",
+        "critic_uses_cached_latents": False,
+        "feature_index_contains_cached_latents": bool("obs_features" in data),
         "eval_actor_source": "hybrid_dp_chunk_actor",
         "critic_encoder_initialized_from_dp": True,
         "aux_next_pred": {
@@ -514,7 +700,14 @@ def train(args: argparse.Namespace) -> dict:
     )
     actor_policy.start_episode()
     actor_algo = actor_policy.policy
+    args.actor_initialized_from_deployed_ema = False
+    if args.resume_checkpoint is None:
+        args.actor_initialized_from_deployed_ema = initialize_actor_from_deployed_ema(actor_algo)
     configure_actor_optimizer(actor_algo, args.actor_lr, args.actor_disable_lr_scheduler)
+    print(
+        json.dumps({"actor_trainability": jsonable(actor_trainability_summary(actor_algo))}, indent=2),
+        flush=True,
+    )
 
     actor_dataset, actor_loader, actor_config = build_actor_loader(
         args=args,
@@ -587,6 +780,10 @@ def train(args: argparse.Namespace) -> dict:
         checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         actor_algo.deserialize(checkpoint["actor_model"], load_optimizers=True)
         configure_actor_optimizer(actor_algo, args.actor_lr, args.actor_disable_lr_scheduler)
+        print(
+            json.dumps({"actor_trainability_after_resume": jsonable(actor_trainability_summary(actor_algo))}, indent=2),
+            flush=True,
+        )
         critic_encoder.load_state_dict(checkpoint["critic_encoder"])
         target_critic_encoder.load_state_dict(checkpoint.get("target_critic_encoder", checkpoint["critic_encoder"]))
         critic.load_state_dict(checkpoint["critic"])
@@ -923,6 +1120,9 @@ def main() -> None:
     parser.add_argument("--actor-demo-weight", type=float, default=1.0)
     parser.add_argument("--actor-success-weight", type=float, default=1.0)
     parser.add_argument("--actor-failure-weight", type=float, default=0.0)
+    parser.add_argument("--actor-failure-demo-start-only", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--actor-failure-sample-start-offset", type=int, default=0)
+    parser.add_argument("--actor-failure-anti-failure-label", type=float, default=1.0)
     parser.add_argument("--actor-normalize-weights-by-ds-size", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--critic-demo-weight", type=float, default=1.0)
     parser.add_argument("--critic-success-weight", type=float, default=1.0)

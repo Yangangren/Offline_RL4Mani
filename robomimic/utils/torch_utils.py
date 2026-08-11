@@ -249,7 +249,14 @@ def load_state_dict(obj, state_dict):
         raise ValueError("Cannot load state dict.")
 
 
-def backprop_for_loss(net, optim, loss, max_grad_norm=None, retain_graph=False):
+def backprop_for_loss(
+    net,
+    optim,
+    loss,
+    max_grad_norm=None,
+    retain_graph=False,
+    grad_sync_fn=None,
+):
     """
     Backpropagate loss and update parameters for network with
     name @name.
@@ -264,6 +271,9 @@ def backprop_for_loss(net, optim, loss, max_grad_norm=None, retain_graph=False):
         max_grad_norm (float): if provided, used to clip gradients
 
         retain_graph (bool): if True, graph is not freed after backward call
+
+        grad_sync_fn (callable): optional function that synchronizes the
+            optimizer parameter gradients after backward and before clipping
 
     Returns:
         grad_norms (float): average gradient norms from backpropagation
@@ -281,6 +291,9 @@ def backprop_for_loss(net, optim, loss, max_grad_norm=None, retain_graph=False):
         group_parameters = optim.param_groups[group_index]["params"]
         for parameter_index in range(len(group_parameters)):
             parameters.append(group_parameters[parameter_index])
+
+    if grad_sync_fn is not None:
+        grad_sync_fn(parameters)
 
     # gradient clipping
     if max_grad_norm is not None:

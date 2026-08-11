@@ -406,19 +406,58 @@ class RiskGuidedDPPolicy:
                 self.risk_model.observation_shapes,
                 self.algo.device,
             )
-            previous = (
-                current
-                if self.previous_ob is None
-                else prepare_observation_for_rgb_critic(
-                    self.previous_ob,
-                    self.risk_model.observation_shapes,
-                    self.algo.device,
-                )
-            )
-            observation_window = {
-                key: torch.stack([previous[key], current[key]], dim=1)
+            observation_horizon = int(self.risk_model.observation_horizon)
+            leading_sizes = {
+                key: int(current[key].shape[0])
                 for key in self.risk_model.observation_shapes
             }
+            if all(size == observation_horizon for size in leading_sizes.values()):
+                # Robomimic's rollout environment is wrapped by FrameStackWrapper.
+                # Consequently, the raw current observation already represents
+                # [t - To + 1, ..., t]. Treating that axis as a batch and stacking
+                # previous/current observations again creates a spurious second
+                # temporal axis: [1, To, To, feature_dim]. Training used exactly
+                # one To-frame window per decision boundary, so consume this
+                # existing window directly.
+                observation_window = {
+                    key: value.unsqueeze(0) for key, value in current.items()
+                }
+            elif all(size == 1 for size in leading_sizes.values()):
+                # Compatibility path for environments that return a single frame
+                # instead of a frame stack. The present critic was trained with a
+                # two-frame [previous, current] window.
+                if observation_horizon != 2:
+                    raise ValueError(
+                        "unstacked critic observations are supported only for "
+                        f"observation_horizon=2, got {observation_horizon}"
+                    )
+                previous = (
+                    current
+                    if self.previous_ob is None
+                    else prepare_observation_for_rgb_critic(
+                        self.previous_ob,
+                        self.risk_model.observation_shapes,
+                        self.algo.device,
+                    )
+                )
+                if not all(
+                    int(previous[key].shape[0]) == 1
+                    for key in self.risk_model.observation_shapes
+                ):
+                    raise ValueError(
+                        "critic observation layout changed within an episode: "
+                        f"previous/current leading sizes differ ({leading_sizes})"
+                    )
+                observation_window = {
+                    key: torch.cat([previous[key], current[key]], dim=0).unsqueeze(0)
+                    for key in self.risk_model.observation_shapes
+                }
+            else:
+                raise ValueError(
+                    "inconsistent critic observation leading dimensions; expected "
+                    f"all 1 or all observation_horizon={observation_horizon}, got "
+                    f"{leading_sizes}"
+                )
             feature = self.risk_model.encode_rgb_boundary(observation_window)
         else:
             # Legacy V1--V3 checkpoints contain only feature-space heads.
@@ -435,10 +474,22 @@ class RiskGuidedDPPolicy:
             feature = (
                 feature - self.feature_mean[None, :]
             ) / self.feature_std[None, :]
-        self.prefix_features.append(feature.squeeze(0))
+        expected_feature_dim = int(self.feature_mean.numel())
+        if tuple(feature.shape) != (1, expected_feature_dim):
+            raise RuntimeError(
+                "critic boundary encoder must return [1, feature_dim]; "
+                f"got {tuple(feature.shape)}, expected (1, {expected_feature_dim})"
+            )
+        self.prefix_features.append(feature[0])
         if self.max_prefix_len > 0 and len(self.prefix_features) > self.max_prefix_len:
             self.prefix_features = self.prefix_features[-self.max_prefix_len :]
-        return torch.stack(self.prefix_features, dim=0).unsqueeze(0)
+        prefix = torch.stack(self.prefix_features, dim=0).unsqueeze(0)
+        if prefix.ndim != 3 or prefix.shape[-1] != expected_feature_dim:
+            raise RuntimeError(
+                "critic prefix must be [batch, boundary_time, feature_dim]; "
+                f"got {tuple(prefix.shape)}"
+            )
+        return prefix
 
     @torch.no_grad()
     def score_candidates(self, current_ob: dict, candidates: torch.Tensor) -> dict[str, torch.Tensor]:

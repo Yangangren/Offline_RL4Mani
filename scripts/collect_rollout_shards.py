@@ -91,6 +91,8 @@ def valid_shard(
     expected: int,
     require_obs: bool,
     require_idql_diagnostics: bool = False,
+    expected_selection: str | None = None,
+    expected_random_selection_probability: float | None = None,
 ) -> bool:
     if not path.exists():
         return False
@@ -100,12 +102,32 @@ def valid_shard(
                 return False
             if "env_args" not in dataset["data"].attrs:
                 return False
+            if expected_selection is not None:
+                stored_selection = dataset["data"].attrs.get("selection")
+                if isinstance(stored_selection, bytes):
+                    stored_selection = stored_selection.decode("utf-8")
+                if stored_selection != expected_selection:
+                    return False
+            if expected_random_selection_probability is not None:
+                stored_probability = dataset["data"].attrs.get(
+                    "random_selection_probability"
+                )
+                if stored_probability is None or not np.isclose(
+                    float(stored_probability),
+                    float(expected_random_selection_probability),
+                ):
+                    return False
             keys = sorted_demo_keys(dataset)
             if len(keys) == 0:
                 return False
             required = ("actions", "states", "rewards", "dones")
             if require_idql_diagnostics:
-                required += ("q_selected", "selected_index")
+                required += (
+                    "q_selected",
+                    "selected_index",
+                    "selection_is_random",
+                    "selection_is_greedy",
+                )
             for key in keys:
                 episode = dataset[f"data/{key}"]
                 if any(name not in episode for name in required):
@@ -236,6 +258,8 @@ def rollout_command(args, shard: Path, spec: dict, attempt: int) -> list[str]:
             str(args.execution_horizon),
             "--selection",
             args.selection,
+            "--random-selection-probability",
+            str(args.random_selection_probability),
             "--inference-success-condition",
             str(args.inference_success_condition),
             "--inference-condition-mask",
@@ -340,6 +364,12 @@ def collect(args) -> list[dict]:
                 args.rollouts_per_shard,
                 args.dataset_obs,
                 require_idql_diagnostics=require_idql_diagnostics,
+                expected_selection=(args.selection if require_idql_diagnostics else None),
+                expected_random_selection_probability=(
+                    args.random_selection_probability
+                    if require_idql_diagnostics
+                    else None
+                ),
             )
         ):
             print(f"[reuse] {shard}", flush=True)
@@ -384,6 +414,14 @@ def collect(args) -> list[dict]:
                         args.rollouts_per_shard,
                         args.dataset_obs,
                         require_idql_diagnostics=require_idql_diagnostics,
+                        expected_selection=(
+                            args.selection if require_idql_diagnostics else None
+                        ),
+                        expected_random_selection_probability=(
+                            args.random_selection_probability
+                            if require_idql_diagnostics
+                            else None
+                        ),
                     )
                     if ok:
                         stats = parse_stats(stdout)
@@ -460,8 +498,12 @@ def merge(args, shard_records: list[dict]) -> dict:
         merged_path.unlink()
 
     successes, failures, all_keys = [], [], []
+    random_exploration_episodes, no_random_exploration_episodes = [], []
     episode_records = []
     total_samples = 0
+    total_selection_decisions = 0
+    total_random_selection_decisions = 0
+    total_non_greedy_selection_decisions = 0
     env_args = None
     with h5py.File(merged_path, "w") as output:
         output_data = output.create_group("data")
@@ -498,6 +540,47 @@ def merge(args, shard_records: list[dict]) -> dict:
                     if episode_policy_seed is not None:
                         episode_policy_seed = int(episode_policy_seed)
 
+                    selection_decisions = 0
+                    random_selection_decisions = 0
+                    non_greedy_selection_decisions = 0
+                    if "selection_is_random" in group:
+                        random_values = np.asarray(
+                            group["selection_is_random"][:],
+                            dtype=np.int8,
+                        )
+                        greedy_values = np.asarray(
+                            group["selection_is_greedy"][:],
+                            dtype=np.int8,
+                        )
+                        valid_decisions = random_values >= 0
+                        selection_decisions = int(np.sum(valid_decisions))
+                        random_selection_decisions = int(
+                            np.sum(random_values[valid_decisions] == 1)
+                        )
+                        non_greedy_selection_decisions = int(
+                            np.sum(greedy_values[valid_decisions] == 0)
+                        )
+                        group.attrs["num_selection_decisions"] = selection_decisions
+                        group.attrs["num_random_selection_decisions"] = (
+                            random_selection_decisions
+                        )
+                        group.attrs["num_non_greedy_selection_decisions"] = (
+                            non_greedy_selection_decisions
+                        )
+                        group.attrs["random_selection_decision_fraction"] = (
+                            random_selection_decisions / max(1, selection_decisions)
+                        )
+                        if random_selection_decisions > 0:
+                            random_exploration_episodes.append(output_key)
+                        else:
+                            no_random_exploration_episodes.append(output_key)
+
+                    total_selection_decisions += selection_decisions
+                    total_random_selection_decisions += random_selection_decisions
+                    total_non_greedy_selection_decisions += (
+                        non_greedy_selection_decisions
+                    )
+
                     all_keys.append(output_key)
                     if is_success:
                         successes.append(output_key)
@@ -515,18 +598,39 @@ def merge(args, shard_records: list[dict]) -> dict:
                             "env_seed": episode_env_seed,
                             "policy_seed": episode_policy_seed,
                             "env_index": record.get("env_index"),
+                            "num_selection_decisions": selection_decisions,
+                            "num_random_selection_decisions": (
+                                random_selection_decisions
+                            ),
+                            "num_non_greedy_selection_decisions": (
+                                non_greedy_selection_decisions
+                            ),
                         }
                     )
                     output_index += 1
 
         output_data.attrs["env_args"] = env_args
         output_data.attrs["total"] = total_samples
+        if args.idql_checkpoint is not None:
+            output_data.attrs["selection"] = args.selection
+            output_data.attrs["random_selection_probability"] = float(
+                args.random_selection_probability
+            )
         mask = output.create_group("mask")
         encoded_all = np.asarray(all_keys, dtype="S")
         mask["all_rollouts"] = encoded_all
         mask["all"] = encoded_all
         mask["success"] = np.asarray(successes, dtype="S")
         mask["failure"] = np.asarray(failures, dtype="S")
+        if args.idql_checkpoint is not None:
+            mask["random_exploration"] = np.asarray(
+                random_exploration_episodes,
+                dtype="S",
+            )
+            mask["no_random_exploration"] = np.asarray(
+                no_random_exploration_episodes,
+                dtype="S",
+            )
 
     horizons = np.asarray([ep["horizon"] for ep in episode_records], dtype=np.float64)
     summary = {
@@ -547,6 +651,11 @@ def merge(args, shard_records: list[dict]) -> dict:
             args.execution_horizon if args.idql_checkpoint is not None else None
         ),
         "selection": args.selection if args.idql_checkpoint is not None else None,
+        "random_selection_probability": (
+            args.random_selection_probability
+            if args.idql_checkpoint is not None
+            else None
+        ),
         "clip_actions": args.clip_actions if args.idql_checkpoint is not None else None,
         "inference_success_condition": (
             args.inference_success_condition if args.idql_checkpoint is not None else None
@@ -569,6 +678,22 @@ def merge(args, shard_records: list[dict]) -> dict:
         "num_success": len(successes),
         "num_failure": len(failures),
         "success_rate": len(successes) / max(1, len(all_keys)),
+        "num_selection_decisions": total_selection_decisions,
+        "num_random_selection_decisions": total_random_selection_decisions,
+        "num_non_greedy_selection_decisions": (
+            total_non_greedy_selection_decisions
+        ),
+        "random_selection_decision_fraction": (
+            total_random_selection_decisions / max(1, total_selection_decisions)
+        ),
+        "non_greedy_selection_decision_fraction": (
+            total_non_greedy_selection_decisions
+            / max(1, total_selection_decisions)
+        ),
+        "num_random_exploration_episodes": len(random_exploration_episodes),
+        "num_no_random_exploration_episodes": len(
+            no_random_exploration_episodes
+        ),
         "total_samples": total_samples,
         "mean_horizon": float(np.mean(horizons)) if len(horizons) else 0.0,
         "min_horizon": int(np.min(horizons)) if len(horizons) else 0,
@@ -615,8 +740,23 @@ def main() -> None:
     parser.add_argument("--execution-horizon", type=int, default=8)
     parser.add_argument(
         "--selection",
-        choices=("argmax", "greedy", "softmax", "advantage_softmax"),
+        choices=(
+            "argmax",
+            "greedy",
+            "softmax",
+            "advantage_softmax",
+            "epsilon_greedy",
+        ),
         default="argmax",
+    )
+    parser.add_argument(
+        "--random-selection-probability",
+        type=float,
+        default=0.0,
+        help=(
+            "For epsilon_greedy collection, uniformly sample one candidate with "
+            "this probability and otherwise execute argmax min(Q1,Q2)."
+        ),
     )
     parser.add_argument("--clip-actions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -684,6 +824,22 @@ def main() -> None:
             "--require-success-condition-adapter and "
             "--forbid-success-condition-adapter are mutually exclusive"
         )
+    if not 0.0 <= args.random_selection_probability <= 1.0:
+        parser.error("--random-selection-probability must be in [0, 1]")
+    if (
+        args.selection != "epsilon_greedy"
+        and args.random_selection_probability != 0.0
+    ):
+        parser.error(
+            "--random-selection-probability is only valid with "
+            "--selection epsilon_greedy"
+        )
+    if (
+        args.selection == "epsilon_greedy"
+        and args.random_selection_probability > 0.0
+        and args.num_candidates < 2
+    ):
+        parser.error("epsilon_greedy exploration requires --num-candidates >= 2")
     for key in (
         "num_shards",
         "rollouts_per_shard",

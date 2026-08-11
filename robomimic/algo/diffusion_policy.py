@@ -24,6 +24,29 @@ import robomimic.utils.obs_utils as ObsUtils
 from robomimic.algo import register_algo_factory_func, PolicyAlgo
 
 
+class SuccessConditionResidual(nn.Module):
+    """Zero-initialized residual adapter for success-conditioned DP."""
+
+    def __init__(self, global_cond_dim: int, hidden_dim: int = 128, input_dim: int = 2):
+        super().__init__()
+        self.global_cond_dim = int(global_cond_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.input_dim = int(input_dim)
+        self.net = nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.global_cond_dim),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, obs_cond, success_condition, condition_mask):
+        success_condition = success_condition.to(device=obs_cond.device, dtype=obs_cond.dtype).view(-1, 1)
+        condition_mask = condition_mask.to(device=obs_cond.device, dtype=obs_cond.dtype).view(-1, 1)
+        cond = torch.cat((success_condition, condition_mask), dim=-1)
+        return obs_cond + self.net(cond)
+
+
 @register_algo_factory_func("diffusion_policy")
 def algo_config_to_class(algo_config):
     """
@@ -128,6 +151,16 @@ class DiffusionPolicyUNet(PolicyAlgo):
         self.hazard_model = None
         self.hazard_action_mean = None
         self.hazard_action_std = None
+        self.success_condition_dropout = 0.0
+        self.inference_success_condition = 1.0
+        self.inference_success_condition_mask = 1.0
+        # Optional L2-SP anchor used by chunk-IDQL round-to-round fine-tuning.
+        # These are deliberately plain tensors instead of module buffers: the
+        # original checkpoint remains the source of truth across resumes and
+        # the anchors must not inflate every actor serialization.
+        self.policy_l2_sp_weight = 0.0
+        self._policy_l2_sp_parameter_anchors = None
+        self._policy_l2_sp_numel = 0
 
         if self.reference_margin_enabled and self.hazard_constraint_enabled:
             raise ValueError(
@@ -135,6 +168,61 @@ class DiffusionPolicyUNet(PolicyAlgo):
             )
         if self.hazard_constraint_enabled:
             self._load_hazard_model()
+
+    def configure_policy_l2_sp_anchor(self, source_nets, weight):
+        """Anchor trainable policy parameters to a prior actor state."""
+        weight = float(weight)
+        if weight < 0.0:
+            raise ValueError("policy L2-SP weight must be non-negative")
+        if weight == 0.0:
+            self.policy_l2_sp_weight = 0.0
+            self._policy_l2_sp_parameter_anchors = None
+            self._policy_l2_sp_numel = 0
+            return
+
+        anchors = []
+        missing = []
+        for name, parameter in self.nets.named_parameters():
+            if name not in source_nets:
+                missing.append(name)
+                continue
+            source = source_nets[name]
+            if tuple(source.shape) != tuple(parameter.shape):
+                raise ValueError(
+                    f"policy L2-SP anchor shape mismatch for {name}: "
+                    f"source={tuple(source.shape)}, current={tuple(parameter.shape)}"
+                )
+            anchors.append(
+                (
+                    parameter,
+                    source.detach().to(
+                        device=parameter.device,
+                        dtype=parameter.dtype,
+                    ).clone(),
+                )
+            )
+        if missing:
+            raise KeyError(
+                "source actor is missing policy L2-SP parameters: "
+                f"{missing[:8]}"
+            )
+        self.policy_l2_sp_weight = weight
+        self._policy_l2_sp_parameter_anchors = tuple(anchors)
+        self._policy_l2_sp_numel = sum(
+            int(parameter.numel()) for parameter, _ in anchors
+        )
+        if self._policy_l2_sp_numel <= 0:
+            raise RuntimeError("policy L2-SP anchor contains no parameters")
+
+    def _policy_l2_sp_loss(self):
+        anchors = self._policy_l2_sp_parameter_anchors
+        if not anchors or self._policy_l2_sp_numel <= 0:
+            return None
+        squared_distance = sum(
+            (parameter - anchor).square().sum()
+            for parameter, anchor in anchors
+        )
+        return squared_distance / float(self._policy_l2_sp_numel)
 
     @property
     def reference_margin_enabled(self):
@@ -246,6 +334,153 @@ class DiffusionPolicyUNet(PolicyAlgo):
         if cuda_after is not None:
             torch.cuda.set_rng_state(cuda_after, self.device)
         return current_cond, reference_cond
+
+    def _refresh_ema_parameter_views(self):
+        if self.ema is None:
+            self._model_ema_parameters = None
+            self._averaged_ema_parameters = None
+            return
+        self._model_ema_parameters = list(self.nets.parameters())
+        self._averaged_ema_parameters = list(self.ema.averaged_model.parameters())
+
+    def _global_condition_dim(self) -> int:
+        obs_dim = int(self.nets["policy"]["obs_encoder"].output_shape()[0])
+        return obs_dim * int(self.algo_config.horizon.observation_horizon)
+
+    def _ensure_policy_optimizer_has_trainable_params(self):
+        if "policy" not in self.optimizers:
+            return
+        optimizer = self.optimizers["policy"]
+        optim_param_ids = {id(param) for group in optimizer.param_groups for param in group["params"]}
+        missing = [
+            param
+            for param in self.nets["policy"].parameters()
+            if param.requires_grad and id(param) not in optim_param_ids
+        ]
+        if not missing:
+            return
+        lr = optimizer.param_groups[0].get("lr", 1e-4) if optimizer.param_groups else 1e-4
+        optimizer.add_param_group({"params": missing, "lr": lr})
+
+    def install_success_condition_adapter(self, hidden_dim: int = 128) -> None:
+        """Install a success/failure condition adapter without changing the DP function."""
+        policy = self.nets["policy"]
+        global_cond_dim = self._global_condition_dim()
+        if "condition_adapter" in policy:
+            adapter = policy["condition_adapter"]
+            if int(adapter.global_cond_dim) != global_cond_dim:
+                raise ValueError(
+                    f"condition adapter global_cond_dim={adapter.global_cond_dim}, expected {global_cond_dim}"
+                )
+        else:
+            policy["condition_adapter"] = SuccessConditionResidual(
+                global_cond_dim=global_cond_dim,
+                hidden_dim=int(hidden_dim),
+            ).to(self.device)
+
+        if self.ema is not None:
+            ema_policy = self.ema.averaged_model["policy"]
+            if "condition_adapter" not in ema_policy:
+                ema_policy["condition_adapter"] = deepcopy(policy["condition_adapter"]).to(self.device)
+        self._refresh_ema_parameter_views()
+        self._ensure_policy_optimizer_has_trainable_params()
+
+    def set_inference_success_condition(
+        self,
+        success_condition: float = 1.0,
+        condition_mask: float = 1.0,
+    ) -> None:
+        """Set the condition supplied to the adapter during policy rollouts."""
+        success_condition = float(success_condition)
+        condition_mask = float(condition_mask)
+        if not 0.0 <= success_condition <= 1.0:
+            raise ValueError(f"success_condition must be in [0, 1], got {success_condition}")
+        if not 0.0 <= condition_mask <= 1.0:
+            raise ValueError(f"condition_mask must be in [0, 1], got {condition_mask}")
+        self.inference_success_condition = success_condition
+        self.inference_success_condition_mask = condition_mask
+
+    def _install_success_condition_adapter_from_state(self, state_dict) -> None:
+        prefix = "policy.condition_adapter.net."
+        final_weight_key = prefix + "2.weight"
+        first_weight_key = prefix + "0.weight"
+        if final_weight_key not in state_dict:
+            return
+        global_cond_dim = int(state_dict[final_weight_key].shape[0])
+        hidden_dim = int(state_dict[first_weight_key].shape[0])
+        if global_cond_dim != self._global_condition_dim():
+            raise ValueError(
+                f"checkpoint condition adapter global_cond_dim={global_cond_dim}, "
+                f"expected {self._global_condition_dim()}"
+            )
+        self.install_success_condition_adapter(hidden_dim=hidden_dim)
+
+    def _success_condition_inputs(
+        self,
+        batch_size: int,
+        *,
+        batch=None,
+        success_condition=None,
+        condition_mask=None,
+        validate: bool = False,
+    ):
+        if success_condition is None:
+            if batch is not None and "success_condition" in batch:
+                success_condition = batch["success_condition"]
+            elif batch is not None and "anti_failure" in batch:
+                success_condition = 1.0 - batch["anti_failure"]
+            elif batch is not None:
+                raise KeyError(
+                    "success-conditioned DP requires anti_failure or success_condition in every training batch"
+                )
+            else:
+                success_condition = torch.ones(batch_size, device=self.device)
+        if condition_mask is None:
+            if batch is not None and "success_condition_mask" in batch:
+                condition_mask = batch["success_condition_mask"]
+            else:
+                condition_mask = torch.ones_like(success_condition)
+        success_condition = success_condition.to(device=self.device, dtype=torch.float32).view(-1)
+        condition_mask = condition_mask.to(device=self.device, dtype=torch.float32).view(-1)
+        if success_condition.shape[0] != batch_size or condition_mask.shape[0] != batch_size:
+            raise ValueError(
+                f"success condition batch mismatch: condition={success_condition.shape}, "
+                f"mask={condition_mask.shape}, batch_size={batch_size}"
+            )
+        dropout = float(getattr(self, "success_condition_dropout", 0.0) or 0.0)
+        if dropout > 0.0 and not validate:
+            keep = (torch.rand(batch_size, device=self.device) >= dropout).to(torch.float32)
+            condition_mask = condition_mask * keep
+            success_condition = success_condition * condition_mask
+        return success_condition, condition_mask
+
+    def _apply_success_condition(
+        self,
+        obs_cond,
+        *,
+        nets,
+        batch=None,
+        success_condition=None,
+        condition_mask=None,
+        validate: bool = False,
+    ):
+        policy = nets["policy"]
+        if "condition_adapter" not in policy:
+            return obs_cond, None
+        success_condition, condition_mask = self._success_condition_inputs(
+            obs_cond.shape[0],
+            batch=batch,
+            success_condition=success_condition,
+            condition_mask=condition_mask,
+            validate=validate,
+        )
+        conditioned = policy["condition_adapter"](obs_cond, success_condition, condition_mask)
+        stats = {
+            "success_condition_mean": success_condition.mean(),
+            "condition_mask_mean": condition_mask.mean(),
+            "failure_condition_fraction": ((success_condition < 0.5) & (condition_mask > 0.5)).float().mean(),
+        }
+        return conditioned, stats
     
     def process_batch_for_training(self, batch):
         """
@@ -268,6 +503,12 @@ class DiffusionPolicyUNet(PolicyAlgo):
         input_batch["obs"] = {k: batch["obs"][k][:, :To, :] for k in batch["obs"]}
         input_batch["goal_obs"] = batch.get("goal_obs", None) # goals may not be present
         input_batch["actions"] = batch["actions"][:, :Tp, :]
+        has_condition_adapter = "condition_adapter" in self.nets["policy"]
+        if has_condition_adapter and "anti_failure" not in batch and "success_condition" not in batch:
+            raise KeyError(
+                "success-conditioned DP requires actor datasets to provide anti_failure labels; "
+                "demo/success must be 0 and failure must be 1"
+            )
         input_batch["anti_failure"] = batch.get(
             "anti_failure",
             torch.zeros(batch["actions"].shape[0], device=batch["actions"].device),
@@ -276,6 +517,15 @@ class DiffusionPolicyUNet(PolicyAlgo):
             "hazard_failure",
             torch.zeros(batch["actions"].shape[0], device=batch["actions"].device),
         )
+        if has_condition_adapter:
+            if "success_condition" in batch:
+                input_batch["success_condition"] = batch["success_condition"]
+            else:
+                input_batch["success_condition"] = 1.0 - input_batch["anti_failure"]
+            input_batch["success_condition_mask"] = batch.get(
+                "success_condition_mask",
+                torch.ones_like(input_batch["success_condition"]),
+            )
         if self.hazard_constraint_enabled:
             if "hazard_context" not in batch:
                 raise KeyError(
@@ -397,6 +647,12 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 obs_cond, reference_obs_cond = self._encode_current_and_reference(inputs)
             else:
                 obs_cond = self._encode_obs(inputs, self.nets)
+            obs_cond, condition_stats = self._apply_success_condition(
+                obs_cond,
+                nets=self.nets,
+                batch=batch,
+                validate=validate,
+            )
             
             # sample noise to add to actions
             noise = torch.randn(actions.shape, device=self.device)
@@ -594,11 +850,31 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 )
             else:
                 loss = per_sample_energy.mean()
+
+            base_loss = loss
+            policy_l2_sp_loss = self._policy_l2_sp_loss()
+            if policy_l2_sp_loss is not None:
+                weighted_policy_l2_sp_loss = (
+                    float(self.policy_l2_sp_weight) * policy_l2_sp_loss
+                )
+                loss = base_loss + weighted_policy_l2_sp_loss
+            else:
+                weighted_policy_l2_sp_loss = None
             
             # logging
             losses = {
-                "l2_loss": loss
+                "l2_loss": base_loss,
+                "total_loss": loss,
             }
+            if policy_l2_sp_loss is not None:
+                losses.update(
+                    {
+                        "policy_l2_sp_loss": policy_l2_sp_loss,
+                        "weighted_policy_l2_sp_loss": (
+                            weighted_policy_l2_sp_loss
+                        ),
+                    }
+                )
             if self.reference_margin_enabled:
                 losses.update(
                     {
@@ -632,6 +908,8 @@ class DiffusionPolicyUNet(PolicyAlgo):
                     }
                 )
             info["losses"] = TensorUtils.detach(losses)
+            if condition_stats is not None:
+                info["success_condition"] = TensorUtils.detach(condition_stats)
 
             if not validate:
                 # gradient step
@@ -639,6 +917,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
                     net=self.nets,
                     optim=self.optimizers["policy"],
                     loss=loss,
+                    grad_sync_fn=getattr(self, "gradient_sync_fn", None),
                 )
                 
                 # update Exponential Moving Average of the model weights
@@ -685,7 +964,17 @@ class DiffusionPolicyUNet(PolicyAlgo):
             loss_log (dict): name -> summary statistic
         """
         log = super(DiffusionPolicyUNet, self).log_info(info)
-        log["Loss"] = info["losses"]["l2_loss"].item()
+        log["Loss"] = info["losses"].get(
+            "total_loss", info["losses"]["l2_loss"]
+        ).item()
+        if "policy_l2_sp_loss" in info["losses"]:
+            log["Base_Loss"] = info["losses"]["l2_loss"].item()
+            log["L2SP/RawLoss"] = info["losses"][
+                "policy_l2_sp_loss"
+            ].item()
+            log["L2SP/WeightedLoss"] = info["losses"][
+                "weighted_policy_l2_sp_loss"
+            ].item()
         for key, name in (
             ("positive_loss", "ReferenceMargin/PositiveLoss"),
             ("failure_loss", "ReferenceMargin/FailureLoss"),
@@ -710,6 +999,9 @@ class DiffusionPolicyUNet(PolicyAlgo):
         ):
             if key in info["losses"]:
                 log[name] = info["losses"][key].item()
+        if "success_condition" in info:
+            for key, value in info["success_condition"].items():
+                log[f"SuccessCondition/{key}"] = value.item()
         if "policy_grad_norms" in info:
             log["Policy_Grad_Norms"] = info["policy_grad_norms"]
         return log
@@ -793,6 +1085,21 @@ class DiffusionPolicyUNet(PolicyAlgo):
 
         # reshape observation to (B,obs_horizon*obs_dim)
         obs_cond = obs_features.flatten(start_dim=1)
+        obs_cond, _ = self._apply_success_condition(
+            obs_cond,
+            nets=nets,
+            success_condition=torch.full(
+                (B,),
+                float(self.inference_success_condition),
+                device=self.device,
+            ),
+            condition_mask=torch.full(
+                (B,),
+                float(self.inference_success_condition_mask),
+                device=self.device,
+            ),
+            validate=True,
+        )
 
         # initialize action from Guassian noise
         noisy_action = torch.randn(
@@ -850,6 +1157,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
             load_optimizers (bool): whether to load optimizers and lr_schedulers from the model_dict;
                 used when resuming training from a checkpoint
         """
+        self._install_success_condition_adapter_from_state(model_dict["nets"])
         self.nets.load_state_dict(model_dict["nets"])
 
         # for backwards compatibility

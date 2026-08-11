@@ -67,6 +67,28 @@ It offers a broad set of demonstration datasets collected on robot manipulation 
 
 The robomimic framework also makes reproducing the results from different benchmarks and datasets easy. See the [datasets page](https://robomimic.github.io/docs/datasets/overview.html) for more information on downloading datasets and reproducing experiments.
 
+### Multi-GPU Tool Hang chunk-IDQL
+
+The project-specific chunk-IDQL launcher supports single-node distributed
+training through `torchrun`. For an eight-GPU Tool Hang run:
+
+```bash
+conda activate robomimic_stable
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+ROBOMIMIC_PYTHON="$CONDA_PREFIX/bin/python" \
+CHUNK_NUM_GPUS=8 \
+CHUNK_BATCH_SIZE=12 \
+CHUNK_NUM_WORKERS=2 \
+bash run_rgb_dp_chunk_idql.sh tool_hang train_chunk_idql_resilient
+```
+
+`CHUNK_BATCH_SIZE` and `CHUNK_NUM_WORKERS` are per GPU. Thus, the example has
+an effective global batch size of 96 and starts 16 data-loading workers. Ranks
+receive separate shuffled sampler shards (with standard padding when the sample
+count is not divisible by eight) and synchronized parameter updates; only rank
+zero writes TensorBoard data, summaries, and checkpoints. Resume a distributed
+checkpoint with the same `CHUNK_NUM_GPUS` value.
+
 ## Docker
 
 You can use the `Dockerfile` to easily build a containerized environment for setting up robomimic with Python 3.9, Miniconda, robosuite, and PyTorch (CPU/GPU support).

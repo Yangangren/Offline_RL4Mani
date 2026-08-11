@@ -6,15 +6,18 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import random
 from collections import OrderedDict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import h5py
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -72,6 +75,266 @@ ACTOR_CONDITION_DEFINITION = (
     "human_demo=1; success_rollout=0; failure_rollout=0"
 )
 DYNAMICS_PREDICTION_MODE = "actor_encoder_direct"
+JOINT_ACTOR_INITIALIZATIONS = frozenset(
+    ("pretrained_dp_joint", "source_chunk_idql_joint")
+)
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    enabled: bool
+    rank: int
+    local_rank: int
+    world_size: int
+    backend: str
+    device: torch.device
+
+    @property
+    def is_main_process(self) -> bool:
+        return self.rank == 0
+
+
+def initialize_distributed(args: argparse.Namespace) -> DistributedContext:
+    """Initialize one torchrun process per GPU, while preserving serial use."""
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    launched_by_torchrun = all(
+        name in os.environ for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")
+    )
+    requested = bool(getattr(args, "distributed", False) or env_world_size > 1)
+    if not requested:
+        device = TorchUtils.get_torch_device(
+            try_to_use_cuda=args.device == "cuda"
+        )
+        return DistributedContext(
+            enabled=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            backend="none",
+            device=device,
+        )
+    if not launched_by_torchrun:
+        raise RuntimeError(
+            "distributed training must be launched with torchrun (or "
+            "python -m torch.distributed.run)"
+        )
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    cli_local_rank = getattr(args, "local_rank", None)
+    if cli_local_rank is not None and int(cli_local_rank) != local_rank:
+        raise RuntimeError(
+            f"--local-rank={cli_local_rank} disagrees with "
+            f"LOCAL_RANK={local_rank}"
+        )
+    if args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("distributed CUDA training requested without CUDA")
+        device_count = int(torch.cuda.device_count())
+        if local_rank < 0 or local_rank >= device_count:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} is outside the {device_count} visible "
+                "CUDA devices"
+            )
+        torch.cuda.set_device(local_rank)
+        torch.backends.cudnn.benchmark = True
+        device = torch.device("cuda", local_rank)
+        default_backend = "nccl"
+    else:
+        device = torch.device("cpu")
+        default_backend = "gloo"
+    requested_backend = str(getattr(args, "distributed_backend", "auto"))
+    backend = default_backend if requested_backend == "auto" else requested_backend
+    if backend == "nccl" and device.type != "cuda":
+        raise ValueError("the NCCL distributed backend requires --device cuda")
+    if backend != "nccl" and device.type == "cuda":
+        raise ValueError("distributed CUDA training requires the NCCL backend")
+    dist.init_process_group(backend=backend, init_method="env://")
+    context = DistributedContext(
+        enabled=True,
+        rank=int(dist.get_rank()),
+        local_rank=local_rank,
+        world_size=int(dist.get_world_size()),
+        backend=backend,
+        device=device,
+    )
+    if context.world_size != env_world_size:
+        raise RuntimeError(
+            f"initialized world_size={context.world_size}, expected {env_world_size}"
+        )
+    return context
+
+
+def seed_process(seed: int, device: torch.device) -> None:
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    # Avoid torch.manual_seed here: it seeds every visible CUDA generator and
+    # can make each torchrun process touch GPUs owned by other local ranks.
+    torch.random.default_generator.manual_seed(int(seed))
+    if device.type == "cuda":
+        torch.cuda.manual_seed(int(seed))
+
+
+def capture_process_rng_state(device: torch.device) -> dict[str, Any]:
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if device.type == "cuda":
+        state["cuda_local"] = torch.cuda.get_rng_state(device).cpu()
+    return state
+
+
+def restore_process_rng_state(
+    state: dict[str, Any] | None,
+    device: torch.device,
+) -> None:
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if device.type == "cuda" and "cuda_local" in state:
+        torch.cuda.set_rng_state(state["cuda_local"].cpu(), device=device)
+
+
+@torch.no_grad()
+def broadcast_module_state(
+    modules: list[nn.Module],
+    context: DistributedContext,
+) -> None:
+    if not context.enabled:
+        return
+    for module in modules:
+        for parameter in module.parameters():
+            dist.broadcast(parameter.data, src=0)
+        for buffer in module.buffers():
+            dist.broadcast(buffer.data, src=0)
+
+
+@torch.no_grad()
+def broadcast_module_buffers(
+    modules: list[nn.Module],
+    context: DistributedContext,
+) -> None:
+    if not context.enabled:
+        return
+    for module in modules:
+        for buffer in module.buffers():
+            dist.broadcast(buffer.data, src=0)
+
+
+@torch.no_grad()
+def all_reduce_gradients(
+    parameters,
+    context: DistributedContext,
+    bucket_cap_mb: float = 25.0,
+) -> None:
+    """Average dense gradients in bounded flat buckets across all ranks."""
+    if not context.enabled:
+        return
+    cap_bytes = max(1, int(float(bucket_cap_mb) * 1024 * 1024))
+    trainable_parameters = [
+        parameter for parameter in parameters if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        return
+    globally_used = torch.tensor(
+        [parameter.grad is not None for parameter in trainable_parameters],
+        dtype=torch.int32,
+        device=context.device,
+    )
+    dist.all_reduce(globally_used, op=dist.ReduceOp.MAX)
+    bucket: list[torch.Tensor] = []
+    bucket_bytes = 0
+    bucket_key = None
+
+    def flush() -> None:
+        nonlocal bucket, bucket_bytes, bucket_key
+        if not bucket:
+            return
+        flat = torch.cat([gradient.reshape(-1) for gradient in bucket])
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.mul_(1.0 / float(context.world_size))
+        offset = 0
+        for gradient in bucket:
+            count = int(gradient.numel())
+            gradient.copy_(flat[offset : offset + count].view_as(gradient))
+            offset += count
+        bucket = []
+        bucket_bytes = 0
+        bucket_key = None
+
+    for parameter, parameter_is_used in zip(
+        trainable_parameters,
+        globally_used.tolist(),
+    ):
+        if not parameter_is_used:
+            continue
+        if parameter.grad is None:
+            parameter.grad = torch.zeros_like(
+                parameter,
+                memory_format=torch.preserve_format,
+            )
+        gradient = parameter.grad
+        if gradient.is_sparse:
+            raise RuntimeError("chunk-IDQL distributed gradients must be dense")
+        key = (gradient.device, gradient.dtype)
+        gradient_bytes = int(gradient.numel() * gradient.element_size())
+        if bucket and (
+            key != bucket_key or bucket_bytes + gradient_bytes > cap_bytes
+        ):
+            flush()
+        bucket_key = key
+        bucket.append(gradient)
+        bucket_bytes += gradient_bytes
+    flush()
+
+
+def mean_distributed_scalars(
+    metrics: dict[str, float],
+    context: DistributedContext,
+) -> dict[str, float]:
+    if not context.enabled or not metrics:
+        return metrics
+    keys = sorted(metrics)
+    values = torch.tensor(
+        [float(metrics[key]) for key in keys],
+        dtype=torch.float64,
+        device=context.device,
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    values.mul_(1.0 / float(context.world_size))
+    return {key: float(value) for key, value in zip(keys, values.cpu().tolist())}
+
+
+def gather_rank_runtime_states(
+    loader_generator: torch.Generator,
+    context: DistributedContext,
+) -> list[dict[str, Any]]:
+    local_state = {
+        "rank": int(context.rank),
+        "rng_state": capture_process_rng_state(context.device),
+        "loader_generator_state": loader_generator.get_state(),
+    }
+    if not context.enabled:
+        return [local_state]
+    gathered: list[dict[str, Any] | None] = [None] * context.world_size
+    dist.all_gather_object(gathered, local_state)
+    if any(state is None for state in gathered):
+        raise RuntimeError("failed to gather all distributed RNG states")
+    return [state for state in gathered if state is not None]
+
+
+def trains_joint_actor(args: argparse.Namespace) -> bool:
+    return str(args.initialization) in JOINT_ACTOR_INITIALIZATIONS
+
+
+def uses_source_l2_sp(args: argparse.Namespace) -> bool:
+    return (
+        float(args.source_actor_l2_sp_weight) > 0.0
+        or float(args.source_critic_l2_sp_weight) > 0.0
+    )
 
 
 class RiseChunkActionValueNetwork(nn.Module):
@@ -173,20 +436,15 @@ class RiseChunkActionValueNetwork(nn.Module):
             self.nets["context"](encoded, late_fusion)
         )
 
-    def action_and_successor(
+    def predict_successor(
         self,
         context: torch.Tensor,
-        acts: torch.Tensor,
-        action_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_repr = self.nets["action_encoder"](context, acts, action_mask)
+        action_repr: torch.Tensor,
+    ) -> torch.Tensor:
         fused = self.nets["state_action_fusion"](
             torch.cat((context, action_repr), dim=-1)
         )
-        delta = self.nets["transition_delta"](fused)
-        gated_delta = self.nets["transition_gate"](fused) * delta
-        predicted_next = self.nets["next_context_norm"](context + gated_delta)
-        return action_repr, gated_delta, predicted_next
+        return self.nets["dynamics_predictor"](fused)
 
     def forward(
         self,
@@ -203,26 +461,19 @@ class RiseChunkActionValueNetwork(nn.Module):
                 f"got {tuple(acts.shape)}"
             )
         context = self.encode_context(obs_dict, goal_dict)
-        action_repr, delta, predicted_next = self.action_and_successor(
+        action_repr = self.nets["action_encoder"](
             context, acts, action_mask
         )
-        q_inputs = [context, action_repr]
-        if self.q_head_uses_delta:
-            q_inputs.append(delta)
-        q = self.nets["q_head"](torch.cat(q_inputs, dim=-1))
+        q = self.nets["q_head"](torch.cat((context, action_repr), dim=-1))
         if not return_aux:
             return q
-        result = {
+        predicted_next = self.predict_successor(context, action_repr)
+        return {
             "q": q,
             "context": context,
             "action_repr": action_repr,
+            "predicted_next_encoder": predicted_next,
         }
-        if self.dynamics_prediction_mode == DYNAMICS_PREDICTION_MODE:
-            result["predicted_next_encoder"] = predicted_next
-        else:
-            result["predicted_delta"] = delta
-            result["predicted_next_context"] = predicted_next
-        return result
 
 
 def make_rise_chunk_value_networks(
@@ -238,8 +489,6 @@ def make_rise_chunk_value_networks(
     num_critics: int = 2,
     critic_group_norm: bool = False,
     late_fusion_key: str | None = "robot0_gripper_qpos",
-    q_head_uses_delta: bool = False,
-    dynamics_prediction_mode: str = DYNAMICS_PREDICTION_MODE,
 ) -> tuple[nn.ModuleList, nn.ModuleList, RiseValueNetwork]:
     encoder_kwargs = ObsUtils.obs_encoder_kwargs_from_config(
         actor_algo.obs_config.encoder
@@ -259,8 +508,6 @@ def make_rise_chunk_value_networks(
             num_action_conv_layers=int(num_action_conv_layers),
             dropout=float(dropout),
             late_fusion_key=late_fusion_key,
-            q_head_uses_delta=q_head_uses_delta,
-            dynamics_prediction_mode=dynamics_prediction_mode,
         )
         if critic_group_norm:
             critic = replace_bn_with_gn(critic)
@@ -317,14 +564,19 @@ def copy_matching_encoder_state(
     }
 
 
-def copy_deployed_dp_encoder_state(module: nn.Module, actor_algo) -> dict[str, int]:
-    """Copy, but do not share, the deployed DP raw-observation encoder."""
+def deployed_actor_obs_encoder(actor_algo) -> nn.Module:
+    """Return the EMA observation encoder used by the deployed actor."""
     actor_nets = (
         actor_algo.ema.averaged_model
         if actor_algo.ema is not None
         else actor_algo.nets
     )
-    source = actor_nets["policy"]["obs_encoder"]
+    return actor_nets["policy"]["obs_encoder"]
+
+
+def copy_deployed_dp_encoder_state(module: nn.Module, actor_algo) -> dict[str, int]:
+    """Copy, but do not share, the deployed DP raw-observation encoder."""
+    source = deployed_actor_obs_encoder(actor_algo)
     # ObservationGroupEncoder is reconstructed from config with BatchNorm, while
     # DiffusionPolicy converts its deployed visual encoder to GroupNorm after
     # construction. Match that deployed architecture before the strict state
@@ -471,13 +723,13 @@ def source_condition_labels(
     *,
     current_index: int,
 ) -> torch.Tensor:
-    """Read outcome conditioning labels independently of critic rewards."""
+    """Map human demos to 1 and every rollout to 0, independent of rewards."""
     batch_size = int(raw_batch["actions"].shape[0])
-    labels_by_time = raw_batch.get("actor_condition")
-    label_source = "actor_condition"
+    labels_by_time = raw_batch.get("source_is_expert")
+    label_source = "source_is_expert"
     if labels_by_time is None:
         raise KeyError(
-            "conditioned actor batch is missing actor_condition; rebuild the "
+            "conditioned actor batch is missing source_is_expert; rebuild the "
             "mixed dataset with the current build_rgb_dp_idql_dataset.py"
         )
     if labels_by_time.ndim < 2 or labels_by_time.shape[1] <= current_index:
@@ -489,91 +741,21 @@ def source_condition_labels(
     labels = labels_by_time[:, current_index].reshape(batch_size, -1)
     if labels.shape[1] != 1:
         raise ValueError(
-            "actor condition requires one scalar outcome label per "
+            "actor condition requires one scalar source label per "
             f"transition, got shape={tuple(labels.shape)}"
         )
     labels = labels[:, 0].float()
     zeros = torch.zeros_like(labels)
     ones = torch.ones_like(labels)
-    is_negative = torch.isclose(labels, zeros, atol=1e-6, rtol=0.0)
-    is_positive = torch.isclose(labels, ones, atol=1e-6, rtol=0.0)
-    if not torch.all(is_negative | is_positive):
-        invalid = labels[~(is_negative | is_positive)]
+    is_rollout = torch.isclose(labels, zeros, atol=1e-6, rtol=0.0)
+    is_human = torch.isclose(labels, ones, atol=1e-6, rtol=0.0)
+    if not torch.all(is_rollout | is_human):
+        invalid = labels[~(is_rollout | is_human)]
         raise ValueError(
             f"actor condition expected {label_source} values 0 or 1, got "
             f"values={invalid[:8].detach().cpu().tolist()}"
         )
-    return is_positive.to(dtype=torch.float32)
-
-
-def source_expert_labels(
-    raw_batch: dict,
-    *,
-    current_index: int,
-) -> torch.Tensor:
-    """Read the expert-source mask used only by --actor-demo-only."""
-    batch_size = int(raw_batch["actions"].shape[0])
-    labels_by_time = raw_batch.get("source_is_expert")
-    label_source = "source_is_expert"
-    if labels_by_time is None:
-        labels_by_time = raw_batch["rewards"]
-        label_source = "legacy RISE rewards"
-    if labels_by_time.ndim < 2 or labels_by_time.shape[1] <= current_index:
-        raise ValueError(
-            f"shared batch {label_source} does not contain the current "
-            f"transition at index {current_index}: "
-            f"shape={tuple(labels_by_time.shape)}"
-        )
-    labels = labels_by_time[:, current_index].reshape(batch_size, -1)
-    if labels.shape[1] != 1:
-        raise ValueError(
-            "expert-source mask requires one scalar label per transition, "
-            f"got shape={tuple(labels.shape)}"
-        )
-    labels = labels[:, 0].float()
-    zeros = torch.zeros_like(labels)
-    ones = torch.ones_like(labels)
-    is_non_expert = torch.isclose(labels, zeros, atol=1e-6, rtol=0.0)
-    is_expert = torch.isclose(labels, ones, atol=1e-6, rtol=0.0)
-    if not torch.all(is_non_expert | is_expert):
-        invalid = labels[~(is_non_expert | is_expert)]
-        raise ValueError(
-            f"expert-source mask expected {label_source} values 0 or 1, got "
-            f"values={invalid[:8].detach().cpu().tolist()}"
-        )
-    return is_expert
-
-
-def select_actor_rows(
-    raw_batch: dict,
-    *,
-    current_index: int,
-    demo_only: bool,
-) -> tuple[dict, torch.Tensor]:
-    """Return the actor view of a shared batch and its selected row mask."""
-    batch_size = int(raw_batch["actions"].shape[0])
-    if not demo_only:
-        rows = torch.ones(
-            batch_size,
-            dtype=torch.bool,
-            device=raw_batch["actions"].device,
-        )
-        return raw_batch, rows
-
-    is_demo = source_expert_labels(
-        raw_batch,
-        current_index=current_index,
-    )
-
-    def take_rows(tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.ndim == 0 or int(tensor.shape[0]) != batch_size:
-            raise ValueError(
-                "all shared-batch tensors must have the same leading batch "
-                f"dimension {batch_size}, got shape={tuple(tensor.shape)}"
-            )
-        return tensor[is_demo]
-
-    return TensorUtils.map_tensor(raw_batch, take_rows), is_demo
+    return is_human.to(dtype=torch.float32)
 
 
 def add_actor_condition(
@@ -606,6 +788,8 @@ def audit_actor_conditions(
         "failure_rollout": 0,
     }
     transition_counts = {key: 0 for key in episode_counts}
+    redundant_condition_episodes = 0
+    redundant_condition_mismatches = 0
     source_names = {
         "expert": "human_demo",
         "non_expert_success": "success_rollout",
@@ -622,14 +806,14 @@ def audit_actor_conditions(
                     f"data/{episode_key} has unsupported rise_source={source!r}"
                 )
             source_name = source_names[source]
-            expected = 0.0 if source == "non_expert_failure" else 1.0
-            if "actor_condition" not in episode:
+            expected = 1.0 if source == "expert" else 0.0
+            if "source_is_expert" not in episode:
                 raise ValueError(
-                    f"data/{episode_key} is missing actor_condition; rebuild "
-                    f"the {reward_mode}-reward dataset so human and successful rollout "
-                    "rows use condition 1 and failure rows use condition 0"
+                    f"data/{episode_key} is missing source_is_expert; rebuild "
+                    f"the {reward_mode}-reward dataset so human rows use "
+                    "condition 1 and all rollout rows use condition 0"
                 )
-            label_key = "actor_condition"
+            label_key = "source_is_expert"
             labels = np.asarray(episode[label_key][:], dtype=np.float32)
             if labels.size < 1 or not np.allclose(
                 labels,
@@ -642,6 +826,19 @@ def audit_actor_conditions(
                     f"data/{episode_key} source={source!r} must map to "
                     f"condition={expected}, got {label_key}={unique[:8]}"
                 )
+            if "actor_condition" in episode:
+                redundant_condition_episodes += 1
+                redundant_labels = np.asarray(
+                    episode["actor_condition"][:],
+                    dtype=np.float32,
+                )
+                if redundant_labels.shape != labels.shape or not np.allclose(
+                    redundant_labels,
+                    expected,
+                    atol=1e-6,
+                    rtol=0.0,
+                ):
+                    redundant_condition_mismatches += 1
             episode_counts[source_name] += 1
             transition_counts[source_name] += int(labels.size)
     if episode_counts["human_demo"] == 0:
@@ -652,11 +849,23 @@ def audit_actor_conditions(
         == 0
     ):
         raise ValueError("conditioned actor dataset contains no rollout data")
+    if redundant_condition_mismatches:
+        print(
+            "[chunk_idql] ignoring stale actor_condition labels in "
+            f"{redundant_condition_mismatches} episodes; actor conditions are "
+            "derived only from source_is_expert",
+            flush=True,
+        )
     return {
         "definition": ACTOR_CONDITION_DEFINITION,
-        "positive_sources": ["human_demo", "success_rollout"],
-        "negative_sources": ["failure_rollout"],
-        "dataset_key": "actor_condition",
+        "positive_sources": ["human_demo"],
+        "negative_sources": ["success_rollout", "failure_rollout"],
+        "dataset_key": "source_is_expert",
+        "redundant_actor_condition_key_loaded": False,
+        "redundant_actor_condition_episodes": redundant_condition_episodes,
+        "redundant_actor_condition_mismatch_episodes": (
+            redundant_condition_mismatches
+        ),
         "condition_mask": 1.0,
         "episode_counts": episode_counts,
         "transition_counts": transition_counts,
@@ -670,6 +879,7 @@ def process_chunk_batch(
     *,
     chunk_horizon: int,
     discount: float,
+    reward_mode: str = "task",
 ) -> dict[str, Any]:
     """Extract a semi-MDP transition at the first executable DP action."""
     current_index = int(actor_algo.algo_config.horizon.observation_horizon) - 1
@@ -681,7 +891,28 @@ def process_chunk_batch(
         )
 
     actions = raw_batch["actions"][:, current_index:end_index]
-    rewards = raw_batch["rewards"][:, current_index:end_index].float()
+    if "rewards" not in raw_batch:
+        raise KeyError("chunk-IDQL batch is missing rewards")
+    critic_rewards = raw_batch["rewards"]
+    if str(reward_mode) == "task":
+        if "task_rewards" not in raw_batch:
+            raise KeyError(
+                "chunk-IDQL critic requires task_rewards in every batch; "
+                "rebuild the dataset with --reward-mode task"
+            )
+        task_rewards = raw_batch["task_rewards"]
+        if task_rewards.shape != critic_rewards.shape or not torch.equal(
+            task_rewards,
+            critic_rewards,
+        ):
+            raise ValueError(
+                "chunk-IDQL critic rewards must exactly equal preserved source "
+                "task_rewards"
+            )
+        critic_rewards = task_rewards
+    elif str(reward_mode) != "rise":
+        raise ValueError(f"unsupported chunk critic reward_mode={reward_mode!r}")
+    rewards = critic_rewards[:, current_index:end_index].float()
     dones = raw_batch["dones"][:, current_index:end_index].float()
     if rewards.ndim == 3:
         rewards = rewards.squeeze(-1)
@@ -800,6 +1031,53 @@ def configure_encoder_target_random_crops(encoder: nn.Module) -> None:
             module.train()
 
 
+ParameterL2SPAnchor = tuple[tuple[nn.Parameter, torch.Tensor], ...]
+
+
+def make_parameter_l2_sp_anchor(
+    module: nn.Module,
+    source_state: dict[str, torch.Tensor],
+    *,
+    label: str,
+) -> ParameterL2SPAnchor:
+    """Copy a source checkpoint's parameters without registering new buffers."""
+    anchors = []
+    missing = []
+    for name, parameter in module.named_parameters():
+        if name not in source_state:
+            missing.append(name)
+            continue
+        source = source_state[name]
+        if tuple(source.shape) != tuple(parameter.shape):
+            raise ValueError(
+                f"{label} L2-SP shape mismatch for {name}: "
+                f"source={tuple(source.shape)}, current={tuple(parameter.shape)}"
+            )
+        anchors.append(
+            (
+                parameter,
+                source.detach().to(
+                    device=parameter.device,
+                    dtype=parameter.dtype,
+                ).clone(),
+            )
+        )
+    if missing:
+        raise KeyError(f"{label} source is missing parameters: {missing[:8]}")
+    if not anchors:
+        raise RuntimeError(f"{label} L2-SP anchor contains no parameters")
+    return tuple(anchors)
+
+
+def parameter_l2_sp_loss(anchor: ParameterL2SPAnchor) -> torch.Tensor:
+    squared_distance = sum(
+        (parameter - source).square().sum()
+        for parameter, source in anchor
+    )
+    numel = sum(int(parameter.numel()) for parameter, _ in anchor)
+    return squared_distance / float(numel)
+
+
 def compute_chunk_losses(
     critics: nn.ModuleList,
     targets: nn.ModuleList,
@@ -812,6 +1090,8 @@ def compute_chunk_losses(
     use_huber: bool,
     dynamics_weight: float,
     dynamics_cosine_weight: float,
+    critic_l2_sp_anchors: tuple[ParameterL2SPAnchor, ...] | None = None,
+    critic_l2_sp_weight: float = 0.0,
 ) -> tuple[list[torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
     device = batch["actions"].device
     crop_seeds = torch.randint(
@@ -880,9 +1160,14 @@ def compute_chunk_losses(
     dynamics_rmse = []
     weighted_dynamics_losses = []
     q_losses = []
-    for output, target_features in zip(
-        outputs,
-        target_next_encoder_features,
+    critic_l2_sp_losses = []
+    weighted_critic_l2_sp_losses = []
+    if critic_l2_sp_anchors is not None and (
+        len(critic_l2_sp_anchors) != len(critics)
+    ):
+        raise ValueError("critic L2-SP anchor count does not match critics")
+    for index, (output, target_features) in enumerate(
+        zip(outputs, target_next_encoder_features)
     ):
         q_loss = regression(output["q"], q_backup)
         dyn_l1, dyn_cos, dyn_rmse = masked_dynamics_losses(
@@ -894,12 +1179,25 @@ def compute_chunk_losses(
             float(dynamics_weight) * dyn_l1
             + float(dynamics_cosine_weight) * dyn_cos
         )
-        critic_losses.append(q_loss + dynamics_loss)
+        if critic_l2_sp_anchors is not None:
+            critic_l2_sp_loss = parameter_l2_sp_loss(
+                critic_l2_sp_anchors[index]
+            )
+        else:
+            critic_l2_sp_loss = q_loss.new_zeros(())
+        weighted_critic_l2_sp_loss = (
+            float(critic_l2_sp_weight) * critic_l2_sp_loss
+        )
+        critic_losses.append(
+            q_loss + dynamics_loss + weighted_critic_l2_sp_loss
+        )
         q_losses.append(q_loss)
         dynamics_l1.append(dyn_l1)
         dynamics_cosine.append(dyn_cos)
         dynamics_rmse.append(dyn_rmse)
         weighted_dynamics_losses.append(dynamics_loss)
+        critic_l2_sp_losses.append(critic_l2_sp_loss)
+        weighted_critic_l2_sp_losses.append(weighted_critic_l2_sp_loss)
 
     with fork_rng_with_seed(vf_crop_seed, device):
         vf_pred = vf(obs_dict=batch["obs"], goal_dict=batch["goal_obs"])
@@ -919,11 +1217,28 @@ def compute_chunk_losses(
             for index, loss in enumerate(critic_losses)
         },
         **{
+            f"critic/q{index + 1}_l2_sp_loss": loss.detach()
+            for index, loss in enumerate(critic_l2_sp_losses)
+        },
+        **{
+            f"critic/q{index + 1}_weighted_l2_sp_loss": loss.detach()
+            for index, loss in enumerate(weighted_critic_l2_sp_losses)
+        },
+        **{
             f"critic/q{index + 1}_mean": output["q"].mean().detach()
             for index, output in enumerate(outputs)
         },
         "critic/q_target_mean": q_backup.mean().detach(),
         "critic/q_ensemble_std": q_predictions.std(dim=1).mean().detach(),
+        "critic/l2_sp_loss": torch.stack(
+            critic_l2_sp_losses
+        ).mean().detach(),
+        "critic/weighted_l2_sp_loss": torch.stack(
+            weighted_critic_l2_sp_losses
+        ).mean().detach(),
+        "critic/l2_sp_weight": q_predictions.new_tensor(
+            float(critic_l2_sp_weight)
+        ),
         "vf/loss": vf_loss.detach(),
         "vf/value_mean": vf_pred.mean().detach(),
         "vf/target_q_min_mean": target_q_min.mean().detach(),
@@ -1023,6 +1338,7 @@ def update_networks(
     *,
     target_tau: float,
     max_gradient_norm: float | None,
+    gradient_sync_fn=None,
 ) -> None:
     for critic, target, optimizer, loss in zip(
         critics, targets, critic_optimizers, critic_losses
@@ -1033,6 +1349,7 @@ def update_networks(
             loss=loss,
             max_grad_norm=max_gradient_norm,
             retain_graph=False,
+            grad_sync_fn=gradient_sync_fn,
         )
         with torch.no_grad():
             TorchUtils.soft_update(critic, target, tau=float(target_tau))
@@ -1042,6 +1359,7 @@ def update_networks(
         loss=vf_loss,
         max_grad_norm=max_gradient_norm,
         retain_graph=False,
+        grad_sync_fn=gradient_sync_fn,
     )
 
 
@@ -1208,7 +1526,17 @@ def checkpoint_payload(
     global_step: int,
     history: list[dict],
     loader_generator: torch.Generator,
+    rank_runtime_states: list[dict[str, Any]] | None = None,
+    distributed_context: DistributedContext | None = None,
 ) -> dict[str, Any]:
+    rank_zero_runtime = (
+        rank_runtime_states[0] if rank_runtime_states is not None else None
+    )
+    distributed_world_size = int(
+        distributed_context.world_size
+        if distributed_context is not None
+        else 1
+    )
     return {
         "rise_style_rgb_idql": True,
         "rise_style_rgb_chunk_idql": True,
@@ -1261,8 +1589,12 @@ def checkpoint_payload(
         "pretrained_dp_checkpoint": str(pretrained_dp_checkpoint),
         "task": str(args.task),
         "dataset": str(args.dataset),
-        "single_dataloader": True,
-        "sampling": "uniform_shuffled_SequenceDataset_indices",
+        "single_dataloader": distributed_world_size == 1,
+        "sampling": (
+            "distributed_shuffled_SequenceDataset_indices"
+            if distributed_world_size > 1
+            else "uniform_shuffled_SequenceDataset_indices"
+        ),
         "reward_mode": str(args.reward_mode),
         "reward_definition": REWARD_DEFINITIONS[args.reward_mode],
         "critic_reward_source": (
@@ -1288,7 +1620,6 @@ def checkpoint_payload(
                     "frozen_deployed_dp_actor_from_pretrained_checkpoint"
                     if args.initialization == "pretrained_dp_frozen"
                     else "frozen_one_step_idql_posttrained_ema_actor"
-                )
                 )
             )
         ),
@@ -1381,25 +1712,74 @@ def checkpoint_payload(
         "actor_lr_warmup_steps": int(args.actor_lr_warmup_steps),
         "actor_lr_total_steps": int(args.actor_lr_total_steps),
         "actor_lr_num_cycles": float(args.actor_lr_num_cycles),
+        "critic_lr": float(args.critic_lr),
+        "encoder_lr": float(args.encoder_lr),
+        "vf_lr": float(args.vf_lr),
+        "source_actor_l2_sp_weight": float(
+            args.source_actor_l2_sp_weight
+        ),
+        "source_critic_l2_sp_weight": float(
+            args.source_critic_l2_sp_weight
+        ),
+        "source_l2_sp_definition": (
+            "mean_squared_parameter_distance_to_source_chunk_checkpoint"
+        ),
+        "source_l2_sp_applies_to": {
+            "actor": "all_trainable_policy_parameters",
+            "critics": "all_online_critic_parameters_independently",
+            "target_critics": "none_follow_online_critics_by_polyak",
+            "vf": "none",
+        },
         "actor_frozen": bool(not trains_joint_actor(args)),
         "actor_encoder_trainable": bool(trains_joint_actor(args)),
         "actor_ema_optimization_step": int(actor_ema_optimization_step),
-        "rng_state": rng_state(),
-        "loader_generator_state": loader_generator.get_state(),
+        "rng_state": (
+            rank_zero_runtime["rng_state"]
+            if rank_zero_runtime is not None
+            else rng_state()
+        ),
+        "loader_generator_state": (
+            rank_zero_runtime["loader_generator_state"]
+            if rank_zero_runtime is not None
+            else loader_generator.get_state()
+        ),
+        "distributed_training": {
+            "enabled": bool(
+                distributed_context is not None
+                and distributed_context.enabled
+            ),
+            "world_size": int(
+                distributed_world_size
+            ),
+            "backend": (
+                distributed_context.backend
+                if distributed_context is not None
+                else "none"
+            ),
+            "gradient_sync": "mean_all_reduce_before_optimizer_step",
+        },
+        "distributed_rank_states": rank_runtime_states,
     }
 
 
 def train(args: argparse.Namespace) -> dict[str, Any]:
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
+    distributed = initialize_distributed(args)
+    args.distributed = bool(distributed.enabled)
+    args.distributed_rank = int(distributed.rank)
+    args.distributed_local_rank = int(distributed.local_rank)
+    args.distributed_world_size = int(distributed.world_size)
+    if distributed.is_main_process:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed.enabled:
+        dist.barrier()
+    device = distributed.device
+    # All ranks construct identical initial parameters. Rank-specific training
+    # RNG streams are installed after model initialization and resume loading.
+    seed_process(args.seed, device)
 
     resume_state = None
     source_for_warm_start = None
+    source_for_regularization = None
     if args.resume_checkpoint is not None:
         resume_state = torch.load(
             args.resume_checkpoint,
@@ -1408,6 +1788,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         )
         if not resume_state.get("rise_style_rgb_chunk_idql", False):
             raise ValueError("resume checkpoint is not a chunk IDQL checkpoint")
+        saved_distributed = resume_state.get("distributed_training", {})
+        if (
+            distributed.enabled
+            and bool(saved_distributed.get("enabled", False))
+            and int(saved_distributed.get("world_size", 1))
+            != distributed.world_size
+        ):
+            raise ValueError(
+                "distributed resume requires the same world size: checkpoint="
+                f"{saved_distributed.get('world_size')} requested="
+                f"{distributed.world_size}"
+            )
 
         saved_dynamics_mode = str(
             resume_state.get(
@@ -1450,8 +1842,32 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"resume reward_mode={saved_reward_mode} does not match "
                 f"requested reward_mode={args.reward_mode}"
             )
+        saved_args = resume_state.get("args", {})
+        resume_float_fields = {
+            "critic_lr": float(args.critic_lr),
+            "encoder_lr": float(args.encoder_lr),
+            "vf_lr": float(args.vf_lr),
+            "source_actor_l2_sp_weight": float(
+                args.source_actor_l2_sp_weight
+            ),
+            "source_critic_l2_sp_weight": float(
+                args.source_critic_l2_sp_weight
+            ),
+        }
+        for field, requested_value in resume_float_fields.items():
+            saved_value = float(saved_args.get(field, 0.0))
+            if saved_value != requested_value:
+                raise ValueError(
+                    f"resume {field}={saved_value} does not match requested "
+                    f"{field}={requested_value}"
+                )
         if saved_initialization in JOINT_ACTOR_INITIALIZATIONS:
-            saved_args = resume_state.get("args", {})
+            saved_actor_lr = float(saved_args.get("actor_lr", 0.0))
+            if saved_actor_lr != float(args.actor_lr):
+                raise ValueError(
+                    f"resume actor_lr={saved_actor_lr} does not match requested "
+                    f"actor_lr={args.actor_lr}"
+                )
             saved_actor_scheduler = str(
                 saved_args.get("actor_lr_scheduler", "constant")
             )
@@ -1519,6 +1935,33 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         pretrained_dp_checkpoint = str(
             resume_state["pretrained_dp_checkpoint"]
         )
+        if uses_source_l2_sp(args):
+            saved_source = resume_state.get("source_chunk_idql_checkpoint")
+            if saved_source is None:
+                raise ValueError(
+                    "regularized resume checkpoint does not record its source "
+                    "chunk checkpoint"
+                )
+            saved_source_path = Path(saved_source).expanduser().resolve()
+            if args.source_chunk_idql_checkpoint is None:
+                args.source_chunk_idql_checkpoint = saved_source_path
+            elif args.source_chunk_idql_checkpoint != saved_source_path:
+                raise ValueError(
+                    "resume source_chunk_idql_checkpoint="
+                    f"{saved_source_path} does not match requested "
+                    f"{args.source_chunk_idql_checkpoint}"
+                )
+            if not saved_source_path.is_file():
+                raise FileNotFoundError(
+                    "L2-SP source chunk checkpoint does not exist: "
+                    f"{saved_source_path}"
+                )
+            source_for_regularization = torch.load(
+                saved_source_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            validate_chunk_source(source_for_regularization, args)
     elif args.initialization in (
         "source_idql_frozen",
         "source_chunk_idql_joint",
@@ -1537,6 +1980,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             validate_source(source_for_warm_start, args)
         else:
             validate_chunk_source(source_for_warm_start, args)
+            if uses_source_l2_sp(args):
+                source_for_regularization = source_for_warm_start
         pretrained_dp_checkpoint = str(
             source_for_warm_start["pretrained_dp_checkpoint"]
         )
@@ -1633,13 +2078,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         actor_algo.algo_config.horizon.prediction_horizon
     )
     args.actor_action_horizon = actor_horizon
+    chunk_reference_state = (
+        source_for_warm_start or source_for_regularization or resume_state
+    )
     if (
         args.initialization == "source_chunk_idql_joint"
-        and int(source_for_warm_start.get("action_dim", -1))
+        and int(chunk_reference_state.get("action_dim", -1))
         != int(args.action_dim)
     ):
         raise ValueError(
-            f"source action_dim={source_for_warm_start.get('action_dim')} "
+            f"source action_dim={chunk_reference_state.get('action_dim')} "
             f"does not match actor action_dim={args.action_dim}"
         )
 
@@ -1684,12 +2132,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         )
     if resume_state is not None:
         saved_args = resume_state.get("args", {})
-        schedule_fields = (
+        schedule_fields = [
             ("critic_vf_lr_scheduler", str),
             ("critic_vf_lr_warmup_steps", int),
             ("critic_vf_lr_total_steps", int),
             ("critic_vf_lr_num_cycles", float),
-        )
+        ]
+        if trains_joint_actor(args):
+            schedule_fields.append(("actor_lr_total_steps", int))
         for field, cast in schedule_fields:
             saved_value = cast(saved_args[field])
             requested_value = cast(getattr(args, field))
@@ -1727,6 +2177,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     resume_state.get("actor_ema_optimization_step", 0)
                 )
             configure_conditioned_actor(actor_algo, args)
+        if float(args.source_actor_l2_sp_weight) > 0.0:
+            if source_for_regularization is None:
+                raise RuntimeError(
+                    "actor L2-SP requested without a loaded source checkpoint"
+                )
+            actor_algo.configure_policy_l2_sp_anchor(
+                source_for_regularization["actor_model"]["nets"],
+                args.source_actor_l2_sp_weight,
+            )
         actor_algo.set_train()
         actor_audit = actor_trainability(actor_algo)
     elif actor_audit is None:
@@ -1925,15 +2384,44 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     f"match checkpoint global_step={global_step}"
                 )
         history = list(resume_state.get("history", []))
-        loader_generator.set_state(
-            resume_state["loader_generator_state"].cpu()
-        )
-        restore_rng_state(resume_state.get("rng_state"))
-        print(
-            f"Resumed {args.resume_checkpoint} at epoch={start_epoch} "
-            f"step={global_step}",
-            flush=True,
-        )
+        rank_runtime_states = resume_state.get("distributed_rank_states")
+        if distributed.enabled and rank_runtime_states is not None:
+            if len(rank_runtime_states) != distributed.world_size:
+                raise ValueError(
+                    "distributed checkpoint rank-state count does not match "
+                    f"world_size={distributed.world_size}"
+                )
+            rank_runtime = rank_runtime_states[distributed.rank]
+            if int(rank_runtime.get("rank", -1)) != distributed.rank:
+                raise ValueError("distributed checkpoint rank states are unordered")
+            loader_generator.set_state(
+                rank_runtime["loader_generator_state"].cpu()
+            )
+            restore_process_rng_state(
+                rank_runtime.get("rng_state"),
+                device,
+            )
+        elif distributed.enabled:
+            # A legacy single-process checkpoint has no per-rank stochastic
+            # state. Preserve its model/optimizer state and create independent
+            # deterministic streams for the new ranks.
+            loader_generator.manual_seed(int(args.seed) + distributed.rank)
+            seed_process(int(args.seed) + distributed.rank, device)
+        else:
+            loader_generator.set_state(
+                resume_state["loader_generator_state"].cpu()
+            )
+            saved_rng_state = resume_state.get("rng_state")
+            if saved_rng_state and "cuda_local" in saved_rng_state:
+                restore_process_rng_state(saved_rng_state, device)
+            else:
+                restore_rng_state(saved_rng_state)
+        if distributed.is_main_process:
+            print(
+                f"Resumed {args.resume_checkpoint} at epoch={start_epoch} "
+                f"step={global_step}",
+                flush=True,
+            )
     elif (
         source_for_warm_start is not None
         and args.initialization == "source_chunk_idql_joint"
@@ -1953,16 +2441,59 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             strict=True,
         )
         vf.load_state_dict(source_for_warm_start["vf"], strict=True)
-        print(
-            "Warm-started actor, actor EMA, twin critics, target critics, VF, "
-            "and dynamics target from "
-            f"{args.source_chunk_idql_checkpoint}; starting fresh optimizers, "
-            "LR schedules, epoch=0, and global_step=0",
-            flush=True,
+        if distributed.is_main_process:
+            print(
+                "Warm-started actor, actor EMA, twin critics, target critics, "
+                "VF, and dynamics target from "
+                f"{args.source_chunk_idql_checkpoint}; starting fresh "
+                "optimizers, LR schedules, epoch=0, and global_step=0",
+                flush=True,
+            )
+    critic_l2_sp_anchors = None
+    if float(args.source_critic_l2_sp_weight) > 0.0:
+        if source_for_regularization is None:
+            raise RuntimeError(
+                "critic L2-SP requested without a loaded source checkpoint"
+            )
+        critic_l2_sp_anchors = tuple(
+            make_parameter_l2_sp_anchor(
+                critic,
+                source_state,
+                label=f"critic_{index + 1}",
+            )
+            for index, (critic, source_state) in enumerate(
+                zip(critics, source_for_regularization["critics"])
+            )
         )
+        if len(critic_l2_sp_anchors) != len(critics):
+            raise ValueError(
+                "source critic count does not match L2-SP critic count"
+            )
     configure_target_random_crops(targets)
     configure_encoder_target_random_crops(dynamics_target_encoder)
-    del resume_state, source_for_warm_start
+
+    synchronized_modules: list[nn.Module] = [
+        actor_algo.nets,
+        critics,
+        targets,
+        dynamics_target_encoder,
+        vf,
+    ]
+    if actor_algo.ema is not None:
+        synchronized_modules.append(actor_algo.ema.averaged_model)
+    if getattr(actor_algo, "reference_nets", None) is not None:
+        synchronized_modules.append(actor_algo.reference_nets)
+    broadcast_module_state(synchronized_modules, distributed)
+    gradient_sync_fn = (
+        (lambda parameters: all_reduce_gradients(parameters, distributed))
+        if distributed.enabled
+        else None
+    )
+    if trains_joint_actor(args):
+        actor_algo.gradient_sync_fn = gradient_sync_fn
+    if distributed.enabled and resume_state is None:
+        seed_process(int(args.seed) + distributed.rank, device)
+    del resume_state, source_for_warm_start, source_for_regularization
 
     if not trains_joint_actor(args):
         actor_algo.nets.cpu()
@@ -2016,6 +2547,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "vf_training": (
             "head_from_step_zero_raw_observation_encoder_delayed"
         ),
+        "source_l2_sp_regularization": {
+            "enabled": bool(uses_source_l2_sp(args)),
+            "definition": (
+                "mean_squared_parameter_distance_to_source_chunk_checkpoint"
+            ),
+            "actor_weight": float(args.source_actor_l2_sp_weight),
+            "critic_weight": float(args.source_critic_l2_sp_weight),
+            "actor_scope": "all_trainable_policy_parameters",
+            "critic_scope": "each_online_critic_all_parameters",
+            "target_critic_scope": "none_polyak_tracks_online",
+            "vf_scope": "none",
+        },
         "warm_start": warm_start_audit,
     }
     startup = {
@@ -2050,10 +2593,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         },
         "loader": {
             "class": dataset.__class__.__name__,
-            "num_loaders": 1,
-            "sampler": "RandomSampler_without_replacement",
+            "num_loaders": int(distributed.world_size),
+            "sampler": loader.sampler.__class__.__name__,
             "balanced_sampling": False,
             "batch_size": int(args.batch_size),
+            "batch_size_per_rank": int(args.batch_size),
+            "effective_global_batch_size": int(
+                args.batch_size * distributed.world_size
+            ),
             "num_batches": int(len(loader)),
             "steps_per_epoch": int(args.steps_per_epoch),
             "steps_per_epoch_source": args.steps_per_epoch_source,
@@ -2114,6 +2661,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "actor_lr_warmup_steps": int(args.actor_lr_warmup_steps),
             "actor_lr_total_steps": int(args.actor_lr_total_steps),
             "actor_lr_num_cycles": float(args.actor_lr_num_cycles),
+            "source_actor_l2_sp_weight": float(
+                args.source_actor_l2_sp_weight
+            ),
+            "source_critic_l2_sp_weight": float(
+                args.source_critic_l2_sp_weight
+            ),
             "conditioned_actor": bool(args.conditioned_actor),
             "condition_dropout": float(args.condition_dropout),
             "condition_hidden_dim": int(args.condition_hidden_dim),
@@ -2146,10 +2699,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 else None
             ),
         },
+        "distributed": {
+            "enabled": bool(distributed.enabled),
+            "world_size": int(distributed.world_size),
+            "backend": distributed.backend,
+            "launcher": "torchrun" if distributed.enabled else "python",
+            "gradient_sync": "mean_all_reduce_before_optimizer_step",
+            "rank_zero_writes_only": True,
+        },
     }
-    write_json(args.output_dir / "training_config.json", startup)
-    print(json.dumps(jsonable(startup), indent=2), flush=True)
-    writer = make_tensorboard_writer(args.output_dir)
+    if distributed.is_main_process:
+        write_json(args.output_dir / "training_config.json", startup)
+        print(json.dumps(jsonable(startup), indent=2), flush=True)
+        writer = make_tensorboard_writer(args.output_dir)
+    else:
+        writer = None
     max_grad = (
         None
         if args.max_gradient_norm is None or args.max_gradient_norm <= 0.0
@@ -2157,6 +2721,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     for epoch in range(start_epoch + 1, int(args.epochs) + 1):
+        if distributed.enabled and hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)
         iterator = iter(loader)
         records: list[dict[str, float]] = []
         for step_in_epoch in range(1, int(args.steps_per_epoch) + 1):
@@ -2182,6 +2748,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             set_representation_trainable(critics, encoder_trainable)
             vf.train()
             set_vf_encoder_trainable(vf, vf_encoder_trainable)
+            broadcast_module_buffers(
+                (
+                    [actor_algo.nets, critics, vf]
+                    if trains_joint_actor(args)
+                    else [critics, vf]
+                ),
+                distributed,
+            )
             ramp = min(
                 1.0,
                 float(global_step + 1)
@@ -2202,6 +2776,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 use_huber=args.use_huber,
                 dynamics_weight=effective_dynamics,
                 dynamics_cosine_weight=effective_dynamics_cosine,
+                critic_l2_sp_anchors=critic_l2_sp_anchors,
+                critic_l2_sp_weight=args.source_critic_l2_sp_weight,
             )
             update_networks(
                 critics,
@@ -2213,6 +2789,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 vf_loss,
                 target_tau=args.target_tau,
                 max_gradient_norm=max_grad,
+                gradient_sync_fn=gradient_sync_fn,
             )
 
             # update condition diffusion actor
@@ -2300,11 +2877,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 metrics["lr/vf_encoder"] = float(
                     vf_optimizer.param_groups[1]["lr"]
                 )
+            metrics["distributed/world_size"] = float(distributed.world_size)
+            metrics["data/effective_global_batch_rows"] = float(
+                raw_batch["actions"].shape[0] * distributed.world_size
+            )
+            metrics = mean_distributed_scalars(metrics, distributed)
             records.append(metrics)
             if writer is not None:
                 for key, value in metrics.items():
                     writer.add_scalar(key, value, global_step)
-            if global_step % int(args.log_every) == 0:
+            if (
+                distributed.is_main_process
+                and global_step % int(args.log_every) == 0
+            ):
                 print(
                     json.dumps(
                         {
@@ -2335,60 +2920,76 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "last": str(args.output_dir / "last.pt"),
             },
         }
-        write_json(args.output_dir / "partial_summary.json", partial)
+        if distributed.is_main_process:
+            write_json(args.output_dir / "partial_summary.json", partial)
 
         if (
             epoch % int(args.save_every_epochs) == 0
             or epoch == int(args.epochs)
         ):
-            payload = checkpoint_payload(
-                args=args,
-                actor_model=actor_algo.serialize(),
-                actor_ema_optimization_step=int(
-                    actor_algo.ema.optimization_step
-                    if actor_algo.ema is not None
-                    else 0
-                ),
-                pretrained_dp_checkpoint=pretrained_dp_checkpoint,
-                critics=critics,
-                targets=targets,
-                dynamics_target_encoder=dynamics_target_encoder,
-                dynamics_target_last_sync_step=(
-                    dynamics_target_last_sync_step
-                ),
-                vf=vf,
-                critic_optimizers=critic_optimizers,
-                vf_optimizer=vf_optimizer,
-                critic_lr_schedulers=critic_lr_schedulers,
-                vf_lr_scheduler=vf_lr_scheduler,
-                action_stats=action_stats,
-                epoch=epoch,
-                global_step=global_step,
-                history=history,
-                loader_generator=loader_generator,
+            rank_runtime_states = (
+                gather_rank_runtime_states(loader_generator, distributed)
+                if distributed.enabled
+                else None
             )
-            latest = args.output_dir / "latest.pt"
-            atomic_torch_save(payload, latest)
-            if epoch == int(args.epochs):
-                replace_with_hardlink(latest, args.output_dir / "last.pt")
-            if (
-                int(args.snapshot_every_epochs) > 0
-                and epoch % int(args.snapshot_every_epochs) == 0
-            ):
-                replace_with_hardlink(
-                    latest,
-                    args.output_dir / "models" / f"model_epoch_{epoch}.pt",
+            if distributed.is_main_process:
+                payload = checkpoint_payload(
+                    args=args,
+                    actor_model=actor_algo.serialize(),
+                    actor_ema_optimization_step=int(
+                        actor_algo.ema.optimization_step
+                        if actor_algo.ema is not None
+                        else 0
+                    ),
+                    pretrained_dp_checkpoint=pretrained_dp_checkpoint,
+                    critics=critics,
+                    targets=targets,
+                    dynamics_target_encoder=dynamics_target_encoder,
+                    dynamics_target_last_sync_step=(
+                        dynamics_target_last_sync_step
+                    ),
+                    vf=vf,
+                    critic_optimizers=critic_optimizers,
+                    vf_optimizer=vf_optimizer,
+                    critic_lr_schedulers=critic_lr_schedulers,
+                    vf_lr_scheduler=vf_lr_scheduler,
+                    action_stats=action_stats,
+                    epoch=epoch,
+                    global_step=global_step,
+                    history=history,
+                    loader_generator=loader_generator,
+                    rank_runtime_states=rank_runtime_states,
+                    distributed_context=distributed,
                 )
-            print(
-                f"Saved {latest} at epoch={epoch} step={global_step}",
-                flush=True,
-            )
+                latest = args.output_dir / "latest.pt"
+                atomic_torch_save(payload, latest)
+                if epoch == int(args.epochs):
+                    replace_with_hardlink(latest, args.output_dir / "last.pt")
+                if (
+                    int(args.snapshot_every_epochs) > 0
+                    and epoch % int(args.snapshot_every_epochs) == 0
+                ):
+                    replace_with_hardlink(
+                        latest,
+                        args.output_dir / "models" / f"model_epoch_{epoch}.pt",
+                    )
+                print(
+                    f"Saved {latest} at epoch={epoch} step={global_step}",
+                    flush=True,
+                )
+        if distributed.enabled:
+            dist.barrier()
 
     if writer is not None:
         writer.flush()
         writer.close()
-    final = json.loads((args.output_dir / "partial_summary.json").read_text())
-    write_json(args.output_dir / "summary.json", final)
+    if distributed.is_main_process:
+        final = json.loads((args.output_dir / "partial_summary.json").read_text())
+        write_json(args.output_dir / "summary.json", final)
+    else:
+        final = {}
+    if distributed.enabled:
+        dist.barrier()
     return final
 
 
@@ -2424,6 +3025,27 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument(
+        "--distributed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable torchrun data-parallel training. This is also enabled "
+            "automatically when WORLD_SIZE is greater than one."
+        ),
+    )
+    parser.add_argument(
+        "--distributed-backend",
+        choices=("auto", "nccl", "gloo"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--local-rank",
+        "--local_rank",
+        type=int,
+        default=None,
+        help="Local process rank supplied by torchrun; the environment wins.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
@@ -2464,6 +3086,15 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--actor-lr", type=float, default=1e-4)
     parser.add_argument(
+        "--source-actor-l2-sp-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Mean-squared parameter anchoring to the source chunk actor. "
+            "Only valid with source_chunk_idql_joint; zero disables it."
+        ),
+    )
+    parser.add_argument(
         "--actor-lr-scheduler",
         choices=("constant", "cosine"),
         default="cosine",
@@ -2482,6 +3113,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--condition-dropout", type=float, default=0.0)
     parser.add_argument("--condition-hidden-dim", type=int, default=128)
     parser.add_argument("--critic-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--source-critic-l2-sp-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Mean-squared parameter anchoring of each online critic to its "
+            "source chunk critic. Zero disables it."
+        ),
+    )
     parser.add_argument("--encoder-lr", type=float, default=1e-5)
     parser.add_argument("--vf-lr", type=float, default=1e-4)
     parser.add_argument(
@@ -2596,13 +3236,33 @@ def main() -> None:
         parser.error("RISE clipped double Q requires at least two critics")
     if args.dynamics_target_sync_interval <= 0:
         parser.error("dynamics-target-sync-interval must be positive")
+    for name in ("actor_lr", "critic_lr", "encoder_lr", "vf_lr"):
+        if float(getattr(args, name)) <= 0.0:
+            parser.error(f"{name.replace('_', '-')} must be positive")
+    for name in (
+        "source_actor_l2_sp_weight",
+        "source_critic_l2_sp_weight",
+    ):
+        if float(getattr(args, name)) < 0.0:
+            parser.error(f"{name.replace('_', '-')} must be non-negative")
+    if uses_source_l2_sp(args) and (
+        args.initialization != "source_chunk_idql_joint"
+    ):
+        parser.error(
+            "source L2-SP regularization requires "
+            "--initialization source_chunk_idql_joint"
+        )
     if not 0.0 <= args.condition_dropout < 1.0:
         parser.error("condition-dropout must be in [0, 1)")
     if args.hdf5_cache_mode == "none":
         args.hdf5_cache_mode = None
     if not args.critic_late_fusion_key:
         args.critic_late_fusion_key = None
-    train(args)
+    try:
+        train(args)
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

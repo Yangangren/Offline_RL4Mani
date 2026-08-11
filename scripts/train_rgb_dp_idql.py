@@ -36,7 +36,7 @@ from robomimic.algo.diffusion_policy import replace_bn_with_gn
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = (
     ROOT
-    / "datasets/square/idql/square_rgb_dp_idql_200demo_100success_94failure.hdf5"
+    / "datasets/square/idql/square_rgb_dp_idql_200demo_100success_94failure_task_reward.hdf5"
 )
 DEFAULT_CHECKPOINT = (
     ROOT
@@ -44,8 +44,12 @@ DEFAULT_CHECKPOINT = (
 )
 DEFAULT_OUTPUT = (
     ROOT
-    / "trained_models/square_rgb_dp_idql_rise/200demo_100success_94failure"
+    / "trained_models/square_rgb_dp_idql_rise/200demo_100success_94failure_task_reward"
 )
+REWARD_DEFINITIONS = {
+    "task": "source_task_reward",
+    "rise": "expert_transition=1; non_expert_transition=0",
+}
 
 
 def jsonable(value: Any) -> Any:
@@ -92,6 +96,17 @@ def initialize_actor_from_deployed_ema(actor_algo) -> bool:
     if hasattr(actor_algo, "_refresh_ema_parameter_views"):
         actor_algo._refresh_ema_parameter_views()
     return True
+
+
+def actor_matches_deployed_ema(actor_algo) -> bool:
+    """Return whether the trainable policy exactly matches deployed EMA."""
+    if actor_algo.ema is None:
+        return False
+    actor_state = actor_algo.nets.state_dict()
+    ema_state = actor_algo.ema.averaged_model.state_dict()
+    return actor_state.keys() == ema_state.keys() and all(
+        torch.equal(actor_state[key], ema_state[key]) for key in actor_state
+    )
 
 
 def make_step_lr_scheduler(
@@ -356,7 +371,23 @@ def build_single_loader(
         config.train.batch_size = int(args.batch_size)
         config.train.num_data_workers = int(args.num_workers)
         config.train.dataset_keys = list(
-            dict.fromkeys(list(config.train.dataset_keys) + ["actions", "rewards", "dones"])
+            dict.fromkeys(
+                list(config.train.dataset_keys)
+                + ["actions", "rewards", "dones"]
+                + (
+                    ["task_rewards"]
+                    if getattr(args, "reward_mode", None) == "task"
+                    else []
+                )
+                + (
+                    ["source_is_expert"]
+                    if (
+                        getattr(args, "reward_mode", None) == "task"
+                        or getattr(args, "conditioned_actor", False)
+                    )
+                    else []
+                )
+            )
         )
 
     dataset = TrainUtils.dataset_factory(
@@ -389,7 +420,21 @@ def build_single_loader(
         raise RuntimeError("failed to install pretrained DP action normalization")
 
     generator = torch.Generator()
-    generator.manual_seed(int(args.seed))
+    distributed_world_size = int(
+        getattr(args, "distributed_world_size", 1)
+    )
+    distributed_rank = int(getattr(args, "distributed_rank", 0))
+    distributed_sampler = None
+    if distributed_world_size > 1:
+        distributed_sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=distributed_world_size,
+            rank=distributed_rank,
+            shuffle=True,
+            seed=int(args.seed),
+            drop_last=False,
+        )
+    generator.manual_seed(int(args.seed) + distributed_rank)
     loader_kwargs: dict[str, Any] = {}
     if int(args.num_workers) > 0:
         loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
@@ -397,9 +442,14 @@ def build_single_loader(
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=int(args.batch_size),
-        shuffle=True,
-        sampler=None,
-        drop_last=len(dataset) >= int(args.batch_size),
+        shuffle=distributed_sampler is None,
+        sampler=distributed_sampler,
+        drop_last=(
+            len(distributed_sampler)
+            if distributed_sampler is not None
+            else len(dataset)
+        )
+        >= int(args.batch_size),
         num_workers=int(args.num_workers),
         pin_memory=bool(args.pin_memory and actor_algo.device.type == "cuda"),
         generator=generator,
@@ -450,10 +500,15 @@ def parameter_count(module: nn.Module) -> int:
 
 
 def rise_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
+    reward_alignment = (
+        "source_environment_task_reward"
+        if args.reward_mode == "task"
+        else "expert_transition_reward_1_non_expert_transition_reward_0"
+    )
     return {
         "matched": [
             "one uniformly shuffled mixed SequenceDataset",
-            "expert_transition_reward_1_non_expert_transition_reward_0",
+            reward_alignment,
             "independent_raw_observation_Q1_Q2_target_Q1_target_Q2_V",
             "one_step_IQL_Q_and_expectile_V_equations",
             "Q_then_target_soft_update_then_V_update_order",
@@ -500,6 +555,12 @@ def process_critic_batch(
         obs_normalization_stats=obs_normalization_stats,
     )
     actions = critic_batch["actions"]
+    expected_shape = (int(actions.shape[0]), int(actor_algo.ac_dim))
+    if actions.ndim != 2 or tuple(actions.shape) != expected_shape:
+        raise ValueError(
+            "one-step IDQL critic requires actions [B, action_dim], got "
+            f"shape={tuple(actions.shape)}; action chunks are not accepted"
+        )
     if not torch.isfinite(actions).all():
         raise ValueError("critic actions contain non-finite values")
     action_min = actions.min().item()
@@ -669,14 +730,89 @@ def dataset_audit(
     dataset_path: Path,
     dataset_size: int,
     expected_task: str | None = None,
+    expected_reward_mode: str | None = None,
 ) -> dict[str, Any]:
     with h5py.File(dataset_path, "r") as handle:
         reward_definition = str(handle.attrs.get("reward_definition", ""))
-        if reward_definition != "expert_transition=1; non_expert_transition=0":
+        reward_mode = str(handle.attrs.get("reward_mode", ""))
+        if not reward_mode and reward_definition == REWARD_DEFINITIONS["rise"]:
+            reward_mode = "rise"
+        if reward_mode not in REWARD_DEFINITIONS:
             raise ValueError(
-                "dataset does not use the RISE reward definition: "
+                "dataset has an unsupported or missing reward mode: "
+                f"reward_mode={reward_mode!r}, definition={reward_definition!r}"
+            )
+        expected_definition = REWARD_DEFINITIONS[reward_mode]
+        if reward_definition != expected_definition:
+            raise ValueError(
+                f"dataset reward_mode={reward_mode!r} requires "
+                f"reward_definition={expected_definition!r}, got "
                 f"{reward_definition!r}"
             )
+        if expected_reward_mode is not None and reward_mode != expected_reward_mode:
+            raise ValueError(
+                f"dataset reward_mode={reward_mode!r} does not match requested "
+                f"reward_mode={expected_reward_mode!r}; rebuild the dataset with "
+                f"--reward-mode {expected_reward_mode} --overwrite, or explicitly "
+                f"train with --reward-mode {reward_mode}"
+            )
+        task_reward_audit = None
+        if reward_mode == "task":
+            missing_source_labels = [
+                key
+                for key, episode in handle["data"].items()
+                if "source_is_expert" not in episode
+            ]
+            if missing_source_labels:
+                raise ValueError(
+                    "task-reward dataset is missing source_is_expert labels for "
+                    f"episodes={missing_source_labels[:8]}; rebuild it"
+                )
+            task_reward_audit = {}
+            for episode_key, episode in handle["data"].items():
+                for key in ("rewards", "task_rewards"):
+                    if key not in episode:
+                        raise ValueError(
+                            f"task-reward dataset data/{episode_key} is missing {key}"
+                        )
+                rewards = np.asarray(episode["rewards"][:], dtype=np.float32)
+                task_rewards = np.asarray(
+                    episode["task_rewards"][:],
+                    dtype=np.float32,
+                )
+                if not np.array_equal(rewards, task_rewards):
+                    raise ValueError(
+                        f"task-reward dataset data/{episode_key} rewards do not "
+                        "match the preserved source task_rewards"
+                    )
+                if not np.isfinite(rewards).all():
+                    raise ValueError(
+                        f"task-reward dataset data/{episode_key} contains "
+                        "non-finite rewards"
+                    )
+                source = episode.attrs.get("rise_source", "unknown")
+                if isinstance(source, bytes):
+                    source = source.decode("utf-8")
+                source = str(source)
+                source_stats = task_reward_audit.setdefault(
+                    source,
+                    {
+                        "episodes": 0,
+                        "transitions": 0,
+                        "positive_reward_episodes": 0,
+                        "positive_reward_transitions": 0,
+                        "reward_sum": 0.0,
+                    },
+                )
+                source_stats["episodes"] += 1
+                source_stats["transitions"] += int(rewards.size)
+                source_stats["positive_reward_episodes"] += int(
+                    np.any(rewards > 0.5)
+                )
+                source_stats["positive_reward_transitions"] += int(
+                    np.count_nonzero(rewards > 0.5)
+                )
+                source_stats["reward_sum"] += float(rewards.sum())
         masks = {
             key: int(len(value))
             for key, value in handle.get("mask", {}).items()
@@ -701,7 +837,9 @@ def dataset_audit(
         "sequence_dataset_size": int(dataset_size),
         "hdf5_total_transitions": hdf5_total,
         "masks": masks,
+        "reward_mode": reward_mode,
         "reward_definition": reward_definition,
+        "task_reward_audit": task_reward_audit,
         "builder_summary": builder_summary,
     }
 
@@ -788,13 +926,24 @@ def checkpoint_payload(
         "dataset": str(args.dataset),
         "single_dataloader": True,
         "sampling": "uniform_shuffled_SequenceDataset_indices",
-        "reward_definition": "expert_transition=1; non_expert_transition=0",
+        "reward_mode": str(args.reward_mode),
+        "reward_definition": REWARD_DEFINITIONS[args.reward_mode],
         "actor_training_objective": "diffusion_bc_full_chunk",
         "actor_source_mask": "none_all_shared_batch_rows",
         "actor_data_mode": "all_human_success_failure_rows",
-        "critic_training_objective": "rise_one_step_iql",
+        "critic_training_objective": (
+            "task_reward_one_step_iql"
+            if args.reward_mode == "task"
+            else "rise_one_step_iql"
+        ),
+        "critic_reward_source": (
+            "rewards=source_environment_task_reward"
+            if args.reward_mode == "task"
+            else "rewards=expert_1_non_expert_0"
+        ),
         "critic_input_mode": "independent_raw_observation_encoders",
         "critic_action_space": "pretrained_dp_normalized_action_space",
+        "critic_action_input": "single_action_at_current_observation_index",
         "critic_horizon": 1,
         "latent_dynamics": False,
         "critic_hidden_dims": tuple(int(value) for value in args.critic_hidden_dims),
@@ -810,6 +959,8 @@ def checkpoint_payload(
         "expectile": float(args.expectile),
         "target_tau": float(args.target_tau),
         "actor_initialized_from_deployed_ema": True,
+        "actor_pretrained_checkpoint_loaded": True,
+        "actor_exactly_matched_deployed_ema_at_initialization": True,
         "actor_encoder_trainable": True,
         "rise_reference_alignment": rise_reference_alignment(args),
         "actor_ema_optimization_step": int(
@@ -842,6 +993,7 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "dataset",
         "checkpoint",
         "task",
+        "reward_mode",
         "seed",
         "batch_size",
         "steps_per_epoch",
@@ -900,6 +1052,10 @@ def train(args: argparse.Namespace) -> dict:
     initialized_from_ema = initialize_actor_from_deployed_ema(actor_algo)
     if actor_algo.ema is not None and not initialized_from_ema:
         raise RuntimeError("failed to initialize actor from deployed EMA")
+    if not actor_matches_deployed_ema(actor_algo):
+        raise RuntimeError(
+            "trainable actor does not exactly match the pretrained deployed EMA"
+        )
 
     dataset, loader, loader_generator, config = build_single_loader(
         args,
@@ -933,7 +1089,12 @@ def train(args: argparse.Namespace) -> dict:
         total_steps=args.lr_total_steps,
         num_cycles=args.lr_num_cycles,
     )
-    audit = dataset_audit(args.dataset, len(dataset), expected_task=args.task)
+    audit = dataset_audit(
+        args.dataset,
+        len(dataset),
+        expected_task=args.task,
+        expected_reward_mode=args.reward_mode,
+    )
     action_stats = dp_checkpoint["action_normalization_stats"]
     obs_normalization_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
 
@@ -1095,6 +1256,12 @@ def train(args: argparse.Namespace) -> dict:
     }
     startup = {
         "task": str(args.task),
+        "actor_initialization": {
+            "checkpoint": str(args.checkpoint),
+            "loaded_with_policy_from_checkpoint": True,
+            "trainable_actor_initialized_from_deployed_ema": True,
+            "exact_state_match_verified": True,
+        },
         "dataset": audit,
         "data_routing": {
             "shared_loader": True,
@@ -1155,6 +1322,11 @@ def train(args: argparse.Namespace) -> dict:
             "action": int(actor_algo.algo_config.horizon.action_horizon),
             "prediction": int(actor_algo.algo_config.horizon.prediction_horizon),
             "critic": 1,
+        },
+        "critic_action_contract": {
+            "input": "actions[:, observation_horizon - 1]",
+            "shape": ["batch", int(actor_algo.ac_dim)],
+            "uses_action_chunk": False,
         },
         "latent_dynamics": {
             "enabled": False,

@@ -121,6 +121,7 @@ class IndexedRawTransitionDataset(torch.utils.data.Dataset):
         observation_horizon: int,
         reward_scale: float,
         normalize_actions: bool,
+        action_std_floor: float = 1e-6,
     ):
         split_mask = decode_string_array(data["split"]) == split
         self.indices = np.flatnonzero(split_mask)
@@ -133,7 +134,7 @@ class IndexedRawTransitionDataset(torch.utils.data.Dataset):
         self.demo = decode_string_array(data["demo"])[self.indices]
         actions = data["action_chunks"][self.indices].astype(np.float32)
         self.action_mean = data["action_mean"].astype(np.float32)
-        self.action_std = np.maximum(data["action_std"].astype(np.float32), 1e-6)
+        self.action_std = np.maximum(data["action_std"].astype(np.float32), float(action_std_floor))
         if normalize_actions:
             actions = (actions - self.action_mean.reshape(1, 1, -1)) / self.action_std.reshape(1, 1, -1)
         self.actions = actions.astype(np.float32)

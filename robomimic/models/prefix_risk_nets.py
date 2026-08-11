@@ -193,6 +193,7 @@ class ActionChunkCrossAttentionEncoder(nn.Module):
         self,
         context: torch.Tensor,
         actions: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # context: [B, T, H], actions: [B, T, L, A]
         batch_size, seq_len, horizon, action_dim = actions.shape
@@ -201,9 +202,34 @@ class ActionChunkCrossAttentionEncoder(nn.Module):
                 f"expected action horizon={self.prediction_horizon}, got {horizon}"
             )
         flat_actions = actions.reshape(batch_size * seq_len, horizon, action_dim)
+        flat_mask = None
+        key_padding_mask = None
+        if action_mask is not None:
+            if action_mask.shape != actions.shape[:-1]:
+                raise ValueError(
+                    "action_mask must have shape [B, T, L], got "
+                    f"{tuple(action_mask.shape)} for actions {tuple(actions.shape)}"
+                )
+            flat_mask = action_mask.reshape(batch_size * seq_len, horizon).bool()
+            # Padded episode time slots have no valid action. Give those slots
+            # one harmless dummy token to keep MultiheadAttention finite; the
+            # outer episode mask excludes their outputs from every loss.
+            empty_chunks = flat_mask.sum(dim=1) == 0
+            if torch.any(empty_chunks):
+                flat_mask = flat_mask.clone()
+                flat_mask[empty_chunks, 0] = True
+            key_padding_mask = ~flat_mask
+
         tokens = self.step_projection(flat_actions)
         tokens = tokens + self.position_embedding[None, :, :]
-        tokens = self.temporal_encoder(tokens)
+        token_weights = None
+        if flat_mask is not None:
+            token_weights = flat_mask.to(tokens.dtype).unsqueeze(-1)
+            tokens = tokens * token_weights
+        for temporal_block in self.temporal_encoder:
+            tokens = temporal_block(tokens)
+            if token_weights is not None:
+                tokens = tokens * token_weights
 
         flat_context = context.reshape(batch_size * seq_len, context.shape[-1])
         query = self.context_query(flat_context).unsqueeze(1)
@@ -211,10 +237,15 @@ class ActionChunkCrossAttentionEncoder(nn.Module):
             query=query,
             key=tokens,
             value=tokens,
+            key_padding_mask=key_padding_mask,
             need_weights=False,
         )
         attended = attended.squeeze(1)
-        pooled = tokens.mean(dim=1)
+        if flat_mask is None:
+            pooled = tokens.mean(dim=1)
+        else:
+            weights = flat_mask.to(tokens.dtype).unsqueeze(-1)
+            pooled = (tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
         encoded = self.output_norm(torch.cat([attended, pooled], dim=-1))
         return encoded.reshape(batch_size, seq_len, -1)
 

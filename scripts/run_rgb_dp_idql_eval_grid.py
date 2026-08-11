@@ -200,6 +200,8 @@ def eval_command(
         args.selection,
         "--softmax-temperature",
         str(args.softmax_temperature),
+        "--random-selection-probability",
+        str(args.random_selection_probability),
     ]
     if not args.forbid_success_condition_adapter:
         cmd.extend(
@@ -462,6 +464,12 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
                     "q_range_mean": stats.get("Q_Range_Mean"),
                     "selected_index_mean": stats.get("Selected_Index_Mean"),
                     "selected_index_first_fraction": stats.get("Selected_Index_First_Fraction"),
+                    "random_selection_decision_fraction": stats.get(
+                        "Random_Selection_Decision_Fraction"
+                    ),
+                    "non_greedy_selection_decision_fraction": stats.get(
+                        "Non_Greedy_Selection_Decision_Fraction"
+                    ),
                     "json": str(args.output_dir / f"one_step_idql_N{n}_seed{r['seed']}.json"),
                     "log": r.get("log", ""),
                 }
@@ -501,6 +509,12 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
                 "q_range_mean": stats.get("Q_Range_Mean"),
                 "selected_index_mean": stats.get("Selected_Index_Mean"),
                 "selected_index_first_fraction": stats.get("Selected_Index_First_Fraction"),
+                "random_selection_decision_fraction": stats.get(
+                    "Random_Selection_Decision_Fraction"
+                ),
+                "non_greedy_selection_decision_fraction": stats.get(
+                    "Non_Greedy_Selection_Decision_Fraction"
+                ),
                 "seed_success_rate_mean": float(np.mean(rates)) if len(rates) else float("nan"),
                 "seed_success_rate_std": float(np.std(rates, ddof=1)) if len(rates) > 1 else 0.0,
                 "seeds": seed_runs,
@@ -539,6 +553,9 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
         "reset_to_initial_state": bool(args.reset_to_initial_state),
         "candidate_batch_size": None if args.actor_source == "plain_dp" else args.candidate_batch_size,
         "selection": None if args.actor_source == "plain_dp" else args.selection,
+        "random_selection_probability": (
+            None if args.actor_source == "plain_dp" else args.random_selection_probability
+        ),
         "num_candidates": args.num_candidates,
         "seeds": args.seeds,
         "by_num_candidates": by_n,
@@ -600,8 +617,19 @@ def main() -> None:
         default="hybrid_dp_chunk_actor",
     )
     parser.add_argument("--critic-source", choices=("target", "online"), default="online")
-    parser.add_argument("--selection", choices=("argmax", "greedy", "softmax", "advantage_softmax"), default="argmax")
+    parser.add_argument(
+        "--selection",
+        choices=(
+            "argmax",
+            "greedy",
+            "softmax",
+            "advantage_softmax",
+            "epsilon_greedy",
+        ),
+        default="argmax",
+    )
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
+    parser.add_argument("--random-selection-probability", type=float, default=0.0)
     parser.add_argument("--clip-actions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--diffusion-clip-sample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -622,6 +650,16 @@ def main() -> None:
         parser.error(
             "--require-success-condition-adapter and "
             "--forbid-success-condition-adapter are mutually exclusive"
+        )
+    if not 0.0 <= args.random_selection_probability <= 1.0:
+        parser.error("--random-selection-probability must be in [0, 1]")
+    if (
+        args.selection != "epsilon_greedy"
+        and args.random_selection_probability != 0.0
+    ):
+        parser.error(
+            "--random-selection-probability is only valid with "
+            "--selection epsilon_greedy"
         )
 
     args.idql_checkpoint = args.idql_checkpoint.resolve()

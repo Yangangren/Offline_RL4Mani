@@ -48,6 +48,47 @@ DEFAULT_DP = (
     / "trained_models/square_rgb_dp/square_ph_rgb_dp_official_s1/20260629231002/last.pth"
 )
 DEFAULT_OUTPUT = ROOT / "rollouts/square_rgb_dp/one_step_idql_eval"
+SELECTION_CHOICES = (
+    "argmax",
+    "greedy",
+    "softmax",
+    "advantage_softmax",
+    "epsilon_greedy",
+)
+
+
+def choose_candidate_index(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    selection: str,
+    softmax_temperature: float,
+    random_selection_probability: float,
+    selection_rng: np.random.Generator,
+) -> tuple[int, bool]:
+    """Choose one candidate and report uniform epsilon exploration separately."""
+    if len(q) == 1:
+        return int(torch.argmax(q).item()), False
+    if selection in ("argmax", "greedy"):
+        return int(torch.argmax(q).item()), False
+    if selection == "epsilon_greedy":
+        explore = bool(selection_rng.random() < random_selection_probability)
+        if explore:
+            return int(selection_rng.integers(0, len(q))), True
+        return int(torch.argmax(q).item()), False
+    if selection == "softmax":
+        probabilities = torch.softmax(
+            q / max(softmax_temperature, 1e-6),
+            dim=0,
+        )
+        return int(torch.multinomial(probabilities, num_samples=1).item()), False
+    if selection == "advantage_softmax":
+        probabilities = torch.softmax(
+            (q - v) / max(softmax_temperature, 1e-6),
+            dim=0,
+        )
+        return int(torch.multinomial(probabilities, num_samples=1).item()), False
+    raise ValueError(f"unknown selection={selection}")
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -163,6 +204,8 @@ class OneStepIDQLPolicy:
         num_inference_steps: int,
         selection: str,
         softmax_temperature: float,
+        random_selection_probability: float,
+        selection_seed: int,
         clip_actions: bool,
         diffusion_clip_sample: bool,
     ):
@@ -182,6 +225,9 @@ class OneStepIDQLPolicy:
         self.num_inference_steps = int(num_inference_steps)
         self.selection = selection
         self.softmax_temperature = float(softmax_temperature)
+        self.random_selection_probability = float(random_selection_probability)
+        self.selection_seed = int(selection_seed)
+        self.selection_rng = np.random.default_rng(self.selection_seed)
         self.clip_actions = bool(clip_actions)
         if self.num_candidates <= 0:
             raise ValueError(f"num_candidates must be positive, got {self.num_candidates}")
@@ -214,6 +260,7 @@ class OneStepIDQLPolicy:
         self.last_v: float | None = None
         self.last_adv: np.ndarray | None = None
         self.last_selected_index: int | None = None
+        self.last_selection_is_random: bool | None = None
 
     def start_episode(self) -> None:
         self.dp_policy.start_episode()
@@ -221,6 +268,7 @@ class OneStepIDQLPolicy:
         self.last_v = None
         self.last_adv = None
         self.last_selected_index = None
+        self.last_selection_is_random = None
 
     @torch.no_grad()
     def sample_normalized_actions(self, obs_features: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -252,16 +300,16 @@ class OneStepIDQLPolicy:
         return norm_actions, raw_actions
 
     def choose_index(self, q: torch.Tensor, v: torch.Tensor) -> int:
-        if self.selection in ("argmax", "greedy") or len(q) == 1:
-            return int(torch.argmax(q).item())
-        if self.selection == "softmax":
-            probs = torch.softmax(q / max(self.softmax_temperature, 1e-6), dim=0)
-            return int(torch.multinomial(probs, num_samples=1).item())
-        if self.selection == "advantage_softmax":
-            adv = q - v
-            probs = torch.softmax(adv / max(self.softmax_temperature, 1e-6), dim=0)
-            return int(torch.multinomial(probs, num_samples=1).item())
-        raise ValueError(f"unknown selection={self.selection}")
+        selected, explored = choose_candidate_index(
+            q,
+            v,
+            selection=self.selection,
+            softmax_temperature=self.softmax_temperature,
+            random_selection_probability=self.random_selection_probability,
+            selection_rng=self.selection_rng,
+        )
+        self.last_selection_is_random = explored
+        return selected
 
     def __call__(self, ob) -> np.ndarray:
         # One-step IDQL evaluation: every call corresponds to exactly one
@@ -281,6 +329,7 @@ class OneStepIDQLPolicy:
             self.last_v = None
             self.last_adv = None
             self.last_selected_index = 0
+            self.last_selection_is_random = None
             selected_action = raw_actions[0]
         else:
             critic_feature = (
@@ -323,6 +372,8 @@ class PretrainedDPFirstActionIDQLPolicy:
         candidate_batch_size: int,
         selection: str,
         softmax_temperature: float,
+        random_selection_probability: float,
+        selection_seed: int,
         clip_actions: bool,
         execution_horizon: int,
     ):
@@ -337,6 +388,9 @@ class PretrainedDPFirstActionIDQLPolicy:
         self.candidate_batch_size = int(candidate_batch_size)
         self.selection = selection
         self.softmax_temperature = float(softmax_temperature)
+        self.random_selection_probability = float(random_selection_probability)
+        self.selection_seed = int(selection_seed)
+        self.selection_rng = np.random.default_rng(self.selection_seed)
         self.clip_actions = bool(clip_actions)
         if self.num_candidates <= 0:
             raise ValueError(f"num_candidates must be positive, got {self.num_candidates}")
@@ -355,6 +409,7 @@ class PretrainedDPFirstActionIDQLPolicy:
         self.last_v: float | None = None
         self.last_adv: np.ndarray | None = None
         self.last_selected_index: int | None = None
+        self.last_selection_is_random: bool | None = None
 
         horizon = self.algo.algo_config.horizon
         self.checkpoint.setdefault("prediction_horizon", int(horizon.prediction_horizon))
@@ -371,12 +426,14 @@ class PretrainedDPFirstActionIDQLPolicy:
         self.last_v = None
         self.last_adv = None
         self.last_selected_index = None
+        self.last_selection_is_random = None
 
     def _clear_decision_stats_for_queued_action(self) -> None:
         self.last_q = None
         self.last_v = None
         self.last_adv = None
         self.last_selected_index = None
+        self.last_selection_is_random = None
 
     @torch.no_grad()
     def sample_action_trajectories(self, prepared_obs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -408,16 +465,16 @@ class PretrainedDPFirstActionIDQLPolicy:
         return (raw_actions - self.action_mean[None, :]) / self.action_std[None, :]
 
     def choose_index(self, q: torch.Tensor, v: torch.Tensor) -> int:
-        if self.selection in ("argmax", "greedy") or len(q) == 1:
-            return int(torch.argmax(q).item())
-        if self.selection == "softmax":
-            probs = torch.softmax(q / max(self.softmax_temperature, 1e-6), dim=0)
-            return int(torch.multinomial(probs, num_samples=1).item())
-        if self.selection == "advantage_softmax":
-            adv = q - v
-            probs = torch.softmax(adv / max(self.softmax_temperature, 1e-6), dim=0)
-            return int(torch.multinomial(probs, num_samples=1).item())
-        raise ValueError(f"unknown selection={self.selection}")
+        selected, explored = choose_candidate_index(
+            q,
+            v,
+            selection=self.selection,
+            softmax_temperature=self.softmax_temperature,
+            random_selection_probability=self.random_selection_probability,
+            selection_rng=self.selection_rng,
+        )
+        self.last_selection_is_random = explored
+        return selected
 
     def __call__(self, ob) -> np.ndarray:
         if self.action_queue:
@@ -434,6 +491,7 @@ class PretrainedDPFirstActionIDQLPolicy:
             self.last_v = None
             self.last_adv = None
             self.last_selected_index = 0
+            self.last_selection_is_random = None
             selected = 0
         else:
             obs_feature = (
@@ -474,6 +532,42 @@ def current_obs_for_value_network(algo, prepared_obs: dict[str, torch.Tensor]):
             )
         current[key] = value
     return current
+
+
+def stacked_obs_for_value_network(
+    algo,
+    prepared_obs: dict[str, torch.Tensor],
+    observation_horizon: int,
+):
+    """Preserve the DP frame stack for a version-2 DQL critic."""
+    stacked = {}
+    observation_horizon = int(observation_horizon)
+    for key, shape in algo.obs_shapes.items():
+        value = prepared_obs[key]
+        expected_batched_ndim = len(shape) + 1
+        if value.ndim == expected_batched_ndim:
+            value = value.unsqueeze(1).expand(
+                -1,
+                observation_horizon,
+                *([-1] * len(shape)),
+            )
+        elif value.ndim == expected_batched_ndim + 1:
+            if value.shape[1] < observation_horizon:
+                padding = value[:, :1].expand(
+                    -1,
+                    observation_horizon - value.shape[1],
+                    *([-1] * len(shape)),
+                )
+                value = torch.cat((padding, value), dim=1)
+            else:
+                value = value[:, -observation_horizon:]
+        else:
+            raise ValueError(
+                f"unexpected stacked DQL observation shape for {key}: "
+                f"{tuple(value.shape)}"
+            )
+        stacked[key] = value
+    return stacked
 
 
 def unnormalize_dp_action_trajectories(dp_policy, actions: torch.Tensor) -> np.ndarray:
@@ -536,6 +630,8 @@ class RiseStyleRGBIDQLPolicy:
         candidate_batch_size: int,
         selection: str,
         softmax_temperature: float,
+        random_selection_probability: float,
+        selection_seed: int,
         clip_actions: bool,
         execution_horizon: int,
     ):
@@ -549,10 +645,16 @@ class RiseStyleRGBIDQLPolicy:
         self.candidate_batch_size = int(candidate_batch_size)
         self.selection = selection
         self.softmax_temperature = float(softmax_temperature)
+        self.random_selection_probability = float(random_selection_probability)
+        self.selection_seed = int(selection_seed)
+        self.selection_rng = np.random.default_rng(self.selection_seed)
         self.clip_actions = bool(clip_actions)
         self.execution_horizon = int(execution_horizon)
         self.critic_chunk_horizon = int(
             checkpoint.get("critic_chunk_horizon", 1)
+        )
+        self.critic_observation_horizon = int(
+            checkpoint.get("critic_observation_horizon", 1)
         )
         if self.num_candidates <= 0:
             raise ValueError(f"num_candidates must be positive, got {self.num_candidates}")
@@ -570,6 +672,7 @@ class RiseStyleRGBIDQLPolicy:
         self.last_v: float | None = None
         self.last_adv: np.ndarray | None = None
         self.last_selected_index: int | None = None
+        self.last_selection_is_random: bool | None = None
 
         horizon = self.algo.algo_config.horizon
         self.checkpoint["observation_horizon"] = int(horizon.observation_horizon)
@@ -588,23 +691,19 @@ class RiseStyleRGBIDQLPolicy:
         self.last_v = None
         self.last_adv = None
         self.last_selected_index = None
+        self.last_selection_is_random = None
 
     def choose_index(self, q: torch.Tensor, v: torch.Tensor) -> int:
-        if self.selection in ("argmax", "greedy") or len(q) == 1:
-            return int(torch.argmax(q).item())
-        if self.selection == "softmax":
-            probabilities = torch.softmax(
-                q / max(self.softmax_temperature, 1e-6),
-                dim=0,
-            )
-            return int(torch.multinomial(probabilities, num_samples=1).item())
-        if self.selection == "advantage_softmax":
-            probabilities = torch.softmax(
-                (q - v) / max(self.softmax_temperature, 1e-6),
-                dim=0,
-            )
-            return int(torch.multinomial(probabilities, num_samples=1).item())
-        raise ValueError(f"unknown selection={self.selection}")
+        selected, explored = choose_candidate_index(
+            q,
+            v,
+            selection=self.selection,
+            softmax_temperature=self.softmax_temperature,
+            random_selection_probability=self.random_selection_probability,
+            selection_rng=self.selection_rng,
+        )
+        self.last_selection_is_random = explored
+        return selected
 
     @torch.no_grad()
     def sample_action_trajectories(
@@ -642,6 +741,7 @@ class RiseStyleRGBIDQLPolicy:
             self.last_v = None
             self.last_adv = None
             self.last_selected_index = None
+            self.last_selection_is_random = None
             return self.action_queue.popleft().astype(np.float64, copy=True)
 
         prepared_obs = self.dp_policy._prepare_observation(ob, batched_ob=False)
@@ -654,8 +754,21 @@ class RiseStyleRGBIDQLPolicy:
             self.last_v = None
             self.last_adv = None
             self.last_selected_index = 0
+            self.last_selection_is_random = None
         else:
-            current_obs = current_obs_for_value_network(self.algo, prepared_obs)
+            if bool(
+                self.checkpoint.get("stacked_pretrained_dql_critic", False)
+            ):
+                current_obs = stacked_obs_for_value_network(
+                    self.algo,
+                    prepared_obs,
+                    self.critic_observation_horizon,
+                )
+            else:
+                current_obs = current_obs_for_value_network(
+                    self.algo,
+                    prepared_obs,
+                )
             obs_batch = repeat_obs(current_obs, self.num_candidates)
             if self.critic_chunk_horizon == 1:
                 q_predictions = [
@@ -853,6 +966,7 @@ class PlainDPPolicy:
         self.last_v: float | None = None
         self.last_adv: np.ndarray | None = None
         self.last_selected_index: int | None = None
+        self.last_selection_is_random: bool | None = None
 
     def start_episode(self) -> None:
         self.dp_policy.start_episode()
@@ -860,12 +974,14 @@ class PlainDPPolicy:
         self.last_v = None
         self.last_adv = None
         self.last_selected_index = None
+        self.last_selection_is_random = None
 
     def __call__(self, ob) -> np.ndarray:
         self.last_q = None
         self.last_v = None
         self.last_adv = None
         self.last_selected_index = None
+        self.last_selection_is_random = None
         return np.asarray(self.dp_policy(ob), dtype=np.float64).copy()
 
 
@@ -1024,8 +1140,19 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
                     late_fusion_key=checkpoint.get(
                         "critic_late_fusion_key", "robot0_gripper_qpos"
                     ),
-                    q_head_uses_delta=bool(
-                        checkpoint.get("critic_q_head_uses_delta", True)
+                )
+            elif bool(checkpoint.get("stacked_pretrained_dql_critic", False)):
+                critics, critic_targets, vf = make_dql_value_networks(
+                    dp_policy.policy,
+                    hidden_dims=tuple(
+                        int(value) for value in checkpoint["critic_hidden_dims"]
+                    ),
+                    observation_horizon=int(
+                        checkpoint["critic_observation_horizon"]
+                    ),
+                    num_critics=int(checkpoint.get("num_critics", 2)),
+                    late_fusion_key=checkpoint.get(
+                        "critic_late_fusion_key", "robot0_gripper_qpos"
                     ),
                 )
             else:
@@ -1112,6 +1239,10 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             candidate_batch_size=args.candidate_batch_size,
             selection=args.selection,
             softmax_temperature=args.softmax_temperature,
+            random_selection_probability=args.random_selection_probability,
+            selection_seed=(
+                args.policy_seed if args.policy_seed is not None else args.seed
+            ),
             clip_actions=args.clip_actions,
             execution_horizon=args.execution_horizon,
         )
@@ -1208,6 +1339,10 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             candidate_batch_size=args.candidate_batch_size,
             selection=args.selection,
             softmax_temperature=args.softmax_temperature,
+            random_selection_probability=args.random_selection_probability,
+            selection_seed=(
+                args.policy_seed if args.policy_seed is not None else args.seed
+            ),
             clip_actions=args.clip_actions,
             execution_horizon=args.execution_horizon,
         )
@@ -1235,6 +1370,10 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
         num_inference_steps=args.num_inference_steps,
         selection=args.selection,
         softmax_temperature=args.softmax_temperature,
+        random_selection_probability=args.random_selection_probability,
+        selection_seed=(
+            args.policy_seed if args.policy_seed is not None else args.seed
+        ),
         clip_actions=args.clip_actions,
         diffusion_clip_sample=args.diffusion_clip_sample,
     )
@@ -1279,6 +1418,8 @@ def rollout(
         q_range=[],
         v=[],
         selected_index=[],
+        selection_is_random=[],
+        selection_is_greedy=[],
         initial_state_dict=initial_state_dict,
     )
     if return_obs:
@@ -1297,6 +1438,7 @@ def rollout(
             video_count += 1
             q = policy.last_q
             selected = policy.last_selected_index
+            selection_is_random = policy.last_selection_is_random
             if record_trajectory:
                 traj["actions"].append(action)
                 traj["rewards"].append(float(reward))
@@ -1311,6 +1453,8 @@ def rollout(
                 traj["q_range"].append(np.nan)
                 traj["v"].append(np.nan)
                 traj["selected_index"].append(-1)
+                traj["selection_is_random"].append(-1)
+                traj["selection_is_greedy"].append(-1)
             else:
                 q_selected = float(q[selected])
                 q_mean = float(np.mean(q))
@@ -1324,6 +1468,12 @@ def rollout(
                 traj["q_range"].append(q_max - q_min)
                 traj["v"].append(float(policy.last_v))
                 traj["selected_index"].append(int(selected))
+                traj["selection_is_random"].append(
+                    int(bool(selection_is_random))
+                )
+                traj["selection_is_greedy"].append(
+                    int(int(selected) == int(np.argmax(q)))
+                )
             if return_obs:
                 traj["obs"].append(obs)
                 traj["next_obs"].append(next_obs)
@@ -1358,6 +1508,15 @@ def rollout(
         valid_indices = selected_index[valid_selection].astype(np.float64)
         stats["Selected_Index_Mean"] = float(np.mean(valid_indices))
         stats["Selected_Index_First_Fraction"] = float(np.mean(valid_indices == 0.0))
+        random_decisions = traj["selection_is_random"][valid_selection]
+        greedy_decisions = traj["selection_is_greedy"][valid_selection]
+        stats["Num_Selection_Decisions"] = int(np.sum(valid_selection))
+        stats["Random_Selection_Decision_Fraction"] = float(
+            np.mean(random_decisions == 1)
+        )
+        stats["Non_Greedy_Selection_Decision_Fraction"] = float(
+            np.mean(greedy_decisions == 0)
+        )
     return stats, traj
 
 
@@ -1457,6 +1616,14 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         "num_candidates": args.num_candidates,
         "num_inference_steps": int(policy.checkpoint.get("dp_num_inference_timesteps", args.num_inference_steps)),
         "selection": None if plain_dp_actor else args.selection,
+        "random_selection_probability": (
+            None if plain_dp_actor else args.random_selection_probability
+        ),
+        "selection_seed": (
+            None
+            if plain_dp_actor
+            else (args.policy_seed if args.policy_seed is not None else args.seed)
+        ),
         "clip_actions": None if plain_dp_actor else args.clip_actions,
         "diffusion_clip_sample": bool(policy.checkpoint.get("dp_clip_sample", args.diffusion_clip_sample)),
         "observation_horizon": policy.checkpoint.get("observation_horizon"),
@@ -1497,6 +1664,8 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         "replan_every_env_step": bool(policy.checkpoint.get("replan_every_env_step", True)),
         "critic_used_for_action_selection": bool((not plain_dp_actor) and args.num_candidates > 1),
         "seed": args.seed,
+        "env_seed": args.env_seed if args.env_seed is not None else args.seed,
+        "policy_seed": args.policy_seed if args.policy_seed is not None else args.seed,
         "n_rollouts": args.n_rollouts,
         "completed_rollouts": len(stats),
         "complete": bool(complete),
@@ -1512,7 +1681,13 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
 
 def write_summary(args, policy, stats: list[dict], complete: bool, suffix: str = "") -> Path:
     summary = build_summary(args, policy, stats, complete=complete)
-    path = args.output_dir / f"one_step_idql_N{args.num_candidates}_seed{args.seed}{suffix}.json"
+    if args.env_seed is None and args.policy_seed is None:
+        seed_label = f"seed{args.seed}"
+    else:
+        env_seed = args.env_seed if args.env_seed is not None else args.seed
+        policy_seed = args.policy_seed if args.policy_seed is not None else args.seed
+        seed_label = f"env{env_seed}_policy{policy_seed}"
+    path = args.output_dir / f"one_step_idql_N{args.num_candidates}_{seed_label}{suffix}.json"
     atomic_write_json(path, summary)
     return path
 
@@ -1545,11 +1720,13 @@ def evaluate(args) -> dict:
             f"record_trajectory={args.dataset_path is not None}",
             flush=True,
         )
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
+        env_seed = args.env_seed if args.env_seed is not None else args.seed
+        policy_seed = args.policy_seed if args.policy_seed is not None else args.seed
+        random.seed(env_seed)
+        np.random.seed(env_seed)
+        torch.manual_seed(policy_seed)
         if device.type == "cuda":
-            torch.cuda.manual_seed_all(args.seed)
+            torch.cuda.manual_seed_all(policy_seed)
 
         imageio = None
         if args.video_dir is not None:
@@ -1565,6 +1742,11 @@ def evaluate(args) -> dict:
             args.dataset_path.parent.mkdir(parents=True, exist_ok=True)
             dataset_writer = h5py.File(args.dataset_path, "w")
             data_group = dataset_writer.create_group("data")
+            data_group.attrs["env_args"] = json.dumps(env.serialize(), indent=4)
+            data_group.attrs["selection"] = args.selection
+            data_group.attrs["random_selection_probability"] = float(
+                args.random_selection_probability
+            )
 
         stats = []
         for i in range(args.n_rollouts):
@@ -1613,13 +1795,26 @@ def evaluate(args) -> dict:
                     "q_range",
                     "v",
                     "selected_index",
+                    "selection_is_random",
+                    "selection_is_greedy",
                 ):
                     ep.create_dataset(key, data=traj[key])
                 if "model" in traj["initial_state_dict"]:
                     ep.attrs["model_file"] = traj["initial_state_dict"]["model"]
+                if "ep_meta" in traj["initial_state_dict"]:
+                    ep.attrs["ep_meta"] = traj["initial_state_dict"]["ep_meta"]
                 ep.attrs["num_samples"] = int(traj["actions"].shape[0])
                 ep.attrs["success"] = float(rollout_stats["Success_Rate"])
+                ep.attrs["episode_return"] = float(rollout_stats["Return"])
+                ep.attrs["env_seed"] = int(env_seed)
+                ep.attrs["policy_seed"] = int(policy_seed)
+                ep.attrs["selection"] = args.selection
+                ep.attrs["random_selection_probability"] = float(
+                    args.random_selection_probability
+                )
                 total_samples += int(traj["actions"].shape[0])
+                data_group.attrs["total"] = total_samples
+                dataset_writer.flush()
 
         if dataset_writer is not None:
             data_group.attrs["total"] = total_samples
@@ -1660,6 +1855,18 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=400)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--env-seed",
+        type=int,
+        default=None,
+        help="Seed Python and NumPy for environment randomization; defaults to --seed.",
+    )
+    parser.add_argument(
+        "--policy-seed",
+        type=int,
+        default=None,
+        help="Seed PyTorch and CUDA for stochastic policy sampling; defaults to --seed.",
+    )
+    parser.add_argument(
         "--env-hard-reset",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1699,8 +1906,17 @@ def main() -> None:
         default=8,
         help="For DP-proposal actors, execute this many actions from the selected trajectory before replanning.",
     )
-    parser.add_argument("--selection", choices=("argmax", "greedy", "softmax", "advantage_softmax"), default="argmax")
+    parser.add_argument("--selection", choices=SELECTION_CHOICES, default="argmax")
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--random-selection-probability",
+        type=float,
+        default=0.0,
+        help=(
+            "For epsilon_greedy selection, choose uniformly among all candidates "
+            "with this probability and otherwise choose argmax min(Q1,Q2)."
+        ),
+    )
     parser.add_argument("--clip-actions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--diffusion-clip-sample", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
@@ -1725,6 +1941,16 @@ def main() -> None:
         parser.error(
             "--require-success-condition-adapter and "
             "--forbid-success-condition-adapter are mutually exclusive"
+        )
+    if not 0.0 <= args.random_selection_probability <= 1.0:
+        parser.error("--random-selection-probability must be in [0, 1]")
+    if (
+        args.selection != "epsilon_greedy"
+        and args.random_selection_probability != 0.0
+    ):
+        parser.error(
+            "--random-selection-probability is only valid with "
+            "--selection epsilon_greedy"
         )
     for key in ("idql_checkpoint", "dp_checkpoint", "output_dir", "dataset_path", "video_dir"):
         value = getattr(args, key)

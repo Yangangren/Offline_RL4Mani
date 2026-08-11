@@ -60,6 +60,8 @@ def decode(values) -> list[str]:
 
 
 def selected_demo_keys(path: Path, filter_key: str | None) -> list[str]:
+    if filter_key == "":
+        filter_key = None
     with h5py.File(path, "r") as f:
         if filter_key is None:
             return sorted(f["data"].keys(), key=lambda x: int(x.split("_")[-1]))
@@ -180,8 +182,8 @@ def source_specs(args) -> list[tuple[str, Path, str | None]]:
     if args.include_demos:
         specs.append(("demo", args.demo_dataset, args.demo_filter_key))
     if args.include_rollouts:
-        specs.append(("rollout_success", args.rollout_dataset, "success"))
-        specs.append(("rollout_failure", args.rollout_dataset, "failure"))
+        specs.append(("rollout_success", args.rollout_dataset, args.success_filter_key))
+        specs.append(("rollout_failure", args.rollout_dataset, args.failure_filter_key))
     return specs
 
 
@@ -206,13 +208,15 @@ def split_by_episode(source: np.ndarray, demo: np.ndarray, seed: int, val_fracti
 
 def build(args) -> dict:
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
-    policy, ckpt = FileUtils.policy_from_checkpoint(
-        ckpt_path=str(args.checkpoint),
-        device=device,
-        verbose=False,
-    )
-    policy.start_episode()
+    policy = None
+    if args.cache_latent_features:
+        device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
+        policy, _ = FileUtils.policy_from_checkpoint(
+            ckpt_path=str(args.checkpoint),
+            device=device,
+            verbose=False,
+        )
+        policy.start_episode()
 
     all_obs_features = []
     all_next_obs_features = []
@@ -244,19 +248,19 @@ def build(args) -> dict:
                 )
                 if len(records["steps"]) == 0:
                     continue
-                obs_features = []
-                next_obs_features = []
-                for start in range(0, len(records["steps"]), args.encoder_batch_size):
-                    sl = slice(start, start + args.encoder_batch_size)
-                    obs = make_obs_batch(group, records["steps"][sl], args.observation_horizon)
-                    next_obs = make_obs_batch(group, records["next_steps"][sl], args.observation_horizon)
-                    obs_features.append(encode_obs_batch(policy, obs))
-                    next_obs_features.append(encode_obs_batch(policy, next_obs))
-                obs_features = np.concatenate(obs_features, axis=0)
-                next_obs_features = np.concatenate(next_obs_features, axis=0)
-
-                all_obs_features.append(obs_features)
-                all_next_obs_features.append(next_obs_features)
+                if args.cache_latent_features:
+                    obs_features = []
+                    next_obs_features = []
+                    for start in range(0, len(records["steps"]), args.encoder_batch_size):
+                        sl = slice(start, start + args.encoder_batch_size)
+                        obs = make_obs_batch(group, records["steps"][sl], args.observation_horizon)
+                        next_obs = make_obs_batch(group, records["next_steps"][sl], args.observation_horizon)
+                        obs_features.append(encode_obs_batch(policy, obs))
+                        next_obs_features.append(encode_obs_batch(policy, next_obs))
+                    obs_features = np.concatenate(obs_features, axis=0)
+                    next_obs_features = np.concatenate(next_obs_features, axis=0)
+                    all_obs_features.append(obs_features)
+                    all_next_obs_features.append(next_obs_features)
                 all_actions.append(records["actions"])
                 all_returns.append(records["returns"])
                 all_dones.append(records["dones"])
@@ -269,8 +273,10 @@ def build(args) -> dict:
                 if args.max_episodes_per_source and index + 1 >= args.max_episodes_per_source:
                     break
 
-    obs_features = np.concatenate(all_obs_features, axis=0)
-    next_obs_features = np.concatenate(all_next_obs_features, axis=0)
+    obs_features = np.concatenate(all_obs_features, axis=0) if args.cache_latent_features else None
+    next_obs_features = (
+        np.concatenate(all_next_obs_features, axis=0) if args.cache_latent_features else None
+    )
     actions = np.concatenate(all_actions, axis=0)
     returns = np.concatenate(all_returns, axis=0)
     dones = np.concatenate(all_dones, axis=0)
@@ -286,10 +292,7 @@ def build(args) -> dict:
     reward_mean = float(returns.mean())
     reward_std = float(max(returns.std(), 1e-6))
 
-    np.savez_compressed(
-        args.output,
-        obs_features=obs_features,
-        next_obs_features=next_obs_features,
+    payload = dict(
         action_chunks=actions,
         chunk_returns=returns,
         dones=dones,
@@ -309,11 +312,17 @@ def build(args) -> dict:
         action_dim=np.asarray(actions.shape[-1], dtype=np.int64),
         checkpoint=np.asarray(str(args.checkpoint), dtype="S"),
     )
+    if args.cache_latent_features:
+        payload["obs_features"] = obs_features
+        payload["next_obs_features"] = next_obs_features
+    np.savez_compressed(args.output, **payload)
     summary = {
         "output": str(args.output),
         "checkpoint": str(args.checkpoint),
+        "cache_latent_features": bool(args.cache_latent_features),
+        "index_only": not bool(args.cache_latent_features),
         "num_chunks": int(actions.shape[0]),
-        "feature_dim": int(obs_features.shape[-1]),
+        "feature_dim": int(obs_features.shape[-1]) if args.cache_latent_features else None,
         "chunk_horizon": int(args.chunk_horizon),
         "transition_mode": "one_step" if int(args.chunk_horizon) == 1 else "chunk",
         "action_dim": int(actions.shape[-1]),
@@ -340,7 +349,9 @@ def main() -> None:
     parser.add_argument("--demo-dataset", type=Path, default=DEFAULT_DEMOS)
     parser.add_argument("--rollout-dataset", type=Path, default=DEFAULT_ROLLOUTS)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--demo-filter-key", type=str, default="train")
+    parser.add_argument("--demo-filter-key", type=str, default=None)
+    parser.add_argument("--success-filter-key", type=str, default="success")
+    parser.add_argument("--failure-filter-key", type=str, default="failure")
     parser.add_argument("--include-demos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-rollouts", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--observation-horizon", type=int, default=2)
@@ -349,6 +360,7 @@ def main() -> None:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--encoder-batch-size", type=int, default=128)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument("--cache-latent-features", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=20260701)

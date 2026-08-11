@@ -119,6 +119,27 @@ case "$TASK" in
     ;;
 esac
 
+case "$STAGE" in
+  train_chunk_idql_round2|train_chunk_idql_round2_resilient|train_chunk_idql_round2_regularized|train_chunk_idql_round2_regularized_resilient)
+    if [[ "$TASK" != "square" ]]; then
+      echo "The configured round-2 warm start currently targets TASK=square." >&2
+      exit 2
+    fi
+    ROUND2_CHUNK_TRAINING=1
+    TASK_ROLLOUT_DATASET=rollouts/square_rgb_dp/chunk_idql/round2_N4_collection/square_rgb_dp_chunk_idql_round2_N4_rollouts_rgb2.hdf5
+    TASK_IDQL_DATASET=datasets/square/idql/square_rgb_dp_chunk_idql_round2_N4_200demo_100success_50failure.hdf5
+    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/square_rgb_dp/chunk_idql/round2_N4_200demo_100success_50failure_h8_dynamics_human_condition
+    TASK_CHUNK_EVAL_OUTPUT=rollouts/square_rgb_dp/chunk_idql/round2_N4_200demo_100success_50failure_h8_dynamics_human_condition
+    TASK_CHUNK_INITIALIZATION=source_chunk_idql_joint
+    TASK_SOURCE_CHUNK_IDQL_CHECKPOINT=trained_models/square_rgb_dp/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition_task_reward/models/model_epoch_50.pt
+    if [[ "$STAGE" == "train_chunk_idql_round2_regularized" || "$STAGE" == "train_chunk_idql_round2_regularized_resilient" ]]; then
+      ROUND2_REGULARIZED_TRAINING=1
+      TASK_CHUNK_IDQL_OUTPUT_DIR=${TASK_CHUNK_IDQL_OUTPUT_DIR}_regularized
+      TASK_CHUNK_EVAL_OUTPUT=${TASK_CHUNK_EVAL_OUTPUT}_regularized
+    fi
+    ;;
+esac
+
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
@@ -136,6 +157,11 @@ export PYTHONFAULTHANDLER=1
 
 PYTHON=${ROBOMIMIC_PYTHON:-/home/ryan/miniconda3/envs/robomimic_stable/bin/python}
 export ROBOMIMIC_PYTHON="$PYTHON"
+CHUNK_NUM_GPUS=${CHUNK_NUM_GPUS:-1}
+if (( CHUNK_NUM_GPUS > 1 )) && [[ "${DEVICE:-cuda}" != "cuda" ]]; then
+  echo "CHUNK_NUM_GPUS>1 requires DEVICE=cuda." >&2
+  exit 2
+fi
 
 DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
 EXPERT_DATASET=${EXPERT_DATASET:-$TASK_EXPERT_DATASET}
@@ -174,6 +200,23 @@ if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
     echo "Square round-2 chunk IDQL requires CHUNK_INITIALIZATION=source_chunk_idql_joint." >&2
     exit 2
   fi
+if [[ "$CHUNK_CONDITIONED_ACTOR" != "1" ]]; then
+    echo "Square round-2 chunk IDQL requires CHUNK_CONDITIONED_ACTOR=1." >&2
+    exit 2
+  fi
+  if [[ "$IDQL_REWARD_MODE" != "task" ]]; then
+    echo "Square round-2 chunk IDQL requires IDQL_REWARD_MODE=task." >&2
+    exit 2
+  fi
+fi
+if [[ "$ROUND2_REGULARIZED_TRAINING" == "1" ]]; then
+  CHUNK_EPOCHS=${CHUNK_EPOCHS:-${ROUND2_EPOCHS:-50}}
+  CHUNK_ACTOR_LR=${CHUNK_ACTOR_LR:-${ROUND2_ACTOR_LR:-1e-5}}
+  CHUNK_CRITIC_LR=${CHUNK_CRITIC_LR:-${ROUND2_CRITIC_LR:-2.5e-5}}
+  CHUNK_ENCODER_LR=${CHUNK_ENCODER_LR:-${ROUND2_ENCODER_LR:-1e-6}}
+  CHUNK_VF_LR=${CHUNK_VF_LR:-${ROUND2_VF_LR:-2.5e-5}}
+  SOURCE_ACTOR_L2_SP_WEIGHT=${SOURCE_ACTOR_L2_SP_WEIGHT:-${ROUND2_ACTOR_L2_SP_WEIGHT:-10.0}}
+  SOURCE_CRITIC_L2_SP_WEIGHT=${SOURCE_CRITIC_L2_SP_WEIGHT:-${ROUND2_CRITIC_L2_SP_WEIGHT:-10.0}}
 fi
 CHUNK_IDQL_CHECKPOINT=${CHUNK_IDQL_CHECKPOINT:-$CHUNK_IDQL_OUTPUT_DIR/last.pt}
 CHUNK_EVAL_OUTPUT=${CHUNK_EVAL_OUTPUT:-$DEFAULT_CHUNK_EVAL_OUTPUT}
@@ -194,19 +237,42 @@ FAILURE_COUNT=${FAILURE_COUNT:-$TASK_FAILURE_COUNT}
 # rollout budget and stops earlier, at a shard boundary, once both outcome
 # quotas are available for the next 100-success / 50-failure training split.
 COLLECTION_NUM_CANDIDATES=${COLLECTION_NUM_CANDIDATES:-4}
+# Collection deliberately explores outside the current critic's argmax support.
+# With N=4 and p=0.25, one quarter of replan decisions select uniformly among
+# the four actor proposals; all other decisions use argmax min(Q1, Q2).
+COLLECTION_SELECTION=${COLLECTION_SELECTION:-epsilon_greedy}
+if [[ "$COLLECTION_SELECTION" == "epsilon_greedy" ]]; then
+  COLLECTION_RANDOM_SELECTION_PROBABILITY=${COLLECTION_RANDOM_SELECTION_PROBABILITY:-0.5}
+else
+  COLLECTION_RANDOM_SELECTION_PROBABILITY=${COLLECTION_RANDOM_SELECTION_PROBABILITY:-0.0}
+fi
+collection_probability_tag=${COLLECTION_RANDOM_SELECTION_PROBABILITY//./p}
+if [[ "$COLLECTION_SELECTION" == "epsilon_greedy" ]]; then
+  DEFAULT_COLLECTION_POLICY_TAG=${COLLECTION_SELECTION}_p${collection_probability_tag}
+else
+  DEFAULT_COLLECTION_POLICY_TAG=$COLLECTION_SELECTION
+fi
+COLLECTION_POLICY_TAG=${COLLECTION_POLICY_TAG:-$DEFAULT_COLLECTION_POLICY_TAG}
+COLLECTION_ROUND_LABEL=${COLLECTION_ROUND_LABEL:-round2}
 COLLECTION_TOTAL_ROLLOUTS=${COLLECTION_TOTAL_ROLLOUTS:-700}
 COLLECTION_SEED_BASE=${COLLECTION_SEED_BASE:-1000}
-COLLECTION_POLICY_SEEDS=${COLLECTION_POLICY_SEEDS-"0 1"}
+# Training-data collection uses several rollouts from each seeded subprocess.
+# Set COLLECTION_POLICY_SEEDS explicitly (for example, "0 1") only when a
+# paired environment/policy-seed audit is needed; that mode requires one
+# rollout per shard and therefore creates many small files.
+COLLECTION_POLICY_SEEDS=${COLLECTION_POLICY_SEEDS-}
 COLLECTION_NUM_ENV_SEEDS=${COLLECTION_NUM_ENV_SEEDS:-}
 if [[ -n "$COLLECTION_POLICY_SEEDS" ]]; then
   COLLECTION_ROLLOUTS_PER_SHARD=${COLLECTION_ROLLOUTS_PER_SHARD:-1}
+  COLLECTION_SEED_LAYOUT_TAG=${COLLECTION_SEED_LAYOUT_TAG:-split_policy_seeds}
 else
   COLLECTION_ROLLOUTS_PER_SHARD=${COLLECTION_ROLLOUTS_PER_SHARD:-25}
+  COLLECTION_SEED_LAYOUT_TAG=${COLLECTION_SEED_LAYOUT_TAG:-rps${COLLECTION_ROLLOUTS_PER_SHARD}}
 fi
 COLLECTION_MIN_SUCCESS_ROLLOUTS=${COLLECTION_MIN_SUCCESS_ROLLOUTS:-100}
 COLLECTION_MIN_FAILURE_ROLLOUTS=${COLLECTION_MIN_FAILURE_ROLLOUTS:-50}
-COLLECTION_OUTPUT_DIR=${COLLECTION_OUTPUT_DIR:-rollouts/${TASK}_rgb_dp/chunk_idql/round2_N${COLLECTION_NUM_CANDIDATES}_collection}
-COLLECTION_RAW_NAME=${COLLECTION_RAW_NAME:-${TASK}_rgb_dp_chunk_idql_round2_N${COLLECTION_NUM_CANDIDATES}_rollouts_raw.hdf5}
+COLLECTION_OUTPUT_DIR=${COLLECTION_OUTPUT_DIR:-rollouts/${TASK}_rgb_dp/chunk_idql/${COLLECTION_ROUND_LABEL}_N${COLLECTION_NUM_CANDIDATES}_${COLLECTION_POLICY_TAG}_${COLLECTION_SEED_LAYOUT_TAG}_collection}
+COLLECTION_RAW_NAME=${COLLECTION_RAW_NAME:-${TASK}_rgb_dp_chunk_idql_${COLLECTION_ROUND_LABEL}_N${COLLECTION_NUM_CANDIDATES}_${COLLECTION_POLICY_TAG}_${COLLECTION_SEED_LAYOUT_TAG}_rollouts_raw.hdf5}
 
 CHUNK_STEPS_PER_EPOCH=${CHUNK_STEPS_PER_EPOCH:-}
 CHUNK_STEPS_PER_EPOCH_ARGS=()
@@ -305,6 +371,8 @@ run_chunk_train() {
   local resume_path="${1:-}"
   local resume_args=()
   local initialization_args=()
+  local distributed_args=()
+  local train_launcher=("$PYTHON" -B)
   if [[ -n "$resume_path" ]]; then
     resume_args=(--resume-checkpoint "$resume_path")
   fi
@@ -338,8 +406,23 @@ run_chunk_train() {
       return 2
       ;;
   esac
-  "$PYTHON" -B scripts/train_rgb_dp_chunk_idql.py \
+  if (( CHUNK_NUM_GPUS > 1 )); then
+    train_launcher=(
+      "$PYTHON" -B -m torch.distributed.run
+      --standalone
+      --nnodes=1
+      "--nproc-per-node=$CHUNK_NUM_GPUS"
+    )
+    distributed_args=(
+      --distributed
+      --distributed-backend "${CHUNK_DISTRIBUTED_BACKEND:-auto}"
+    )
+    export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
+    echo "[rgb_dp_chunk_idql] distributed training: GPUs=$CHUNK_NUM_GPUS per-rank-batch=${CHUNK_BATCH_SIZE:-${BATCH_SIZE:-100}}" >&2
+  fi
+  "${train_launcher[@]}" scripts/train_rgb_dp_chunk_idql.py \
     --task "$TASK" \
+    "${distributed_args[@]}" \
     "${initialization_args[@]}" \
     --dataset "$IDQL_DATASET" \
     --output-dir "$CHUNK_IDQL_OUTPUT_DIR" \
@@ -361,6 +444,7 @@ run_chunk_train() {
     --target-tau "${TARGET_TAU:-0.01}" \
     --dynamics-target-sync-interval "${DYNAMICS_TARGET_SYNC_INTERVAL:-1000}" \
     --actor-lr "${CHUNK_ACTOR_LR:-${ACTOR_LR:-1e-4}}" \
+    --source-actor-l2-sp-weight "${SOURCE_ACTOR_L2_SP_WEIGHT:-0.0}" \
     --actor-lr-scheduler "${CHUNK_ACTOR_LR_SCHEDULER:-cosine}" \
     --actor-lr-warmup-steps "${CHUNK_ACTOR_LR_WARMUP_STEPS:-1000}" \
     --actor-lr-num-cycles "${CHUNK_ACTOR_LR_NUM_CYCLES:-0.5}" \
@@ -368,6 +452,7 @@ run_chunk_train() {
     --condition-dropout "${CHUNK_CONDITION_DROPOUT:-${CONDITION_DROPOUT:-0.0}}" \
     --condition-hidden-dim "${CHUNK_CONDITION_HIDDEN_DIM:-${CONDITION_HIDDEN_DIM:-128}}" \
     --critic-lr "${CHUNK_CRITIC_LR:-${CRITIC_LR:-1e-4}}" \
+    --source-critic-l2-sp-weight "${SOURCE_CRITIC_L2_SP_WEIGHT:-0.0}" \
     --encoder-lr "${CHUNK_ENCODER_LR:-1e-5}" \
     --vf-lr "${CHUNK_VF_LR:-${VF_LR:-1e-4}}" \
     --critic-vf-lr-scheduler "${CHUNK_CRITIC_VF_LR_SCHEDULER:-cosine}" \
@@ -395,12 +480,12 @@ run_chunk_train() {
 }
 
 case "$STAGE" in
-  train_chunk_idql|train_chunk_idql_round2)
+  train_chunk_idql|train_chunk_idql_round2|train_chunk_idql_round2_regularized)
     ensure_dataset
     run_chunk_train "${CHUNK_RESUME_CHECKPOINT:-}"
     ;;
 
-  train_chunk_idql_resilient|train_chunk_idql_round2_resilient)
+  train_chunk_idql_resilient|train_chunk_idql_round2_resilient|train_chunk_idql_round2_regularized_resilient)
     ensure_dataset
     max_restarts=${MAX_RESTARTS:-20}
     retry_sleep=${RETRY_SLEEP:-5}
@@ -457,6 +542,7 @@ case "$STAGE" in
     ;;
 
   collect_chunk_idql_rollouts_resilient)
+    echo "[rgb_dp_chunk_idql collection] task=$TASK N=$COLLECTION_NUM_CANDIDATES selection=$COLLECTION_SELECTION random_probability=$COLLECTION_RANDOM_SELECTION_PROBABILITY total_rollouts=$COLLECTION_TOTAL_ROLLOUTS rollouts_per_shard=$COLLECTION_ROLLOUTS_PER_SHARD seed_layout=$COLLECTION_SEED_LAYOUT_TAG policy_seeds=${COLLECTION_POLICY_SEEDS:-none} output=$COLLECTION_OUTPUT_DIR" >&2
     if (( COLLECTION_TOTAL_ROLLOUTS <= 0 || COLLECTION_ROLLOUTS_PER_SHARD <= 0 )); then
       echo "COLLECTION_TOTAL_ROLLOUTS and COLLECTION_ROLLOUTS_PER_SHARD must be positive." >&2
       exit 2
@@ -505,7 +591,8 @@ case "$STAGE" in
       --num-candidates "$COLLECTION_NUM_CANDIDATES" \
       --candidate-batch-size "${CANDIDATE_BATCH_SIZE:-16}" \
       --execution-horizon "${EXECUTION_HORIZON:-8}" \
-      --selection "${SELECTION:-argmax}" \
+      --selection "$COLLECTION_SELECTION" \
+      --random-selection-probability "$COLLECTION_RANDOM_SELECTION_PROBABILITY" \
       "${CHUNK_EVAL_CONDITION_ARGS[@]}" \
       --clip-actions \
       --no-env-hard-reset \
@@ -551,7 +638,7 @@ case "$STAGE" in
     ;;
 
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang] {train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang] {train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|train_chunk_idql_round2_regularized|train_chunk_idql_round2_regularized_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
     exit 2
     ;;
 esac
