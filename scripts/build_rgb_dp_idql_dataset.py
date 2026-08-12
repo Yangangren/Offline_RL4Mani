@@ -4,10 +4,9 @@
 The default ``task`` reward mode keeps each source trajectory's environment
 reward. The optional ``rise`` mode reproduces the prior binary imitation reward
 (human transition 1, rollout transition 0). Source identity and the actor's
-human-demo condition are stored separately from critic rewards: human
-transitions use condition 1 and every deployment rollout transition uses
-condition 0. Large arrays stay in their source HDF5 files through external
-links; shifted ``next_obs`` arrays are HDF5 virtual datasets.
+condition are stored separately from critic rewards. Large arrays stay in their
+source HDF5 files through external links; shifted ``next_obs`` arrays are HDF5
+virtual datasets.
 """
 
 from __future__ import annotations
@@ -34,6 +33,18 @@ REWARD_DEFINITIONS = {
     "task": "source_task_reward",
     "rise": "expert_transition=1; non_expert_transition=0",
 }
+ACTOR_CONDITION_DEFINITIONS = {
+    "human_only": "human_demo=1; success_rollout=0; failure_rollout=0",
+    "human_success": "human_demo=1; success_rollout=1; failure_rollout=0",
+}
+
+
+def actor_condition_value(source_label: str, mode: str) -> bool:
+    if mode == "human_only":
+        return source_label == "expert"
+    if mode == "human_success":
+        return source_label != "non_expert_failure"
+    raise ValueError(f"unsupported actor condition mode: {mode}")
 
 
 def decode(values: np.ndarray) -> list[str]:
@@ -106,6 +117,7 @@ def add_episode(
     source_key: str,
     source_label: str,
     reward_mode: str,
+    actor_condition_mode: str,
 ) -> int:
     with h5py.File(source_path, "r") as source_file:
         source_group = source_file[f"data/{source_key}"]
@@ -163,7 +175,7 @@ def add_episode(
             "actor_condition",
             data=np.full(
                 count,
-                source_label == "expert",
+                actor_condition_value(source_label, actor_condition_mode),
                 dtype=np.uint8,
             ),
         )
@@ -242,6 +254,7 @@ def build(args: argparse.Namespace) -> dict:
                 source_key,
                 source,
                 args.reward_mode,
+                args.actor_condition_mode,
             )
             if source == "expert":
                 episode_keys["expert"].append(output_key)
@@ -266,8 +279,9 @@ def build(args: argparse.Namespace) -> dict:
             "source_is_expert=1 for human demo; 0 for deployment rollout"
         )
         output.attrs["actor_condition_definition"] = (
-            "human_demo=1; success_rollout=0; failure_rollout=0"
+            ACTOR_CONDITION_DEFINITIONS[args.actor_condition_mode]
         )
+        output.attrs["actor_condition_mode"] = str(args.actor_condition_mode)
         output.attrs["sampling_definition"] = (
             "one concatenated dataset; uniform over SequenceDataset indices"
         )
@@ -286,8 +300,9 @@ def build(args: argparse.Namespace) -> dict:
             "source_is_expert=1 for human demo; 0 for deployment rollout"
         ),
         "actor_condition_definition": (
-            "human_demo=1; success_rollout=0; failure_rollout=0"
+            ACTOR_CONDITION_DEFINITIONS[args.actor_condition_mode]
         ),
+        "actor_condition_mode": str(args.actor_condition_mode),
         "sampling_definition": "one dataset; uniform shuffled transition-window sampling",
         "expert": {
             "source": str(args.expert_dataset),
@@ -342,6 +357,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "task keeps source environment rewards (default); rise assigns "
             "human transition=1 and rollout transition=0"
+        ),
+    )
+    parser.add_argument(
+        "--actor-condition-mode",
+        choices=tuple(ACTOR_CONDITION_DEFINITIONS),
+        default="human_only",
+        help=(
+            "human_only labels only demonstrations as condition 1; "
+            "human_success labels demonstrations and successful deployment "
+            "rollouts as 1 and failure rollouts as 0"
         ),
     )
     parser.add_argument("--seed", type=int, default=0)

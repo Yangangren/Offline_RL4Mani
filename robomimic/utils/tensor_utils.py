@@ -256,7 +256,7 @@ def contiguous(x):
     )
 
 
-def to_device(x, device):
+def to_device(x, device, non_blocking=False):
     """
     Sends all torch tensors in nested dictionary or list or tuple to device
     @device, and returns a new nested structure.
@@ -271,7 +271,7 @@ def to_device(x, device):
     return recursive_dict_list_tuple_apply(
         x,
         {
-            torch.Tensor: lambda x, d=device: x.to(d),
+            torch.Tensor: lambda x, d=device: x.to(d, non_blocking=non_blocking),
             type(None): lambda x: x,
         }
     )

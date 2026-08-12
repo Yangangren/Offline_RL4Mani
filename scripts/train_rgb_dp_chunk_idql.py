@@ -41,7 +41,6 @@ from train_rgb_dp_idql import (
     align_shared_batch_actions,
     atomic_torch_save,
     build_single_loader,
-    configure_actor_optimizer,
     dataset_audit,
     initialize_actor_from_deployed_ema,
     jsonable,
@@ -52,7 +51,6 @@ from train_rgb_dp_idql import (
     replace_with_hardlink,
     restore_rng_state,
     rng_state,
-    scalar_metrics,
     write_json,
 )
 
@@ -71,13 +69,34 @@ DEFAULT_OUTPUT = (
     / "trained_models/square_rgb_dp_chunk_idql_rise"
     / "200demo_100success_94failure_h8_dynamics_task_reward"
 )
-ACTOR_CONDITION_DEFINITION = (
-    "human_demo=1; success_rollout=0; failure_rollout=0"
-)
+ACTOR_CONDITION_DEFINITIONS = {
+    "human_only": "human_demo=1; success_rollout=0; failure_rollout=0",
+    "human_success": "human_demo=1; success_rollout=1; failure_rollout=0",
+}
 DYNAMICS_PREDICTION_MODE = "actor_encoder_direct"
 JOINT_ACTOR_INITIALIZATIONS = frozenset(
     ("pretrained_dp_joint", "source_chunk_idql_joint")
 )
+
+
+def actor_condition_definition(mode: str) -> str:
+    return ACTOR_CONDITION_DEFINITIONS[str(mode)]
+
+
+def actor_condition_sources(mode: str) -> tuple[list[str], list[str]]:
+    if mode == "human_only":
+        return ["human_demo"], ["success_rollout", "failure_rollout"]
+    if mode == "human_success":
+        return ["human_demo", "success_rollout"], ["failure_rollout"]
+    raise ValueError(f"unsupported actor condition mode: {mode}")
+
+
+def actor_condition_labels(mode: str) -> dict[str, float]:
+    positive, _ = actor_condition_sources(mode)
+    return {
+        source: float(source in positive)
+        for source in ("human_demo", "success_rollout", "failure_rollout")
+    }
 
 
 @dataclass(frozen=True)
@@ -164,6 +183,84 @@ def initialize_distributed(args: argparse.Namespace) -> DistributedContext:
     return context
 
 
+BATCH_SCALED_STEP_FIELDS = (
+    "actor_lr_warmup_steps",
+    "critic_vf_lr_warmup_steps",
+    "dynamics_warmup_steps",
+    "encoder_freeze_steps",
+    "vf_encoder_freeze_steps",
+    "dynamics_target_sync_interval",
+)
+
+
+def batch_scaled_step_count(
+    reference_steps,
+    reference_batch_size,
+    effective_batch_size,
+):
+    """Translate a reference-batch step count to the same sample count."""
+    reference_steps = int(reference_steps)
+    if reference_steps <= 0:
+        return 0
+    return max(
+        1,
+        int(
+            round(
+                reference_steps
+                * float(reference_batch_size)
+                / float(effective_batch_size)
+            )
+        ),
+    )
+
+
+def batch_scaled_tau(reference_tau, reference_batch_size, effective_batch_size):
+    """Preserve target-network decay per processed sample."""
+    reference_tau = float(reference_tau)
+    if reference_tau <= 0.0 or reference_tau >= 1.0:
+        return reference_tau
+    batch_ratio = float(effective_batch_size) / float(reference_batch_size)
+    return float(-np.expm1(np.log1p(-reference_tau) * batch_ratio))
+
+
+def configure_batch_scaled_semantics(
+    args: argparse.Namespace,
+    context: DistributedContext,
+) -> None:
+    reference_batch_size = int(args.schedule_reference_batch_size)
+    effective_batch_size = int(args.batch_size) * int(context.world_size)
+    if reference_batch_size <= 0 or effective_batch_size <= 0:
+        raise ValueError("reference and effective batch sizes must be positive")
+    args.effective_global_batch_size = effective_batch_size
+    args.schedule_batch_ratio = (
+        float(effective_batch_size) / float(reference_batch_size)
+    )
+    for field in BATCH_SCALED_STEP_FIELDS:
+        setattr(
+            args,
+            f"resolved_{field}",
+            batch_scaled_step_count(
+                getattr(args, field),
+                reference_batch_size,
+                effective_batch_size,
+            ),
+        )
+    args.resolved_target_tau = batch_scaled_tau(
+        args.target_tau,
+        reference_batch_size,
+        effective_batch_size,
+    )
+
+
+def modules_have_mutable_batch_norm(modules) -> bool:
+    return any(
+        isinstance(layer, nn.modules.batchnorm._BatchNorm)
+        and bool(layer.track_running_stats)
+        for module in modules
+        for layer in module.modules()
+    )
+
+
 def seed_process(seed: int, device: torch.device) -> None:
     random.seed(int(seed))
     np.random.seed(int(seed))
@@ -229,8 +326,9 @@ def all_reduce_gradients(
     parameters,
     context: DistributedContext,
     bucket_cap_mb: float = 25.0,
+    preserve_unused_parameters: bool = True,
 ) -> None:
-    """Average dense gradients in bounded flat buckets across all ranks."""
+    """Average dense gradients with fixed-order asynchronous NCCL buckets."""
     if not context.enabled:
         return
     cap_bytes = max(1, int(float(bucket_cap_mb) * 1024 * 1024))
@@ -239,38 +337,41 @@ def all_reduce_gradients(
     ]
     if not trainable_parameters:
         return
-    globally_used = torch.tensor(
-        [parameter.grad is not None for parameter in trainable_parameters],
-        dtype=torch.int32,
-        device=context.device,
-    )
-    dist.all_reduce(globally_used, op=dist.ReduceOp.MAX)
+
+    globally_used = None
+    usage_work = None
+    if preserve_unused_parameters:
+        globally_used = torch.tensor(
+            [parameter.grad is not None for parameter in trainable_parameters],
+            dtype=torch.int32,
+            device=context.device,
+        )
+        usage_work = dist.all_reduce(
+            globally_used,
+            op=dist.ReduceOp.MAX,
+            async_op=True,
+        )
+
     bucket: list[torch.Tensor] = []
     bucket_bytes = 0
     bucket_key = None
+    pending = []
 
-    def flush() -> None:
+    def launch() -> None:
         nonlocal bucket, bucket_bytes, bucket_key
         if not bucket:
             return
-        flat = torch.cat([gradient.reshape(-1) for gradient in bucket])
-        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-        flat.mul_(1.0 / float(context.world_size))
-        offset = 0
-        for gradient in bucket:
-            count = int(gradient.numel())
-            gradient.copy_(flat[offset : offset + count].view_as(gradient))
-            offset += count
+        gradients = tuple(bucket)
+        flat = torch.cat([gradient.reshape(-1) for gradient in gradients])
+        work = dist.all_reduce(flat, op=dist.ReduceOp.SUM, async_op=True)
+        pending.append((work, flat, gradients))
         bucket = []
         bucket_bytes = 0
         bucket_key = None
 
-    for parameter, parameter_is_used in zip(
-        trainable_parameters,
-        globally_used.tolist(),
-    ):
-        if not parameter_is_used:
-            continue
+    # Every rank reduces every trainable parameter in the same order. Locally
+    # unused parameters contribute zeros so collective ordering cannot diverge.
+    for parameter in trainable_parameters:
         if parameter.grad is None:
             parameter.grad = torch.zeros_like(
                 parameter,
@@ -284,28 +385,67 @@ def all_reduce_gradients(
         if bucket and (
             key != bucket_key or bucket_bytes + gradient_bytes > cap_bytes
         ):
-            flush()
+            launch()
         bucket_key = key
         bucket.append(gradient)
         bucket_bytes += gradient_bytes
-    flush()
+    launch()
+
+    scale = 1.0 / float(context.world_size)
+    for work, flat, gradients in pending:
+        work.wait()
+        flat.mul_(scale)
+        offset = 0
+        for gradient in gradients:
+            count = int(gradient.numel())
+            gradient.copy_(flat[offset : offset + count].view_as(gradient))
+            offset += count
+    if usage_work is not None:
+        usage_work.wait()
+        globally_used_host = globally_used.cpu().tolist()
+        for parameter, parameter_is_used in zip(
+            trainable_parameters,
+            globally_used_host,
+        ):
+            if not parameter_is_used:
+                parameter.grad = None
 
 
 def mean_distributed_scalars(
-    metrics: dict[str, float],
+    metrics: dict[str, Any],
     context: DistributedContext,
 ) -> dict[str, float]:
-    if not context.enabled or not metrics:
-        return metrics
+    """Materialize and optionally average scalar tensors with one synchronization."""
+    if not metrics:
+        return {}
     keys = sorted(metrics)
-    values = torch.tensor(
-        [float(metrics[key]) for key in keys],
-        dtype=torch.float64,
-        device=context.device,
-    )
-    dist.all_reduce(values, op=dist.ReduceOp.SUM)
-    values.mul_(1.0 / float(context.world_size))
-    return {key: float(value) for key, value in zip(keys, values.cpu().tolist())}
+    scalar_tensors = []
+    for key in keys:
+        value = metrics[key]
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError(f"metric {key!r} is not scalar: {tuple(value.shape)}")
+            scalar_tensors.append(
+                value.detach().reshape(()).to(
+                    device=context.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+            )
+        else:
+            scalar_tensors.append(
+                torch.as_tensor(
+                    value,
+                    device=context.device,
+                    dtype=torch.float32,
+                )
+            )
+    values = torch.stack(scalar_tensors)
+    if context.enabled:
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        values.mul_(1.0 / float(context.world_size))
+    host_values = values.cpu().tolist()
+    return {key: float(value) for key, value in zip(keys, host_values)}
 
 
 def gather_rank_runtime_states(
@@ -328,13 +468,6 @@ def gather_rank_runtime_states(
 
 def trains_joint_actor(args: argparse.Namespace) -> bool:
     return str(args.initialization) in JOINT_ACTOR_INITIALIZATIONS
-
-
-def uses_source_l2_sp(args: argparse.Namespace) -> bool:
-    return (
-        float(args.source_actor_l2_sp_weight) > 0.0
-        or float(args.source_critic_l2_sp_weight) > 0.0
-    )
 
 
 class RiseChunkActionValueNetwork(nn.Module):
@@ -713,6 +846,113 @@ def configure_conditioned_actor(actor_algo, args: argparse.Namespace) -> None:
     actor_algo.success_condition_dropout = float(args.condition_dropout)
 
 
+def install_pretrained_actor_reference(
+    actor_algo,
+    *,
+    weight: float,
+    batch_fraction: float,
+) -> dict[str, Any]:
+    """Install an exact frozen copy of the originally deployed DP EMA."""
+    if actor_algo.ema is None:
+        raise RuntimeError(
+            "actor reference distillation requires a pretrained DP EMA"
+        )
+    if actor_algo.reference_policy_enabled or actor_algo.hazard_constraint_enabled:
+        raise RuntimeError(
+            "actor reference distillation is incompatible with existing "
+            "reference-margin or hazard objectives"
+        )
+    teacher = copy.deepcopy(actor_algo.ema.averaged_model).float().to(
+        actor_algo.device
+    )
+    if "condition_adapter" in teacher["policy"]:
+        raise RuntimeError(
+            "the reference teacher must be the original unconditional "
+            "pretrained DP EMA"
+        )
+    teacher.train()
+    teacher.requires_grad_(False)
+    actor_algo.reference_nets = teacher
+    actor_algo.reference_distillation_weight = float(weight)
+    actor_algo.reference_distillation_batch_fraction = float(batch_fraction)
+    if any(parameter.requires_grad for parameter in teacher.parameters()):
+        raise RuntimeError("the pretrained actor reference is not frozen")
+    return {
+        "source": "original_pretrained_DP_deployed_EMA",
+        "objective": "same_crop_noisy_action_timestep_noise_prediction_MSE",
+        "student_condition": 1.0,
+        "student_condition_mask": 1.0,
+        "weight": float(weight),
+        "batch_fraction": float(batch_fraction),
+        "teacher_parameter_count": parameter_count(teacher),
+        "teacher_trainable_parameter_count": 0,
+    }
+
+
+def configure_chunk_actor_optimizer(
+    actor_algo,
+    *,
+    adapter_lr: float,
+    unet_lr: float,
+    obs_encoder_lr: float,
+    scheduler_type: str,
+    warmup_steps: int,
+    total_steps: int,
+    num_cycles: float,
+) -> None:
+    """Use independent Adam learning rates for the three actor components."""
+    policy = actor_algo.nets["policy"]
+    expected_modules = (
+        ("condition_adapter", float(adapter_lr)),
+        ("noise_pred_net", float(unet_lr)),
+        ("obs_encoder", float(obs_encoder_lr)),
+    )
+    if set(policy.keys()) != {name for name, _ in expected_modules}:
+        raise RuntimeError(
+            "unexpected actor policy modules for grouped optimization: "
+            f"{tuple(policy.keys())}"
+        )
+
+    parameter_groups = []
+    grouped_parameter_ids: set[int] = set()
+    for name, learning_rate in expected_modules:
+        parameters = list(policy[name].parameters())
+        if not parameters:
+            raise RuntimeError(f"actor module {name!r} has no parameters")
+        duplicates = [
+            parameter
+            for parameter in parameters
+            if id(parameter) in grouped_parameter_ids
+        ]
+        if duplicates:
+            raise RuntimeError(f"actor module {name!r} shares optimizer parameters")
+        for parameter in parameters:
+            parameter.requires_grad_(True)
+            grouped_parameter_ids.add(id(parameter))
+        parameter_groups.append(
+            {
+                "params": parameters,
+                "lr": learning_rate,
+                "group_name": name,
+            }
+        )
+
+    all_parameters = list(policy.parameters())
+    if grouped_parameter_ids != {id(parameter) for parameter in all_parameters}:
+        raise RuntimeError("the grouped actor optimizer does not cover the policy")
+    actor_algo.optimizers["policy"] = torch.optim.Adam(parameter_groups)
+    actor_algo.lr_schedulers["policy"] = make_step_lr_scheduler(
+        actor_algo.optimizers["policy"],
+        scheduler_type=scheduler_type,
+        warmup_steps=warmup_steps,
+        total_steps=total_steps,
+        num_cycles=num_cycles,
+    )
+    actor_algo.step_lr_schedulers_every_batch["policy"] = (
+        actor_algo.lr_schedulers["policy"] is not None
+    )
+
+
 def gather_time(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     rows = torch.arange(values.shape[0], device=values.device)
     return values[rows, indices]
@@ -723,13 +963,13 @@ def source_condition_labels(
     *,
     current_index: int,
 ) -> torch.Tensor:
-    """Map human demos to 1 and every rollout to 0, independent of rewards."""
+    """Read explicit actor labels, independently of source identity and reward."""
     batch_size = int(raw_batch["actions"].shape[0])
-    labels_by_time = raw_batch.get("source_is_expert")
-    label_source = "source_is_expert"
+    labels_by_time = raw_batch.get("actor_condition")
+    label_source = "actor_condition"
     if labels_by_time is None:
         raise KeyError(
-            "conditioned actor batch is missing source_is_expert; rebuild the "
+            "conditioned actor batch is missing actor_condition; rebuild the "
             "mixed dataset with the current build_rgb_dp_idql_dataset.py"
         )
     if labels_by_time.ndim < 2 or labels_by_time.shape[1] <= current_index:
@@ -747,15 +987,15 @@ def source_condition_labels(
     labels = labels[:, 0].float()
     zeros = torch.zeros_like(labels)
     ones = torch.ones_like(labels)
-    is_rollout = torch.isclose(labels, zeros, atol=1e-6, rtol=0.0)
-    is_human = torch.isclose(labels, ones, atol=1e-6, rtol=0.0)
-    if not torch.all(is_rollout | is_human):
-        invalid = labels[~(is_rollout | is_human)]
+    is_zero = torch.isclose(labels, zeros, atol=1e-6, rtol=0.0)
+    is_one = torch.isclose(labels, ones, atol=1e-6, rtol=0.0)
+    if not torch.all(is_zero | is_one):
+        invalid = labels[~(is_zero | is_one)]
         raise ValueError(
             f"actor condition expected {label_source} values 0 or 1, got "
             f"values={invalid[:8].detach().cpu().tolist()}"
         )
-    return is_human.to(dtype=torch.float32)
+    return is_one.to(dtype=torch.float32)
 
 
 def add_actor_condition(
@@ -780,22 +1020,41 @@ def audit_actor_conditions(
     dataset_path: Path,
     *,
     reward_mode: str,
+    actor_condition_mode: str,
 ) -> dict[str, Any]:
     """Validate actor labels independently of the selected critic reward."""
+    expected_definition = actor_condition_definition(actor_condition_mode)
+    expected_labels = actor_condition_labels(actor_condition_mode)
+    positive_sources, negative_sources = actor_condition_sources(
+        actor_condition_mode
+    )
     episode_counts = {
         "human_demo": 0,
         "success_rollout": 0,
         "failure_rollout": 0,
     }
     transition_counts = {key: 0 for key in episode_counts}
-    redundant_condition_episodes = 0
-    redundant_condition_mismatches = 0
     source_names = {
         "expert": "human_demo",
         "non_expert_success": "success_rollout",
         "non_expert_failure": "failure_rollout",
     }
     with h5py.File(dataset_path, "r") as handle:
+        dataset_mode = str(handle.attrs.get("actor_condition_mode", "human_only"))
+        dataset_definition = str(
+            handle.attrs.get("actor_condition_definition", "")
+        )
+        if dataset_mode != actor_condition_mode:
+            raise ValueError(
+                f"dataset actor_condition_mode={dataset_mode!r} does not "
+                f"match requested mode={actor_condition_mode!r}; rebuild it"
+            )
+        if dataset_definition != expected_definition:
+            raise ValueError(
+                "dataset actor condition definition="
+                f"{dataset_definition!r} does not match requested "
+                f"{expected_definition!r}; rebuild it"
+            )
         for episode_key, episode in handle["data"].items():
             source = episode.attrs.get("rise_source")
             if isinstance(source, bytes):
@@ -806,66 +1065,63 @@ def audit_actor_conditions(
                     f"data/{episode_key} has unsupported rise_source={source!r}"
                 )
             source_name = source_names[source]
-            expected = 1.0 if source == "expert" else 0.0
             if "source_is_expert" not in episode:
                 raise ValueError(
                     f"data/{episode_key} is missing source_is_expert; rebuild "
-                    f"the {reward_mode}-reward dataset so human rows use "
-                    "condition 1 and all rollout rows use condition 0"
+                    f"the {reward_mode}-reward dataset"
                 )
-            label_key = "source_is_expert"
-            labels = np.asarray(episode[label_key][:], dtype=np.float32)
-            if labels.size < 1 or not np.allclose(
-                labels,
-                expected,
+            source_labels = np.asarray(
+                episode["source_is_expert"][:], dtype=np.float32
+            )
+            expected_source_label = 1.0 if source == "expert" else 0.0
+            if source_labels.size < 1 or not np.allclose(
+                source_labels,
+                expected_source_label,
                 atol=1e-6,
                 rtol=0.0,
             ):
-                unique = np.unique(labels).tolist()
+                unique = np.unique(source_labels).tolist()
                 raise ValueError(
-                    f"data/{episode_key} source={source!r} must map to "
-                    f"condition={expected}, got {label_key}={unique[:8]}"
+                    f"data/{episode_key} source={source!r} has invalid "
+                    f"source_is_expert={unique[:8]}"
                 )
-            if "actor_condition" in episode:
-                redundant_condition_episodes += 1
-                redundant_labels = np.asarray(
-                    episode["actor_condition"][:],
-                    dtype=np.float32,
+            if "actor_condition" not in episode:
+                raise ValueError(
+                    f"data/{episode_key} is missing actor_condition; rebuild "
+                    f"the {reward_mode}-reward dataset"
                 )
-                if redundant_labels.shape != labels.shape or not np.allclose(
-                    redundant_labels,
-                    expected,
-                    atol=1e-6,
-                    rtol=0.0,
-                ):
-                    redundant_condition_mismatches += 1
+            condition_labels = np.asarray(
+                episode["actor_condition"][:], dtype=np.float32
+            )
+            expected_condition = expected_labels[source_name]
+            if condition_labels.shape != source_labels.shape or not np.allclose(
+                condition_labels,
+                expected_condition,
+                atol=1e-6,
+                rtol=0.0,
+            ):
+                unique = np.unique(condition_labels).tolist()
+                raise ValueError(
+                    f"data/{episode_key} source={source!r} must map to actor "
+                    f"condition={expected_condition}, got {unique[:8]}"
+                )
             episode_counts[source_name] += 1
-            transition_counts[source_name] += int(labels.size)
-    if episode_counts["human_demo"] == 0:
-        raise ValueError("conditioned actor dataset contains no human demos")
-    if (
-        episode_counts["success_rollout"]
-        + episode_counts["failure_rollout"]
-        == 0
-    ):
-        raise ValueError("conditioned actor dataset contains no rollout data")
-    if redundant_condition_mismatches:
-        print(
-            "[chunk_idql] ignoring stale actor_condition labels in "
-            f"{redundant_condition_mismatches} episodes; actor conditions are "
-            "derived only from source_is_expert",
-            flush=True,
+            transition_counts[source_name] += int(condition_labels.size)
+    missing_sources = [
+        source for source, count in episode_counts.items() if count == 0
+    ]
+    if missing_sources:
+        raise ValueError(
+            "conditioned actor dataset is missing required sources: "
+            f"{missing_sources}"
         )
     return {
-        "definition": ACTOR_CONDITION_DEFINITION,
-        "positive_sources": ["human_demo"],
-        "negative_sources": ["success_rollout", "failure_rollout"],
-        "dataset_key": "source_is_expert",
-        "redundant_actor_condition_key_loaded": False,
-        "redundant_actor_condition_episodes": redundant_condition_episodes,
-        "redundant_actor_condition_mismatch_episodes": (
-            redundant_condition_mismatches
-        ),
+        "mode": str(actor_condition_mode),
+        "definition": expected_definition,
+        "positive_sources": positive_sources,
+        "negative_sources": negative_sources,
+        "dataset_key": "actor_condition",
+        "source_identity_key": "source_is_expert",
         "condition_mask": 1.0,
         "episode_counts": episode_counts,
         "transition_counts": transition_counts,
@@ -944,10 +1200,17 @@ def process_chunk_batch(
             key: raw_batch["obs"][key][:, current_index]
             for key in actor_algo.obs_shapes
         },
-        "next_obs": {
-            key: gather_time(raw_batch["next_obs"][key], next_indices)
-            for key in actor_algo.obs_shapes
-        },
+        "next_obs": (
+            {
+                key: raw_batch["next_obs"][key][:, 0]
+                for key in actor_algo.obs_shapes
+            }
+            if "chunk_sparse_next_obs" in raw_batch
+            else {
+                key: gather_time(raw_batch["next_obs"][key], next_indices)
+                for key in actor_algo.obs_shapes
+            }
+        ),
         "actions": actions * action_mask.unsqueeze(-1),
         "action_mask": action_mask,
         "reward": chunk_return.reshape(-1, 1),
@@ -956,19 +1219,25 @@ def process_chunk_batch(
         "exact_next": exact_next.reshape(-1, 1),
         "goal_obs": raw_batch.get("goal_obs"),
     }
-    batch = TensorUtils.to_device(TensorUtils.to_float(batch), actor_algo.device)
+    batch = TensorUtils.to_device(
+        TensorUtils.to_float(batch),
+        actor_algo.device,
+        non_blocking=actor_algo.device.type == "cuda",
+    )
     batch = actor_algo.postprocess_batch_for_training(
         batch, obs_normalization_stats=obs_normalization_stats
     )
-    if not torch.isfinite(batch["actions"]).all():
-        raise ValueError("chunk critic actions contain non-finite values")
-    action_min = float(batch["actions"].min().item())
-    action_max = float(batch["actions"].max().item())
-    if action_min < -1.001 or action_max > 1.001:
-        raise ValueError(
-            "chunk actions are outside the pretrained normalized space: "
-            f"min={action_min:.6f}, max={action_max:.6f}"
-        )
+    if not bool(getattr(actor_algo, "_chunk_action_range_validated", False)):
+        if not torch.isfinite(batch["actions"]).all():
+            raise ValueError("chunk critic actions contain non-finite values")
+        action_min = float(batch["actions"].min().item())
+        action_max = float(batch["actions"].max().item())
+        if action_min < -1.001 or action_max > 1.001:
+            raise ValueError(
+                "chunk actions are outside the pretrained normalized space: "
+                f"min={action_min:.6f}, max={action_max:.6f}"
+            )
+        actor_algo._chunk_action_range_validated = True
     batch["actions"] = batch["actions"].clamp(-1.0, 1.0)
     return batch
 
@@ -1031,53 +1300,6 @@ def configure_encoder_target_random_crops(encoder: nn.Module) -> None:
             module.train()
 
 
-ParameterL2SPAnchor = tuple[tuple[nn.Parameter, torch.Tensor], ...]
-
-
-def make_parameter_l2_sp_anchor(
-    module: nn.Module,
-    source_state: dict[str, torch.Tensor],
-    *,
-    label: str,
-) -> ParameterL2SPAnchor:
-    """Copy a source checkpoint's parameters without registering new buffers."""
-    anchors = []
-    missing = []
-    for name, parameter in module.named_parameters():
-        if name not in source_state:
-            missing.append(name)
-            continue
-        source = source_state[name]
-        if tuple(source.shape) != tuple(parameter.shape):
-            raise ValueError(
-                f"{label} L2-SP shape mismatch for {name}: "
-                f"source={tuple(source.shape)}, current={tuple(parameter.shape)}"
-            )
-        anchors.append(
-            (
-                parameter,
-                source.detach().to(
-                    device=parameter.device,
-                    dtype=parameter.dtype,
-                ).clone(),
-            )
-        )
-    if missing:
-        raise KeyError(f"{label} source is missing parameters: {missing[:8]}")
-    if not anchors:
-        raise RuntimeError(f"{label} L2-SP anchor contains no parameters")
-    return tuple(anchors)
-
-
-def parameter_l2_sp_loss(anchor: ParameterL2SPAnchor) -> torch.Tensor:
-    squared_distance = sum(
-        (parameter - source).square().sum()
-        for parameter, source in anchor
-    )
-    numel = sum(int(parameter.numel()) for parameter, _ in anchor)
-    return squared_distance / float(numel)
-
-
 def compute_chunk_losses(
     critics: nn.ModuleList,
     targets: nn.ModuleList,
@@ -1090,8 +1312,6 @@ def compute_chunk_losses(
     use_huber: bool,
     dynamics_weight: float,
     dynamics_cosine_weight: float,
-    critic_l2_sp_anchors: tuple[ParameterL2SPAnchor, ...] | None = None,
-    critic_l2_sp_weight: float = 0.0,
 ) -> tuple[list[torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
     device = batch["actions"].device
     crop_seeds = torch.randint(
@@ -1160,15 +1380,7 @@ def compute_chunk_losses(
     dynamics_rmse = []
     weighted_dynamics_losses = []
     q_losses = []
-    critic_l2_sp_losses = []
-    weighted_critic_l2_sp_losses = []
-    if critic_l2_sp_anchors is not None and (
-        len(critic_l2_sp_anchors) != len(critics)
-    ):
-        raise ValueError("critic L2-SP anchor count does not match critics")
-    for index, (output, target_features) in enumerate(
-        zip(outputs, target_next_encoder_features)
-    ):
+    for output, target_features in zip(outputs, target_next_encoder_features):
         q_loss = regression(output["q"], q_backup)
         dyn_l1, dyn_cos, dyn_rmse = masked_dynamics_losses(
             output["predicted_next_encoder"],
@@ -1179,25 +1391,12 @@ def compute_chunk_losses(
             float(dynamics_weight) * dyn_l1
             + float(dynamics_cosine_weight) * dyn_cos
         )
-        if critic_l2_sp_anchors is not None:
-            critic_l2_sp_loss = parameter_l2_sp_loss(
-                critic_l2_sp_anchors[index]
-            )
-        else:
-            critic_l2_sp_loss = q_loss.new_zeros(())
-        weighted_critic_l2_sp_loss = (
-            float(critic_l2_sp_weight) * critic_l2_sp_loss
-        )
-        critic_losses.append(
-            q_loss + dynamics_loss + weighted_critic_l2_sp_loss
-        )
+        critic_losses.append(q_loss + dynamics_loss)
         q_losses.append(q_loss)
         dynamics_l1.append(dyn_l1)
         dynamics_cosine.append(dyn_cos)
         dynamics_rmse.append(dyn_rmse)
         weighted_dynamics_losses.append(dynamics_loss)
-        critic_l2_sp_losses.append(critic_l2_sp_loss)
-        weighted_critic_l2_sp_losses.append(weighted_critic_l2_sp_loss)
 
     with fork_rng_with_seed(vf_crop_seed, device):
         vf_pred = vf(obs_dict=batch["obs"], goal_dict=batch["goal_obs"])
@@ -1217,28 +1416,11 @@ def compute_chunk_losses(
             for index, loss in enumerate(critic_losses)
         },
         **{
-            f"critic/q{index + 1}_l2_sp_loss": loss.detach()
-            for index, loss in enumerate(critic_l2_sp_losses)
-        },
-        **{
-            f"critic/q{index + 1}_weighted_l2_sp_loss": loss.detach()
-            for index, loss in enumerate(weighted_critic_l2_sp_losses)
-        },
-        **{
             f"critic/q{index + 1}_mean": output["q"].mean().detach()
             for index, output in enumerate(outputs)
         },
         "critic/q_target_mean": q_backup.mean().detach(),
         "critic/q_ensemble_std": q_predictions.std(dim=1).mean().detach(),
-        "critic/l2_sp_loss": torch.stack(
-            critic_l2_sp_losses
-        ).mean().detach(),
-        "critic/weighted_l2_sp_loss": torch.stack(
-            weighted_critic_l2_sp_losses
-        ).mean().detach(),
-        "critic/l2_sp_weight": q_predictions.new_tensor(
-            float(critic_l2_sp_weight)
-        ),
         "vf/loss": vf_loss.detach(),
         "vf/value_mean": vf_pred.mean().detach(),
         "vf/target_q_min_mean": target_q_min.mean().detach(),
@@ -1340,27 +1522,35 @@ def update_networks(
     max_gradient_norm: float | None,
     gradient_sync_fn=None,
 ) -> None:
-    for critic, target, optimizer, loss in zip(
-        critics, targets, critic_optimizers, critic_losses
-    ):
-        TorchUtils.backprop_for_loss(
-            net=critic,
-            optim=optimizer,
-            loss=loss,
-            max_grad_norm=max_gradient_norm,
-            retain_graph=False,
-            grad_sync_fn=gradient_sync_fn,
+    """Backpropagate Q1/Q2/V first, then synchronize their gradients once."""
+    optimizers = [*critic_optimizers, vf_optimizer]
+    parameter_groups = [
+        [
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        ]
+        for optimizer in optimizers
+    ]
+    for optimizer in optimizers:
+        optimizer.zero_grad(set_to_none=True)
+    for loss in critic_losses:
+        loss.backward()
+    vf_loss.backward()
+
+    if gradient_sync_fn is not None:
+        gradient_sync_fn(
+            parameter
+            for parameters in parameter_groups
+            for parameter in parameters
         )
-        with torch.no_grad():
-            TorchUtils.soft_update(critic, target, tau=float(target_tau))
-    TorchUtils.backprop_for_loss(
-        net=vf,
-        optim=vf_optimizer,
-        loss=vf_loss,
-        max_grad_norm=max_gradient_norm,
-        retain_graph=False,
-        grad_sync_fn=gradient_sync_fn,
-    )
+    if max_gradient_norm is not None:
+        for parameters in parameter_groups:
+            torch.nn.utils.clip_grad_norm_(parameters, max_gradient_norm)
+    for optimizer in optimizers:
+        optimizer.step()
+    for critic, target in zip(critics, targets):
+        TorchUtils.soft_update(critic, target, tau=float(target_tau))
 
 
 def validate_source(source: dict, args: argparse.Namespace) -> None:
@@ -1393,7 +1583,7 @@ def validate_source(source: dict, args: argparse.Namespace) -> None:
 
 
 def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
-    """Validate a complete chunk checkpoint before round-to-round warm start."""
+    """Validate a complete chunk checkpoint before a joint warm start."""
     if not source.get("rise_style_rgb_chunk_idql", False):
         raise ValueError(
             "source-chunk-idql-checkpoint is not a chunk IDQL checkpoint"
@@ -1410,21 +1600,23 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
         )
     if not bool(source.get("conditioned_actor", False)):
         raise ValueError(
-            "round-2 joint warm start requires a conditioned source actor"
+            "joint chunk warm start requires a conditioned source actor"
         )
     source_condition_definition = str(
         source.get("actor_condition_label_definition", "")
     )
-    if source_condition_definition != ACTOR_CONDITION_DEFINITION:
+    required_condition_definition = actor_condition_definition(
+        args.actor_condition_mode
+    )
+    if source_condition_definition != required_condition_definition:
         raise ValueError(
             "source actor condition definition="
             f"{source_condition_definition!r} does not match required "
-            f"{ACTOR_CONDITION_DEFINITION!r}"
+            f"{required_condition_definition!r}"
         )
     if not bool(args.conditioned_actor):
         raise ValueError(
-            "source_chunk_idql_joint requires --conditioned-actor so human "
-            "demonstrations remain condition 1 and every rollout remains 0"
+            "source_chunk_idql_joint requires --conditioned-actor"
         )
 
     source_args = source.get("args", {})
@@ -1511,6 +1703,7 @@ def checkpoint_payload(
     args: argparse.Namespace,
     actor_model: dict,
     actor_ema_optimization_step: int,
+    actor_ema_reference_step: float,
     pretrained_dp_checkpoint: str,
     critics: nn.ModuleList,
     targets: nn.ModuleList,
@@ -1524,6 +1717,7 @@ def checkpoint_payload(
     action_stats: dict,
     epoch: int,
     global_step: int,
+    global_samples_seen: int,
     history: list[dict],
     loader_generator: torch.Generator,
     rank_runtime_states: list[dict[str, Any]] | None = None,
@@ -1604,12 +1798,17 @@ def checkpoint_payload(
         ),
         "actor_training_objective": (
             (
-                "human_conditioned_diffusion_BC_all_mixed_rows_"
-                "human_1_all_rollouts_0_"
+                "conditional_diffusion_BC_all_mixed_rows_"
+                f"{args.actor_condition_mode}_"
                 + (
                     "from_source_chunk_IDQL_actor"
                     if args.initialization == "source_chunk_idql_joint"
                     else "from_pretrained_DP_ema"
+                )
+                + (
+                    "_plus_pretrained_EMA_noise_prediction_reference_at_condition_1"
+                    if float(args.actor_reference_weight) > 0.0
+                    else ""
                 )
             )
             if trains_joint_actor(args) and args.conditioned_actor
@@ -1624,13 +1823,16 @@ def checkpoint_payload(
             )
         ),
         "conditioned_actor": bool(args.conditioned_actor),
+        "actor_condition_mode": (
+            str(args.actor_condition_mode) if args.conditioned_actor else None
+        ),
         "actor_condition_label_definition": (
-            ACTOR_CONDITION_DEFINITION
+            actor_condition_definition(args.actor_condition_mode)
             if args.conditioned_actor
             else None
         ),
         "actor_condition_source": (
-            "source_is_expert_at_current_transition"
+            "actor_condition_at_current_transition"
             if args.conditioned_actor
             else None
         ),
@@ -1692,7 +1894,8 @@ def checkpoint_payload(
         "dynamics_cosine_weight": float(args.dynamics_cosine_weight),
         "dynamics_warmup_steps": int(args.dynamics_warmup_steps),
         "augmentation": (
-            "paired_training_random_crops_online_dynamics_target_and_vf_target"
+            "paired_training_random_crops_online_dynamics_target_and_vf_target_"
+            "plus_paired_actor_student_and_reference_teacher_crops"
         ),
         "q_loss": "huber" if args.use_huber else "mse",
         "max_gradient_norm": (
@@ -1707,7 +1910,13 @@ def checkpoint_payload(
         "critic_vf_lr_total_steps": int(args.critic_vf_lr_total_steps),
         "critic_vf_lr_num_cycles": float(args.critic_vf_lr_num_cycles),
         "vf_encoder_freeze_steps": int(args.vf_encoder_freeze_steps),
-        "actor_lr": float(args.actor_lr),
+        "actor_adapter_lr": float(args.actor_adapter_lr),
+        "actor_unet_lr": float(args.actor_unet_lr),
+        "actor_obs_encoder_lr": float(args.actor_obs_encoder_lr),
+        "actor_reference_weight": float(args.actor_reference_weight),
+        "actor_reference_batch_fraction": float(
+            args.actor_reference_batch_fraction
+        ),
         "actor_lr_scheduler": str(args.actor_lr_scheduler),
         "actor_lr_warmup_steps": int(args.actor_lr_warmup_steps),
         "actor_lr_total_steps": int(args.actor_lr_total_steps),
@@ -1715,24 +1924,11 @@ def checkpoint_payload(
         "critic_lr": float(args.critic_lr),
         "encoder_lr": float(args.encoder_lr),
         "vf_lr": float(args.vf_lr),
-        "source_actor_l2_sp_weight": float(
-            args.source_actor_l2_sp_weight
-        ),
-        "source_critic_l2_sp_weight": float(
-            args.source_critic_l2_sp_weight
-        ),
-        "source_l2_sp_definition": (
-            "mean_squared_parameter_distance_to_source_chunk_checkpoint"
-        ),
-        "source_l2_sp_applies_to": {
-            "actor": "all_trainable_policy_parameters",
-            "critics": "all_online_critic_parameters_independently",
-            "target_critics": "none_follow_online_critics_by_polyak",
-            "vf": "none",
-        },
         "actor_frozen": bool(not trains_joint_actor(args)),
         "actor_encoder_trainable": bool(trains_joint_actor(args)),
         "actor_ema_optimization_step": int(actor_ema_optimization_step),
+        "actor_ema_reference_step": float(actor_ema_reference_step),
+        "global_samples_seen": int(global_samples_seen),
         "rng_state": (
             rank_zero_runtime["rng_state"]
             if rank_zero_runtime is not None
@@ -1768,6 +1964,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     args.distributed_rank = int(distributed.rank)
     args.distributed_local_rank = int(distributed.local_rank)
     args.distributed_world_size = int(distributed.world_size)
+    configure_batch_scaled_semantics(args, distributed)
     if distributed.is_main_process:
         args.output_dir.mkdir(parents=True, exist_ok=True)
     if distributed.enabled:
@@ -1779,7 +1976,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     resume_state = None
     source_for_warm_start = None
-    source_for_regularization = None
     if args.resume_checkpoint is not None:
         resume_state = torch.load(
             args.resume_checkpoint,
@@ -1844,15 +2040,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             )
         saved_args = resume_state.get("args", {})
         resume_float_fields = {
+            "actor_adapter_lr": float(args.actor_adapter_lr),
+            "actor_unet_lr": float(args.actor_unet_lr),
+            "actor_obs_encoder_lr": float(args.actor_obs_encoder_lr),
+            "actor_reference_weight": float(args.actor_reference_weight),
+            "actor_reference_batch_fraction": float(args.actor_reference_batch_fraction),
             "critic_lr": float(args.critic_lr),
             "encoder_lr": float(args.encoder_lr),
             "vf_lr": float(args.vf_lr),
-            "source_actor_l2_sp_weight": float(
-                args.source_actor_l2_sp_weight
-            ),
-            "source_critic_l2_sp_weight": float(
-                args.source_critic_l2_sp_weight
-            ),
         }
         for field, requested_value in resume_float_fields.items():
             saved_value = float(saved_args.get(field, 0.0))
@@ -1862,12 +2057,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     f"{field}={requested_value}"
                 )
         if saved_initialization in JOINT_ACTOR_INITIALIZATIONS:
-            saved_actor_lr = float(saved_args.get("actor_lr", 0.0))
-            if saved_actor_lr != float(args.actor_lr):
-                raise ValueError(
-                    f"resume actor_lr={saved_actor_lr} does not match requested "
-                    f"actor_lr={args.actor_lr}"
-                )
             saved_actor_scheduler = str(
                 saved_args.get("actor_lr_scheduler", "constant")
             )
@@ -1904,15 +2093,30 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"match requested conditioned_actor={args.conditioned_actor}"
             )
         if saved_conditioned_actor:
+            saved_condition_mode = str(
+                resume_state.get("args", {}).get(
+                    "actor_condition_mode", "human_only"
+                )
+            )
+            if saved_condition_mode != str(args.actor_condition_mode):
+                raise ValueError(
+                    "resume actor_condition_mode="
+                    f"{saved_condition_mode!r} does not match requested "
+                    f"{args.actor_condition_mode!r}; start a fresh output "
+                    "directory"
+                )
             saved_condition_definition = str(
                 resume_state.get("actor_condition_label_definition", "")
             )
-            if saved_condition_definition != ACTOR_CONDITION_DEFINITION:
+            required_condition_definition = actor_condition_definition(
+                args.actor_condition_mode
+            )
+            if saved_condition_definition != required_condition_definition:
                 raise ValueError(
                     "resume actor condition definition="
                     f"{saved_condition_definition!r} does not match requested "
-                    f"{ACTOR_CONDITION_DEFINITION!r}; start a fresh output "
-                    "directory for the human-only condition"
+                    f"{required_condition_definition!r}; start a fresh output "
+                    "directory"
                 )
             saved_condition_hidden_dim = int(
                 resume_state.get("args", {}).get("condition_hidden_dim", 128)
@@ -1935,33 +2139,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         pretrained_dp_checkpoint = str(
             resume_state["pretrained_dp_checkpoint"]
         )
-        if uses_source_l2_sp(args):
-            saved_source = resume_state.get("source_chunk_idql_checkpoint")
-            if saved_source is None:
-                raise ValueError(
-                    "regularized resume checkpoint does not record its source "
-                    "chunk checkpoint"
-                )
-            saved_source_path = Path(saved_source).expanduser().resolve()
-            if args.source_chunk_idql_checkpoint is None:
-                args.source_chunk_idql_checkpoint = saved_source_path
-            elif args.source_chunk_idql_checkpoint != saved_source_path:
-                raise ValueError(
-                    "resume source_chunk_idql_checkpoint="
-                    f"{saved_source_path} does not match requested "
-                    f"{args.source_chunk_idql_checkpoint}"
-                )
-            if not saved_source_path.is_file():
-                raise FileNotFoundError(
-                    "L2-SP source chunk checkpoint does not exist: "
-                    f"{saved_source_path}"
-                )
-            source_for_regularization = torch.load(
-                saved_source_path,
-                map_location="cpu",
-                weights_only=False,
-            )
-            validate_chunk_source(source_for_regularization, args)
     elif args.initialization in (
         "source_idql_frozen",
         "source_chunk_idql_joint",
@@ -1980,8 +2157,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             validate_source(source_for_warm_start, args)
         else:
             validate_chunk_source(source_for_warm_start, args)
-            if uses_source_l2_sp(args):
-                source_for_regularization = source_for_warm_start
         pretrained_dp_checkpoint = str(
             source_for_warm_start["pretrained_dp_checkpoint"]
         )
@@ -2016,6 +2191,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "initial action normalization does not match the pretrained DP"
         )
     actor_algo = actor_policy.policy
+    actor_reference_audit = {
+        "enabled": False,
+        "weight": float(args.actor_reference_weight),
+        "batch_fraction": float(args.actor_reference_batch_fraction),
+        "reason": "actor_frozen_or_zero_weight",
+    }
+    if trains_joint_actor(args) and float(args.actor_reference_weight) > 0.0:
+        actor_reference_audit = {
+            "enabled": True,
+            **install_pretrained_actor_reference(
+                actor_algo,
+                weight=args.actor_reference_weight,
+                batch_fraction=args.actor_reference_batch_fraction,
+            ),
+        }
     if trains_joint_actor(args):
         if resume_state is None:
             if args.initialization == "source_chunk_idql_joint":
@@ -2079,7 +2269,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     )
     args.actor_action_horizon = actor_horizon
     chunk_reference_state = (
-        source_for_warm_start or source_for_regularization or resume_state
+        source_for_warm_start or resume_state
     )
     if (
         args.initialization == "source_chunk_idql_joint"
@@ -2100,6 +2290,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         audit_actor_conditions(
             args.dataset,
             reward_mode=str(args.reward_mode),
+            actor_condition_mode=str(args.actor_condition_mode),
         )
         if args.conditioned_actor
         else None
@@ -2122,48 +2313,72 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     )
     if (
         args.critic_vf_lr_scheduler == "cosine"
-        and int(args.critic_vf_lr_warmup_steps)
+        and int(args.resolved_critic_vf_lr_warmup_steps)
         >= int(args.critic_vf_lr_total_steps)
     ):
         raise ValueError(
-            "critic_vf_lr_warmup_steps="
-            f"{args.critic_vf_lr_warmup_steps} must be smaller than the "
+            "resolved_critic_vf_lr_warmup_steps="
+            f"{args.resolved_critic_vf_lr_warmup_steps} (reference "
+            f"{args.critic_vf_lr_warmup_steps}) must be smaller than the "
             f"{args.critic_vf_lr_total_steps} critic/VF training steps"
         )
     if resume_state is not None:
         saved_args = resume_state.get("args", {})
         schedule_fields = [
             ("critic_vf_lr_scheduler", str),
-            ("critic_vf_lr_warmup_steps", int),
             ("critic_vf_lr_total_steps", int),
             ("critic_vf_lr_num_cycles", float),
+            *[
+                (f"resolved_{field}", int)
+                for field in BATCH_SCALED_STEP_FIELDS
+            ],
+            ("resolved_target_tau", float),
         ]
         if trains_joint_actor(args):
             schedule_fields.append(("actor_lr_total_steps", int))
         for field, cast in schedule_fields:
-            saved_value = cast(saved_args[field])
+            if field in saved_args:
+                saved_raw_value = saved_args[field]
+            elif field.startswith("resolved_"):
+                legacy_field = field[len("resolved_") :]
+                saved_raw_value = saved_args.get(legacy_field)
+                if saved_raw_value is None:
+                    raise ValueError(
+                        f"resume checkpoint has no {field} configuration"
+                    )
+            else:
+                raise ValueError(
+                    f"resume checkpoint has no {field} configuration"
+                )
+            saved_value = cast(saved_raw_value)
             requested_value = cast(getattr(args, field))
             if saved_value != requested_value:
                 raise ValueError(
                     f"resume {field}={saved_value} does not match requested "
-                    f"{field}={requested_value}"
+                    f"{field}={requested_value}; legacy checkpoints created "
+                    "before sample-aware schedules should be used as a "
+                    "--source-chunk-idql-checkpoint for a fresh round"
                 )
     if trains_joint_actor(args):
         if (
             args.actor_lr_scheduler == "cosine"
-            and int(args.actor_lr_warmup_steps)
+            and int(args.resolved_actor_lr_warmup_steps)
             >= int(args.actor_lr_total_steps)
         ):
             raise ValueError(
-                f"actor_lr_warmup_steps={args.actor_lr_warmup_steps} must be "
+                "resolved_actor_lr_warmup_steps="
+                f"{args.resolved_actor_lr_warmup_steps} (reference "
+                f"{args.actor_lr_warmup_steps}) must be "
                 "smaller than the "
                 f"{args.actor_lr_total_steps} actor training steps"
             )
-        configure_actor_optimizer(
+        configure_chunk_actor_optimizer(
             actor_algo,
-            args.actor_lr,
+            adapter_lr=args.actor_adapter_lr,
+            unet_lr=args.actor_unet_lr,
+            obs_encoder_lr=args.actor_obs_encoder_lr,
             scheduler_type=args.actor_lr_scheduler,
-            warmup_steps=args.actor_lr_warmup_steps,
+            warmup_steps=args.resolved_actor_lr_warmup_steps,
             total_steps=args.actor_lr_total_steps,
             num_cycles=args.actor_lr_num_cycles,
         )
@@ -2177,16 +2392,51 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     resume_state.get("actor_ema_optimization_step", 0)
                 )
             configure_conditioned_actor(actor_algo, args)
-        if float(args.source_actor_l2_sp_weight) > 0.0:
-            if source_for_regularization is None:
-                raise RuntimeError(
-                    "actor L2-SP requested without a loaded source checkpoint"
+        if actor_algo.ema is not None:
+            ema_state_source = (
+                resume_state
+                if resume_state is not None
+                else (
+                    source_for_warm_start
+                    if args.initialization == "source_chunk_idql_joint"
+                    else None
                 )
-            actor_algo.configure_policy_l2_sp_anchor(
-                source_for_regularization["actor_model"]["nets"],
-                args.source_actor_l2_sp_weight,
             )
+            actor_algo.ema_update_step_scale = float(args.schedule_batch_ratio)
+            if (
+                ema_state_source is not None
+                and "actor_ema_reference_step" in ema_state_source
+            ):
+                ema_reference_step = float(
+                    ema_state_source["actor_ema_reference_step"]
+                )
+            else:
+                source_args = (ema_state_source or {}).get("args", {})
+                source_world_size = int(
+                    (ema_state_source or {})
+                    .get("distributed_training", {})
+                    .get("world_size", 1)
+                )
+                source_effective_batch = int(
+                    source_args.get(
+                        "effective_global_batch_size",
+                        int(source_args.get("batch_size", 100))
+                        * source_world_size,
+                    )
+                )
+                source_reference_batch = int(
+                    source_args.get("schedule_reference_batch_size", 100)
+                )
+                ema_reference_step = (
+                    float(actor_algo.ema.optimization_step)
+                    * float(source_effective_batch)
+                    / float(source_reference_batch)
+                )
+            actor_algo.ema_reference_step = ema_reference_step
         actor_algo.set_train()
+        if actor_algo.reference_nets is not None:
+            actor_algo.reference_nets.train()
+            actor_algo.reference_nets.requires_grad_(False)
         actor_audit = actor_trainability(actor_algo)
     elif actor_audit is None:
         raise RuntimeError("frozen actor audit was not initialized")
@@ -2305,7 +2555,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         make_step_lr_scheduler(
             optimizer,
             scheduler_type=args.critic_vf_lr_scheduler,
-            warmup_steps=args.critic_vf_lr_warmup_steps,
+            warmup_steps=args.resolved_critic_vf_lr_warmup_steps,
             total_steps=args.critic_vf_lr_total_steps,
             num_cycles=args.critic_vf_lr_num_cycles,
         )
@@ -2314,13 +2564,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     vf_lr_scheduler = make_step_lr_scheduler(
         vf_optimizer,
         scheduler_type=args.critic_vf_lr_scheduler,
-        warmup_steps=args.critic_vf_lr_warmup_steps,
+        warmup_steps=args.resolved_critic_vf_lr_warmup_steps,
         total_steps=args.critic_vf_lr_total_steps,
         num_cycles=args.critic_vf_lr_num_cycles,
     )
 
     start_epoch = 0
     global_step = 0
+    global_samples_seen = 0
     dynamics_target_last_sync_step = 0
     history: list[dict] = []
     if resume_state is not None:
@@ -2366,6 +2617,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             vf_lr_scheduler.load_state_dict(vf_scheduler_state)
         start_epoch = int(resume_state["epoch"])
         global_step = int(resume_state["step"])
+        global_samples_seen = int(
+            resume_state.get(
+                "global_samples_seen",
+                global_step * int(args.effective_global_batch_size),
+            )
+        )
         dynamics_target_last_sync_step = int(
             resume_state["dynamics_target_last_sync_step"]
         )
@@ -2449,26 +2706,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "optimizers, LR schedules, epoch=0, and global_step=0",
                 flush=True,
             )
-    critic_l2_sp_anchors = None
-    if float(args.source_critic_l2_sp_weight) > 0.0:
-        if source_for_regularization is None:
-            raise RuntimeError(
-                "critic L2-SP requested without a loaded source checkpoint"
-            )
-        critic_l2_sp_anchors = tuple(
-            make_parameter_l2_sp_anchor(
-                critic,
-                source_state,
-                label=f"critic_{index + 1}",
-            )
-            for index, (critic, source_state) in enumerate(
-                zip(critics, source_for_regularization["critics"])
-            )
-        )
-        if len(critic_l2_sp_anchors) != len(critics):
-            raise ValueError(
-                "source critic count does not match L2-SP critic count"
-            )
     configure_target_random_crops(targets)
     configure_encoder_target_random_crops(dynamics_target_encoder)
 
@@ -2483,9 +2720,23 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         synchronized_modules.append(actor_algo.ema.averaged_model)
     if getattr(actor_algo, "reference_nets", None) is not None:
         synchronized_modules.append(actor_algo.reference_nets)
+    training_buffer_modules = (
+        [actor_algo.nets, critics, vf]
+        if trains_joint_actor(args)
+        else [critics, vf]
+    )
+    synchronize_training_buffers = modules_have_mutable_batch_norm(
+        training_buffer_modules
+    )
     broadcast_module_state(synchronized_modules, distributed)
     gradient_sync_fn = (
-        (lambda parameters: all_reduce_gradients(parameters, distributed))
+        (
+            lambda parameters: all_reduce_gradients(
+                parameters,
+                distributed,
+                bucket_cap_mb=args.gradient_bucket_cap_mb,
+            )
+        )
         if distributed.enabled
         else None
     )
@@ -2493,7 +2744,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         actor_algo.gradient_sync_fn = gradient_sync_fn
     if distributed.enabled and resume_state is None:
         seed_process(int(args.seed) + distributed.rank, device)
-    del resume_state, source_for_warm_start, source_for_regularization
+    del resume_state, source_for_warm_start
 
     if not trains_joint_actor(args):
         actor_algo.nets.cpu()
@@ -2539,7 +2790,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "dynamics_target_context_mlp": False,
         "training_augmentation": (
-            "paired_random_crop_coordinates_for_online_and_target_encoders"
+            "paired_random_crop_coordinates_for_online_and_target_encoders_"
+            "plus_paired_actor_student_and_reference_teacher_crops"
         ),
         "target_encoder_mode": (
             "eval_except_crop_randomizers_in_training_mode"
@@ -2547,21 +2799,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "vf_training": (
             "head_from_step_zero_raw_observation_encoder_delayed"
         ),
-        "source_l2_sp_regularization": {
-            "enabled": bool(uses_source_l2_sp(args)),
-            "definition": (
-                "mean_squared_parameter_distance_to_source_chunk_checkpoint"
-            ),
-            "actor_weight": float(args.source_actor_l2_sp_weight),
-            "critic_weight": float(args.source_critic_l2_sp_weight),
-            "actor_scope": "all_trainable_policy_parameters",
-            "critic_scope": "each_online_critic_all_parameters",
-            "target_critic_scope": "none_polyak_tracks_online",
-            "vf_scope": "none",
-        },
+        "actor_reference_distillation": actor_reference_audit,
         "warm_start": warm_start_audit,
     }
     startup = {
+        "actor_reference_distillation": actor_reference_audit,
         "task": str(args.task),
         "chunk_initialization": str(args.initialization),
         "source_idql_checkpoint": (
@@ -2605,6 +2847,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "steps_per_epoch": int(args.steps_per_epoch),
             "steps_per_epoch_source": args.steps_per_epoch_source,
             "sequence_length": int(sequence_length),
+            "sparse_chunk_loader": bool(args.sparse_chunk_loader),
+            "observation_frames_per_sample": (
+                int(args.observation_horizon) + 1
+                if args.sparse_chunk_loader
+                else 2 * (
+                    int(args.observation_horizon) - 1 + int(sequence_length)
+                )
+            ),
         },
         "data_routing": {
             "shared_loader": True,
@@ -2620,11 +2870,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 else "none_actor_frozen"
             ),
             "actor_condition_labels": (
-                {
-                    "human_demo": 1.0,
-                    "success_rollout": 0.0,
-                    "failure_rollout": 0.0,
-                }
+                actor_condition_labels(args.actor_condition_mode)
                 if args.conditioned_actor
                 else None
             ),
@@ -2647,6 +2893,29 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "mixed_dataset_statistics_used": False,
         },
+        "batch_semantics": {
+            "batch_size_control": "per_gpu_CHUNK_BATCH_SIZE",
+            "batch_size_per_rank": int(args.batch_size),
+            "world_size": int(distributed.world_size),
+            "effective_global_batch_size": int(
+                args.effective_global_batch_size
+            ),
+            "schedule_reference_batch_size": int(
+                args.schedule_reference_batch_size
+            ),
+            "effective_to_reference_ratio": float(
+                args.schedule_batch_ratio
+            ),
+            "learning_rates_automatically_scaled": False,
+            "step_inputs_are_reference_batch_steps": True,
+            "resolved_steps": {
+                field: int(getattr(args, f"resolved_{field}"))
+                for field in BATCH_SCALED_STEP_FIELDS
+            },
+            "reference_target_tau": float(args.target_tau),
+            "resolved_target_tau": float(args.resolved_target_tau),
+            "actor_ema_sample_scaled": True,
+        },
         "architecture": architecture,
         "hyperparameters": {
             "epochs": int(args.epochs),
@@ -2656,18 +2925,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "dynamics_target_sync_interval": int(
                 args.dynamics_target_sync_interval
             ),
-            "actor_lr": float(args.actor_lr),
+            "actor_adapter_lr": float(args.actor_adapter_lr),
+            "actor_unet_lr": float(args.actor_unet_lr),
+            "actor_obs_encoder_lr": float(args.actor_obs_encoder_lr),
+            "actor_reference_weight": float(args.actor_reference_weight),
+            "actor_reference_batch_fraction": float(
+                args.actor_reference_batch_fraction
+            ),
             "actor_lr_scheduler": str(args.actor_lr_scheduler),
             "actor_lr_warmup_steps": int(args.actor_lr_warmup_steps),
             "actor_lr_total_steps": int(args.actor_lr_total_steps),
             "actor_lr_num_cycles": float(args.actor_lr_num_cycles),
-            "source_actor_l2_sp_weight": float(
-                args.source_actor_l2_sp_weight
-            ),
-            "source_critic_l2_sp_weight": float(
-                args.source_critic_l2_sp_weight
-            ),
             "conditioned_actor": bool(args.conditioned_actor),
+            "actor_condition_mode": str(args.actor_condition_mode),
             "condition_dropout": float(args.condition_dropout),
             "condition_hidden_dim": int(args.condition_hidden_dim),
             "critic_lr": float(args.critic_lr),
@@ -2704,7 +2974,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "world_size": int(distributed.world_size),
             "backend": distributed.backend,
             "launcher": "torchrun" if distributed.enabled else "python",
-            "gradient_sync": "mean_all_reduce_before_optimizer_step",
+            "gradient_sync": "async_bucketed_mean_all_reduce",
+            "critic_vf_gradient_sync_phases_per_step": 1,
+            "actor_gradient_sync_phases_per_step": int(
+                trains_joint_actor(args)
+            ),
+            "gradient_bucket_cap_mb": float(args.gradient_bucket_cap_mb),
+            "per_step_buffer_broadcast": bool(synchronize_training_buffers),
             "rank_zero_writes_only": True,
         },
     }
@@ -2720,6 +2996,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         else float(args.max_gradient_norm)
     )
 
+    shared_action_range_validated = False
     for epoch in range(start_epoch + 1, int(args.epochs) + 1):
         if distributed.enabled and hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
@@ -2731,7 +3008,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             except StopIteration:
                 iterator = iter(loader)
                 raw_batch = next(iterator)
-            raw_batch = align_shared_batch_actions(raw_batch)
+            raw_batch = align_shared_batch_actions(
+                raw_batch,
+                validate=not shared_action_range_validated,
+            )
+            shared_action_range_validated = True
             batch = process_chunk_batch(
                 raw_batch,
                 actor_algo,
@@ -2740,26 +3021,25 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 discount=args.discount,
                 reward_mode=args.reward_mode,
             )
-            encoder_trainable = global_step >= int(args.encoder_freeze_steps)
+            encoder_trainable = global_step >= int(
+                args.resolved_encoder_freeze_steps
+            )
             vf_encoder_trainable = (
-                global_step >= int(args.vf_encoder_freeze_steps)
+                global_step >= int(args.resolved_vf_encoder_freeze_steps)
             )
             critics.train()
             set_representation_trainable(critics, encoder_trainable)
             vf.train()
             set_vf_encoder_trainable(vf, vf_encoder_trainable)
-            broadcast_module_buffers(
-                (
-                    [actor_algo.nets, critics, vf]
-                    if trains_joint_actor(args)
-                    else [critics, vf]
-                ),
-                distributed,
-            )
+            if synchronize_training_buffers:
+                broadcast_module_buffers(
+                    training_buffer_modules,
+                    distributed,
+                )
             ramp = min(
                 1.0,
                 float(global_step + 1)
-                / max(float(args.dynamics_warmup_steps), 1.0),
+                / max(float(args.resolved_dynamics_warmup_steps), 1.0),
             )
             effective_dynamics = float(args.dynamics_weight) * ramp
             effective_dynamics_cosine = (
@@ -2776,8 +3056,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 use_huber=args.use_huber,
                 dynamics_weight=effective_dynamics,
                 dynamics_cosine_weight=effective_dynamics_cosine,
-                critic_l2_sp_anchors=critic_l2_sp_anchors,
-                critic_l2_sp_weight=args.source_critic_l2_sp_weight,
             )
             update_networks(
                 critics,
@@ -2787,21 +3065,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 vf_optimizer,
                 critic_losses,
                 vf_loss,
-                target_tau=args.target_tau,
+                target_tau=args.resolved_target_tau,
                 max_gradient_norm=max_grad,
                 gradient_sync_fn=gradient_sync_fn,
             )
 
             # update condition diffusion actor
-            actor_info: dict[str, float] = {}
+            actor_info: dict[str, Any] = {}
             if trains_joint_actor(args):
-                current_index = int(args.observation_horizon) - 1
-                condition_labels = source_condition_labels(
-                    raw_batch,
-                    current_index=current_index,
-                )
                 actor_batch = raw_batch
                 if args.conditioned_actor:
+                    current_index = int(args.observation_horizon) - 1
+                    condition_labels = source_condition_labels(
+                        raw_batch,
+                        current_index=current_index,
+                    )
                     actor_batch = add_actor_condition(
                         actor_batch,
                         condition_labels,
@@ -2810,33 +3088,44 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 actor_info = {
                     "actor/data_rows": float(actor_row_count),
                     "actor/conditioned": float(args.conditioned_actor),
-                    "actor/condition_mean": float(
-                        condition_labels.mean().item()
-                    ),
-                    "actor/zero_condition_fraction": float(
-                        (condition_labels < 0.5).float().mean().item()
-                    ),
                 }
+                if args.conditioned_actor:
+                    actor_info.update(
+                        {
+                            "actor/condition_mean": condition_labels.mean(),
+                            "actor/zero_condition_fraction": (
+                                (condition_labels < 0.5).float().mean()
+                            ),
+                        }
+                    )
                 actor_info.update(
                     actor_train_step(
                         actor_algo,
                         actor_batch,
                         epoch,
                         obs_stats,
+                        defer_scalar_conversion=True,
                     )
                 )
-                del actor_batch, condition_labels
+                del actor_batch
+                if args.conditioned_actor:
+                    del condition_labels
             for scheduler in critic_lr_schedulers:
                 if scheduler is not None:
                     scheduler.step()
             if vf_lr_scheduler is not None:
                 vf_lr_scheduler.step()
+            global_samples_seen += int(
+                raw_batch["actions"].shape[0] * distributed.world_size
+            )
             actor_info["critic/data_rows"] = float(raw_batch["actions"].shape[0])
             global_step += 1
             dynamics_target_synced = False
             if (
                 trains_joint_actor(args)
-                and global_step % int(args.dynamics_target_sync_interval) == 0
+                and global_step
+                % int(args.resolved_dynamics_target_sync_interval)
+                == 0
             ):
                 sync_actor_dynamics_target_encoder(
                     dynamics_target_encoder,
@@ -2844,7 +3133,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 dynamics_target_last_sync_step = global_step
                 dynamics_target_synced = True
-            metrics = scalar_metrics(info)
+            metrics = dict(info)
             metrics.update(actor_info)
             metrics["dynamics/target_synced_after_update"] = float(
                 dynamics_target_synced
@@ -2863,9 +3152,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 vf_encoder_trainable
             )
             if trains_joint_actor(args):
-                metrics["lr/actor"] = float(
-                    actor_algo.optimizers["policy"].param_groups[0]["lr"]
-                )
+                for group in actor_algo.optimizers["policy"].param_groups:
+                    group_name = str(group.get("group_name", "unknown"))
+                    metrics[f"lr/actor_{group_name}"] = float(group["lr"])
             metrics["lr/critic"] = float(
                 critic_optimizers[0].param_groups[0]["lr"]
             )
@@ -2883,13 +3172,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             )
             metrics = mean_distributed_scalars(metrics, distributed)
             records.append(metrics)
-            if writer is not None:
+            should_log = (
+                global_step % int(args.log_every) == 0
+                or step_in_epoch == int(args.steps_per_epoch)
+            )
+            if writer is not None and should_log:
                 for key, value in metrics.items():
                     writer.add_scalar(key, value, global_step)
-            if (
-                distributed.is_main_process
-                and global_step % int(args.log_every) == 0
-            ):
+            if distributed.is_main_process and should_log:
                 print(
                     json.dumps(
                         {
@@ -2904,6 +3194,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             del batch, critic_losses, vf_loss
 
         epoch_summary = {
+            "global_samples_seen": int(global_samples_seen),
             "epoch": int(epoch),
             "global_step": int(global_step),
             "metrics": mean_metrics(records),
@@ -2913,6 +3204,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             **startup,
             "last_completed_epoch": int(epoch),
             "global_step": int(global_step),
+            "global_samples_seen": int(global_samples_seen),
             "last_epoch_metrics": epoch_summary["metrics"],
             "history": history,
             "checkpoints": {
@@ -2941,6 +3233,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                         if actor_algo.ema is not None
                         else 0
                     ),
+                    actor_ema_reference_step=float(
+                        getattr(actor_algo, "ema_reference_step", 0.0)
+                    ),
                     pretrained_dp_checkpoint=pretrained_dp_checkpoint,
                     critics=critics,
                     targets=targets,
@@ -2956,6 +3251,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     action_stats=action_stats,
                     epoch=epoch,
                     global_step=global_step,
+                    global_samples_seen=global_samples_seen,
                     history=history,
                     loader_generator=loader_generator,
                     rank_runtime_states=rank_runtime_states,
@@ -3040,6 +3336,12 @@ def make_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument(
+        "--gradient-bucket-cap-mb",
+        type=float,
+        default=100.0,
+        help="Flat gradient all-reduce bucket size in MiB.",
+    )
+    parser.add_argument(
         "--local-rank",
         "--local_rank",
         type=int,
@@ -3050,6 +3352,20 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument(
+        "--schedule-reference-batch-size",
+        type=int,
+        default=100,
+        help=(
+            "Reference global batch used to express step-based warmups, "
+            "freezes, target synchronization, target tau, and actor EMA."
+        ),
+    )
+    parser.add_argument(
+        "--sparse-chunk-loader",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
@@ -3084,15 +3400,14 @@ def make_parser() -> argparse.ArgumentParser:
             "actor EMA after this many joint-training optimizer steps."
         ),
     )
-    parser.add_argument("--actor-lr", type=float, default=1e-4)
+    parser.add_argument("--actor-adapter-lr", type=float, default=1e-4)
+    parser.add_argument("--actor-unet-lr", type=float, default=1e-5)
+    parser.add_argument("--actor-obs-encoder-lr", type=float, default=1e-6)
+    parser.add_argument("--actor-reference-weight", type=float, default=0.0)
     parser.add_argument(
-        "--source-actor-l2-sp-weight",
+        "--actor-reference-batch-fraction",
         type=float,
-        default=0.0,
-        help=(
-            "Mean-squared parameter anchoring to the source chunk actor. "
-            "Only valid with source_chunk_idql_joint; zero disables it."
-        ),
+        default=0.25,
     )
     parser.add_argument(
         "--actor-lr-scheduler",
@@ -3106,22 +3421,22 @@ def make_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Condition the jointly trained diffusion actor on data source: "
-            "human demonstrations use 1; all deployment rollouts use 0."
+            "Train the joint diffusion actor with explicit binary conditions "
+            "from the dataset's actor_condition key."
+        ),
+    )
+    parser.add_argument(
+        "--actor-condition-mode",
+        choices=tuple(ACTOR_CONDITION_DEFINITIONS),
+        default="human_only",
+        help=(
+            "human_only uses human=1 and all rollouts=0; human_success uses "
+            "human and successful rollouts=1 and failure rollouts=0"
         ),
     )
     parser.add_argument("--condition-dropout", type=float, default=0.0)
     parser.add_argument("--condition-hidden-dim", type=int, default=128)
     parser.add_argument("--critic-lr", type=float, default=1e-4)
-    parser.add_argument(
-        "--source-critic-l2-sp-weight",
-        type=float,
-        default=0.0,
-        help=(
-            "Mean-squared parameter anchoring of each online critic to its "
-            "source chunk critic. Zero disables it."
-        ),
-    )
     parser.add_argument("--encoder-lr", type=float, default=1e-5)
     parser.add_argument("--vf-lr", type=float, default=1e-4)
     parser.add_argument(
@@ -3232,26 +3547,30 @@ def main() -> None:
         )
     if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
         parser.error("steps-per-epoch must be positive when specified")
+    if args.batch_size <= 0:
+        parser.error("batch-size must be positive")
+    if args.schedule_reference_batch_size <= 0:
+        parser.error("schedule-reference-batch-size must be positive")
+    if args.gradient_bucket_cap_mb <= 0.0:
+        parser.error("gradient-bucket-cap-mb must be positive")
     if args.num_critics < 2:
         parser.error("RISE clipped double Q requires at least two critics")
     if args.dynamics_target_sync_interval <= 0:
         parser.error("dynamics-target-sync-interval must be positive")
-    for name in ("actor_lr", "critic_lr", "encoder_lr", "vf_lr"):
+    for name in (
+        "actor_adapter_lr",
+        "actor_unet_lr",
+        "actor_obs_encoder_lr",
+        "critic_lr",
+        "encoder_lr",
+        "vf_lr",
+    ):
         if float(getattr(args, name)) <= 0.0:
             parser.error(f"{name.replace('_', '-')} must be positive")
-    for name in (
-        "source_actor_l2_sp_weight",
-        "source_critic_l2_sp_weight",
-    ):
-        if float(getattr(args, name)) < 0.0:
-            parser.error(f"{name.replace('_', '-')} must be non-negative")
-    if uses_source_l2_sp(args) and (
-        args.initialization != "source_chunk_idql_joint"
-    ):
-        parser.error(
-            "source L2-SP regularization requires "
-            "--initialization source_chunk_idql_joint"
-        )
+    if float(args.actor_reference_weight) < 0.0:
+        parser.error("actor-reference-weight must be non-negative")
+    if not 0.0 < args.actor_reference_batch_fraction <= 1.0:
+        parser.error("actor-reference-batch-fraction must be in (0, 1]")
     if not 0.0 <= args.condition_dropout < 1.0:
         parser.error("condition-dropout must be in [0, 1)")
     if args.hdf5_cache_mode == "none":

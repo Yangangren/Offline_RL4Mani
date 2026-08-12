@@ -120,7 +120,7 @@ case "$TASK" in
 esac
 
 case "$STAGE" in
-  train_chunk_idql_round2|train_chunk_idql_round2_resilient|train_chunk_idql_round2_regularized|train_chunk_idql_round2_regularized_resilient)
+  train_chunk_idql_round2|train_chunk_idql_round2_resilient)
     if [[ "$TASK" != "square" ]]; then
       echo "The configured round-2 warm start currently targets TASK=square." >&2
       exit 2
@@ -132,11 +132,6 @@ case "$STAGE" in
     TASK_CHUNK_EVAL_OUTPUT=rollouts/square_rgb_dp/chunk_idql/round2_N4_200demo_100success_50failure_h8_dynamics_human_condition
     TASK_CHUNK_INITIALIZATION=source_chunk_idql_joint
     TASK_SOURCE_CHUNK_IDQL_CHECKPOINT=trained_models/square_rgb_dp/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition_task_reward/models/model_epoch_50.pt
-    if [[ "$STAGE" == "train_chunk_idql_round2_regularized" || "$STAGE" == "train_chunk_idql_round2_regularized_resilient" ]]; then
-      ROUND2_REGULARIZED_TRAINING=1
-      TASK_CHUNK_IDQL_OUTPUT_DIR=${TASK_CHUNK_IDQL_OUTPUT_DIR}_regularized
-      TASK_CHUNK_EVAL_OUTPUT=${TASK_CHUNK_EVAL_OUTPUT}_regularized
-    fi
     ;;
 esac
 
@@ -162,11 +157,21 @@ if (( CHUNK_NUM_GPUS > 1 )) && [[ "${DEVICE:-cuda}" != "cuda" ]]; then
   echo "CHUNK_NUM_GPUS>1 requires DEVICE=cuda." >&2
   exit 2
 fi
+EVAL_GPU_ARGS=()
+if [[ -n "${EVAL_NUM_GPUS:-}" ]]; then
+  EVAL_GPU_ARGS+=(--num-gpus "$EVAL_NUM_GPUS")
+fi
+if [[ -n "${EVAL_GPU_IDS:-}" ]]; then
+  read -r -a eval_gpu_id_args <<< "$EVAL_GPU_IDS"
+  EVAL_GPU_ARGS+=(--gpu-ids "${eval_gpu_id_args[@]}")
+fi
 
 DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
 EXPERT_DATASET=${EXPERT_DATASET:-$TASK_EXPERT_DATASET}
 ROLLOUT_DATASET=${ROLLOUT_DATASET:-$TASK_ROLLOUT_DATASET}
 IDQL_REWARD_MODE=${IDQL_REWARD_MODE:-task}
+CHUNK_ACTOR_CONDITION_MODE=${CHUNK_ACTOR_CONDITION_MODE:-human_only} # human_success
+
 case "$IDQL_REWARD_MODE" in
   task)
     DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_task_reward.hdf5
@@ -187,6 +192,17 @@ case "$IDQL_REWARD_MODE" in
     exit 2
     ;;
 esac
+if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "human_success" ]]; then
+  condition_path_tag=human_success_condition
+  if [[ "$IDQL_REWARD_MODE" == "task" ]]; then
+    DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_${condition_path_tag}_task_reward.hdf5
+  else
+    DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_${condition_path_tag}.hdf5
+  fi
+  DEFAULT_CHUNK_IDQL_OUTPUT_DIR=${DEFAULT_CHUNK_IDQL_OUTPUT_DIR/human_condition/$condition_path_tag}
+  DEFAULT_CHUNK_EVAL_OUTPUT=${DEFAULT_CHUNK_EVAL_OUTPUT/human_condition/$condition_path_tag}
+  DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT/human_condition/$condition_path_tag}
+fi
 IDQL_DATASET=${IDQL_DATASET:-$DEFAULT_IDQL_DATASET}
 IDQL_OUTPUT_DIR=${IDQL_OUTPUT_DIR:-$DEFAULT_IDQL_OUTPUT_DIR}
 IDQL_CHECKPOINT=${IDQL_CHECKPOINT:-$IDQL_OUTPUT_DIR/last.pt}
@@ -200,7 +216,7 @@ if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
     echo "Square round-2 chunk IDQL requires CHUNK_INITIALIZATION=source_chunk_idql_joint." >&2
     exit 2
   fi
-if [[ "$CHUNK_CONDITIONED_ACTOR" != "1" ]]; then
+  if [[ "$CHUNK_CONDITIONED_ACTOR" != "1" ]]; then
     echo "Square round-2 chunk IDQL requires CHUNK_CONDITIONED_ACTOR=1." >&2
     exit 2
   fi
@@ -208,15 +224,6 @@ if [[ "$CHUNK_CONDITIONED_ACTOR" != "1" ]]; then
     echo "Square round-2 chunk IDQL requires IDQL_REWARD_MODE=task." >&2
     exit 2
   fi
-fi
-if [[ "$ROUND2_REGULARIZED_TRAINING" == "1" ]]; then
-  CHUNK_EPOCHS=${CHUNK_EPOCHS:-${ROUND2_EPOCHS:-50}}
-  CHUNK_ACTOR_LR=${CHUNK_ACTOR_LR:-${ROUND2_ACTOR_LR:-1e-5}}
-  CHUNK_CRITIC_LR=${CHUNK_CRITIC_LR:-${ROUND2_CRITIC_LR:-2.5e-5}}
-  CHUNK_ENCODER_LR=${CHUNK_ENCODER_LR:-${ROUND2_ENCODER_LR:-1e-6}}
-  CHUNK_VF_LR=${CHUNK_VF_LR:-${ROUND2_VF_LR:-2.5e-5}}
-  SOURCE_ACTOR_L2_SP_WEIGHT=${SOURCE_ACTOR_L2_SP_WEIGHT:-${ROUND2_ACTOR_L2_SP_WEIGHT:-10.0}}
-  SOURCE_CRITIC_L2_SP_WEIGHT=${SOURCE_CRITIC_L2_SP_WEIGHT:-${ROUND2_CRITIC_L2_SP_WEIGHT:-10.0}}
 fi
 CHUNK_IDQL_CHECKPOINT=${CHUNK_IDQL_CHECKPOINT:-$CHUNK_IDQL_OUTPUT_DIR/last.pt}
 CHUNK_EVAL_OUTPUT=${CHUNK_EVAL_OUTPUT:-$DEFAULT_CHUNK_EVAL_OUTPUT}
@@ -288,6 +295,10 @@ PERSISTENT_WORKERS_ARG=--persistent-workers
 if [[ "${PERSISTENT_WORKERS:-1}" == "0" ]]; then
   PERSISTENT_WORKERS_ARG=--no-persistent-workers
 fi
+SPARSE_CHUNK_LOADER_ARG=--sparse-chunk-loader
+if [[ "${CHUNK_SPARSE_LOADER:-1}" == "0" ]]; then
+  SPARSE_CHUNK_LOADER_ARG=--no-sparse-chunk-loader
+fi
 CRITIC_GROUP_NORM=${CRITIC_GROUP_NORM:-$TASK_CRITIC_GROUP_NORM}
 CRITIC_GROUP_NORM_ARG=--no-critic-group-norm
 if [[ "$CRITIC_GROUP_NORM" == "1" ]]; then
@@ -353,6 +364,7 @@ build_dataset() {
     --failure-mask "$FAILURE_MASK" \
     --failure-count "$FAILURE_COUNT" \
     --reward-mode "$IDQL_REWARD_MODE" \
+    --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
     --seed "${DATASET_SEED:-0}" \
     "${overwrite_args[@]}"
 }
@@ -416,6 +428,7 @@ run_chunk_train() {
     distributed_args=(
       --distributed
       --distributed-backend "${CHUNK_DISTRIBUTED_BACKEND:-auto}"
+      --gradient-bucket-cap-mb "${CHUNK_GRADIENT_BUCKET_CAP_MB:-100}"
     )
     export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
     echo "[rgb_dp_chunk_idql] distributed training: GPUs=$CHUNK_NUM_GPUS per-rank-batch=${CHUNK_BATCH_SIZE:-${BATCH_SIZE:-100}}" >&2
@@ -431,6 +444,8 @@ run_chunk_train() {
     --seed "${CHUNK_SEED:-${SEED:-0}}" \
     --epochs "${CHUNK_EPOCHS:-$TASK_CHUNK_EPOCHS}" \
     "${CHUNK_STEPS_PER_EPOCH_ARGS[@]}" \
+    --schedule-reference-batch-size "${CHUNK_SCHEDULE_REFERENCE_BATCH_SIZE:-100}" \
+    "$SPARSE_CHUNK_LOADER_ARG" \
     --batch-size "${CHUNK_BATCH_SIZE:-${BATCH_SIZE:-100}}" \
     --num-workers "${CHUNK_NUM_WORKERS:-${NUM_WORKERS:-6}}" \
     --prefetch-factor "${CHUNK_PREFETCH_FACTOR:-${PREFETCH_FACTOR:-2}}" \
@@ -438,13 +453,17 @@ run_chunk_train() {
     "$PERSISTENT_WORKERS_ARG" \
     --hdf5-cache-mode "${HDF5_CACHE_MODE:-low_dim}" \
     --reward-mode "$IDQL_REWARD_MODE" \
+    --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
     --chunk-horizon "${CHUNK_HORIZON:-8}" \
     --discount "${DISCOUNT:-0.99}" \
     --expectile "${EXPECTILE:-0.9}" \
     --target-tau "${TARGET_TAU:-0.01}" \
     --dynamics-target-sync-interval "${DYNAMICS_TARGET_SYNC_INTERVAL:-1000}" \
-    --actor-lr "${CHUNK_ACTOR_LR:-${ACTOR_LR:-1e-4}}" \
-    --source-actor-l2-sp-weight "${SOURCE_ACTOR_L2_SP_WEIGHT:-0.0}" \
+    --actor-adapter-lr "${CHUNK_ACTOR_ADAPTER_LR:-1e-4}" \
+    --actor-unet-lr "${CHUNK_ACTOR_UNET_LR:-1e-5}" \
+    --actor-obs-encoder-lr "${CHUNK_ACTOR_OBS_ENCODER_LR:-1e-6}" \
+    --actor-reference-weight "${CHUNK_ACTOR_REFERENCE_WEIGHT:-0.0}" \
+    --actor-reference-batch-fraction "${CHUNK_ACTOR_REFERENCE_BATCH_FRACTION:-0.25}" \
     --actor-lr-scheduler "${CHUNK_ACTOR_LR_SCHEDULER:-cosine}" \
     --actor-lr-warmup-steps "${CHUNK_ACTOR_LR_WARMUP_STEPS:-1000}" \
     --actor-lr-num-cycles "${CHUNK_ACTOR_LR_NUM_CYCLES:-0.5}" \
@@ -452,7 +471,6 @@ run_chunk_train() {
     --condition-dropout "${CHUNK_CONDITION_DROPOUT:-${CONDITION_DROPOUT:-0.0}}" \
     --condition-hidden-dim "${CHUNK_CONDITION_HIDDEN_DIM:-${CONDITION_HIDDEN_DIM:-128}}" \
     --critic-lr "${CHUNK_CRITIC_LR:-${CRITIC_LR:-1e-4}}" \
-    --source-critic-l2-sp-weight "${SOURCE_CRITIC_L2_SP_WEIGHT:-0.0}" \
     --encoder-lr "${CHUNK_ENCODER_LR:-1e-5}" \
     --vf-lr "${CHUNK_VF_LR:-${VF_LR:-1e-4}}" \
     --critic-vf-lr-scheduler "${CHUNK_CRITIC_VF_LR_SCHEDULER:-cosine}" \
@@ -480,12 +498,16 @@ run_chunk_train() {
 }
 
 case "$STAGE" in
-  train_chunk_idql|train_chunk_idql_round2|train_chunk_idql_round2_regularized)
+  build_dataset)
+    build_dataset
+    ;;
+
+  train_chunk_idql|train_chunk_idql_round2)
     ensure_dataset
     run_chunk_train "${CHUNK_RESUME_CHECKPOINT:-}"
     ;;
 
-  train_chunk_idql_resilient|train_chunk_idql_round2_resilient|train_chunk_idql_round2_regularized_resilient)
+  train_chunk_idql_resilient|train_chunk_idql_round2_resilient)
     ensure_dataset
     max_restarts=${MAX_RESTARTS:-20}
     retry_sleep=${RETRY_SLEEP:-5}
@@ -525,6 +547,7 @@ case "$STAGE" in
       --expected-task "$TASK" \
       --output-dir "$CHUNK_EVAL_OUTPUT" \
       --device "${DEVICE:-cuda}" \
+      "${EVAL_GPU_ARGS[@]}" \
       --actor-source hybrid_dp_chunk_actor \
       --critic-source "${CRITIC_SOURCE:-online}" \
       --n-rollouts "${N_ROLLOUTS:-50}" \
@@ -575,11 +598,11 @@ case "$STAGE" in
         --policy-seeds "${collection_policy_seed_args[@]}"
       )
     else
-    if (( COLLECTION_TOTAL_ROLLOUTS % COLLECTION_ROLLOUTS_PER_SHARD != 0 )); then
-      echo "COLLECTION_TOTAL_ROLLOUTS must be divisible by COLLECTION_ROLLOUTS_PER_SHARD." >&2
-      exit 2
-    fi
-    collection_num_shards=$((COLLECTION_TOTAL_ROLLOUTS / COLLECTION_ROLLOUTS_PER_SHARD))
+      if (( COLLECTION_TOTAL_ROLLOUTS % COLLECTION_ROLLOUTS_PER_SHARD != 0 )); then
+        echo "COLLECTION_TOTAL_ROLLOUTS must be divisible by COLLECTION_ROLLOUTS_PER_SHARD." >&2
+        exit 2
+      fi
+      collection_num_shards=$((COLLECTION_TOTAL_ROLLOUTS / COLLECTION_ROLLOUTS_PER_SHARD))
     fi
     "$PYTHON" -B scripts/collect_rollout_shards.py \
       --idql-checkpoint "$CHUNK_IDQL_CHECKPOINT" \
@@ -621,6 +644,7 @@ case "$STAGE" in
       --expected-task "$TASK" \
       --output-dir "$COMPOSED_CHUNK_EVAL_OUTPUT" \
       --device "${DEVICE:-cuda}" \
+      "${EVAL_GPU_ARGS[@]}" \
       --actor-source external_dp_chunk_critic \
       --critic-source "${CRITIC_SOURCE:-online}" \
       --n-rollouts "${N_ROLLOUTS:-50}" \
@@ -638,7 +662,7 @@ case "$STAGE" in
     ;;
 
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang] {train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|train_chunk_idql_round2_regularized|train_chunk_idql_round2_regularized_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
     exit 2
     ;;
 esac

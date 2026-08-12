@@ -732,6 +732,135 @@ class SequenceDataset(torch.utils.data.Dataset):
         return None
 
 
+class SparseChunkSequenceDataset(torch.utils.data.Dataset):
+    """Load only the observation frames consumed by chunk-IDQL.
+
+    The wrapped ``SequenceDataset`` still supplies the full action, reward,
+    done, and conditioning sequence. Images are restricted to the actor's
+    observation history plus one terminal-aware next observation.
+    """
+
+    def __init__(self, dataset, chunk_horizon, observation_horizon):
+        super().__init__()
+        if dataset.__class__.__name__ != "SequenceDataset":
+            raise TypeError("sparse chunk loading requires a SequenceDataset")
+        self.dataset = dataset
+        self.chunk_horizon = int(chunk_horizon)
+        self.observation_horizon = int(observation_horizon)
+        if self.chunk_horizon < 1 or self.observation_horizon < 1:
+            raise ValueError("chunk and observation horizons must be positive")
+        if int(dataset.n_frame_stack) != self.observation_horizon:
+            raise ValueError(
+                "SequenceDataset frame_stack must equal observation_horizon: "
+                f"{dataset.n_frame_stack} != {self.observation_horizon}"
+            )
+        available = int(dataset.n_frame_stack - 1 + dataset.seq_length)
+        required = self.observation_horizon - 1 + self.chunk_horizon
+        if available < required:
+            raise ValueError(
+                "SequenceDataset is too short for sparse chunk loading: "
+                f"available={available}, required={required}"
+            )
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getattr__(self, name):
+        if name == "dataset":
+            raise AttributeError(name)
+        return getattr(self.dataset, name)
+
+    def __getitem__(self, index):
+        base = self.dataset
+        demo_id = base._index_to_demo_id[index]
+        demo_start_index = base._demo_id_to_start_indices[demo_id]
+        demo_length = base._demo_id_to_demo_length[demo_id]
+        demo_index_offset = 0 if base.pad_frame_stack else base.n_frame_stack - 1
+        index_in_demo = (
+            index
+            - demo_start_index
+            + demo_index_offset
+            + (base.sample_start_offset if base.demo_start_only else 0)
+        )
+
+        meta = base.get_dataset_sequence_from_demo(
+            demo_id,
+            index_in_demo=index_in_demo,
+            keys=base.dataset_keys,
+            num_frames_to_stack=base.n_frame_stack - 1,
+            seq_length=base.seq_length,
+        )
+        meta["obs"] = base.get_obs_sequence_from_demo(
+            demo_id,
+            index_in_demo=index_in_demo,
+            keys=base.obs_keys,
+            num_frames_to_stack=base.n_frame_stack - 1,
+            seq_length=1,
+            prefix="obs",
+        )
+
+        current_index = self.observation_horizon - 1
+        chunk_dones = np.asarray(
+            meta["dones"][current_index : current_index + self.chunk_horizon]
+        ).reshape(self.chunk_horizon, -1)[:, 0]
+        continuation = 1.0 - (chunk_dones > 0.5).astype(np.float32)
+        action_mask = np.concatenate(
+            (
+                np.ones((1,), dtype=np.float32),
+                np.cumprod(continuation[:-1], dtype=np.float32),
+            )
+        )
+        valid_length = int(action_mask.sum())
+        next_index_in_demo = min(
+            demo_length - 1,
+            index_in_demo + valid_length - 1,
+        )
+        meta["next_obs"] = base.get_obs_sequence_from_demo(
+            demo_id,
+            index_in_demo=next_index_in_demo,
+            keys=base.obs_keys,
+            num_frames_to_stack=0,
+            seq_length=1,
+            prefix="next_obs",
+        )
+        meta["chunk_sparse_next_obs"] = np.float32(1.0)
+
+        if base.goal_mode == "last":
+            demo_length_offset = 0 if base.pad_seq_length else base.seq_length - 1
+            goal_index = demo_length - demo_length_offset - 1
+            goal = base.get_obs_sequence_from_demo(
+                demo_id,
+                index_in_demo=goal_index,
+                keys=base.obs_keys,
+                num_frames_to_stack=0,
+                seq_length=1,
+                prefix="next_obs",
+            )
+            meta["goal_obs"] = {key: value[0] for key, value in goal.items()}
+
+        action_dict = OrderedDict()
+        for key in base.action_keys:
+            action = meta[key]
+            if len(action.shape) == 1:
+                action = action.reshape(-1, 1)
+            action_dict[key] = action
+        action_dict = ObsUtils.normalize_dict(
+            action_dict,
+            normalization_stats=base.get_action_normalization_stats(),
+        )
+        meta["actions"] = PyUtils.action_dict_to_vector(action_dict)
+        meta["index"] = index
+        meta["anti_failure"] = np.float32(base.sample_label)
+        meta["hazard_failure"] = np.float32(base.hazard_label)
+
+        if base._lang_emb is not None:
+            meta["obs"][LangUtils.LANG_EMB_OBS_KEY] = np.tile(
+                base._lang_emb,
+                (self.observation_horizon, 1),
+            )
+        return meta
+
+
 class CustomWeightedRandomSampler(torch.utils.data.WeightedRandomSampler):
     def __init__(self, *args, **kwargs):
         """

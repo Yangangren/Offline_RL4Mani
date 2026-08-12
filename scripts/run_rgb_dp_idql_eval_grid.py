@@ -13,9 +13,12 @@ import argparse
 import json
 import math
 import os
+import queue
 import shutil
 import subprocess
+import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -56,11 +59,64 @@ COMMON_ENV = {
 }
 
 
-def process_env(cache_suffix: str) -> dict[str, str]:
+def process_env(cache_suffix: str, gpu_id: int | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.update(COMMON_ENV)
     env["PYTHONPYCACHEPREFIX"] = f"/tmp/robomimic_one_step_idql_eval_pycache_{cache_suffix}"
+    if gpu_id is not None:
+        # The evaluator always uses logical cuda:0. Restricting each child to
+        # one physical GPU makes cuda:0 map to that worker's device. MuJoCo EGL
+        # uses the physical device index, so bind it explicitly as well.
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        env["MUJOCO_EGL_DEVICE_ID"] = str(gpu_id)
     return env
+
+
+def resolve_gpu_ids(args: argparse.Namespace) -> list[int | None]:
+    """Resolve the physical GPU assigned to each evaluation worker."""
+    requested = args.num_gpus
+    explicit = args.gpu_ids
+
+    if args.device != "cuda":
+        if explicit or (requested is not None and requested != 1):
+            raise ValueError("multi-GPU evaluation requires --device cuda")
+        return [None]
+
+    if requested is None:
+        requested = len(explicit) if explicit else 1
+    if requested <= 0:
+        raise ValueError("--num-gpus must be positive")
+
+    if explicit:
+        if any(gpu_id < 0 for gpu_id in explicit):
+            raise ValueError("--gpu-ids must contain non-negative physical GPU IDs")
+        if len(set(explicit)) != len(explicit):
+            raise ValueError("--gpu-ids must not contain duplicates")
+        if requested > len(explicit):
+            raise ValueError(
+                f"--num-gpus={requested} exceeds the {len(explicit)} entries in --gpu-ids"
+            )
+        return [int(gpu_id) for gpu_id in explicit[:requested]]
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        tokens = [token.strip() for token in visible.split(",") if token.strip()]
+        if not tokens or any(not token.isdigit() for token in tokens):
+            raise ValueError(
+                "CUDA_VISIBLE_DEVICES must contain numeric GPU IDs for MuJoCo EGL; "
+                "alternatively pass numeric physical IDs through --gpu-ids"
+            )
+        available = [int(token) for token in tokens]
+        if len(set(available)) != len(available):
+            raise ValueError("CUDA_VISIBLE_DEVICES must not contain duplicate GPU IDs")
+        if requested > len(available):
+            raise ValueError(
+                f"--num-gpus={requested} exceeds the {len(available)} devices in "
+                "CUDA_VISIBLE_DEVICES"
+            )
+        return available[:requested]
+
+    return list(range(requested))
 
 
 class TeeLogger:
@@ -242,6 +298,7 @@ def run_chunk(
     chunk_seed: int,
     n_rollouts: int,
     logger: TeeLogger,
+    gpu_id: int | None = None,
 ) -> dict:
     chunk_dir = args.output_dir / "chunks" / f"N{num_candidates}_seed{seed}_chunk{chunk_index:03d}"
     chunk_json = chunk_dir / f"one_step_idql_N{num_candidates}_seed{chunk_seed}.json"
@@ -281,7 +338,7 @@ def run_chunk(
         proc = subprocess.Popen(
             command,
             cwd=ROOT,
-            env=process_env(cache_suffix),
+            env=process_env(cache_suffix, gpu_id=gpu_id),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -320,7 +377,12 @@ def run_chunk(
     )
 
 
-def run_pair(args: argparse.Namespace, num_candidates: int, seed: int) -> dict:
+def run_pair(
+    args: argparse.Namespace,
+    num_candidates: int,
+    seed: int,
+    gpu_id: int | None = None,
+) -> dict:
     final_json = args.output_dir / f"one_step_idql_N{num_candidates}_seed{seed}.json"
     if final_json.exists() and not args.force:
         try:
@@ -336,7 +398,7 @@ def run_pair(args: argparse.Namespace, num_candidates: int, seed: int) -> dict:
     logger = TeeLogger(log_path, mode="w")
     logger.line(
         f"[pair] N={num_candidates} seed={seed} n_rollouts={args.n_rollouts} "
-        f"rollouts_per_chunk={args.rollouts_per_chunk}"
+        f"rollouts_per_chunk={args.rollouts_per_chunk} gpu_id={gpu_id}"
     )
     all_rollouts: list[dict] = []
     chunk_records: list[dict] = []
@@ -357,6 +419,7 @@ def run_pair(args: argparse.Namespace, num_candidates: int, seed: int) -> dict:
                 chunk_seed=chunk_seed,
                 n_rollouts=count,
                 logger=logger,
+                gpu_id=gpu_id,
             )
             rollouts = chunk.get("rollouts", [])
             if len(rollouts) == 0:
@@ -440,6 +503,130 @@ def run_pair(args: argparse.Namespace, num_candidates: int, seed: int) -> dict:
     atomic_write_json(final_json, result)
     print(f"[pair wrote] {final_json}", flush=True)
     return result
+
+
+def run_grid(args: argparse.Namespace) -> list[dict]:
+    pairs = [
+        (int(num_candidates), int(seed))
+        for num_candidates in args.num_candidates
+        for seed in args.seeds
+    ]
+    pair_order = {pair: index for index, pair in enumerate(pairs)}
+    worker_gpu_ids = args.eval_gpu_ids[: len(pairs)]
+
+    if len(worker_gpu_ids) == 1:
+        results = []
+        gpu_id = worker_gpu_ids[0]
+        for num_candidates, seed in pairs:
+            results.append(run_pair(args, num_candidates, seed, gpu_id=gpu_id))
+            summarize(results, args)
+        return results
+
+    print(
+        f"[multi-gpu eval] pairs={len(pairs)} workers={len(worker_gpu_ids)} "
+        f"gpu_ids={worker_gpu_ids}",
+        flush=True,
+    )
+    tasks: queue.Queue[tuple[int, int]] = queue.Queue()
+    completed: queue.Queue[tuple[str, int, int, int, object]] = queue.Queue()
+    stop_event = threading.Event()
+    for pair in pairs:
+        tasks.put(pair)
+
+    def gpu_worker(gpu_id: int) -> None:
+        print(f"[gpu worker start] gpu_id={gpu_id}", flush=True)
+        while not stop_event.is_set():
+            try:
+                num_candidates, seed = tasks.get_nowait()
+            except queue.Empty:
+                break
+            if stop_event.is_set():
+                tasks.task_done()
+                break
+            print(
+                f"[gpu assignment] gpu_id={gpu_id} N={num_candidates} seed={seed}",
+                flush=True,
+            )
+            try:
+                result = run_pair(
+                    args,
+                    num_candidates,
+                    seed,
+                    gpu_id=gpu_id,
+                )
+            except Exception:
+                stop_event.set()
+                completed.put(
+                    (
+                        "error",
+                        gpu_id,
+                        num_candidates,
+                        seed,
+                        traceback.format_exc(),
+                    )
+                )
+            else:
+                completed.put(("result", gpu_id, num_candidates, seed, result))
+            finally:
+                tasks.task_done()
+        print(f"[gpu worker stop] gpu_id={gpu_id}", flush=True)
+
+    threads = [
+        threading.Thread(
+            target=gpu_worker,
+            args=(gpu_id,),
+            name=f"eval-gpu-{gpu_id}",
+            daemon=True,
+        )
+        for gpu_id in worker_gpu_ids
+    ]
+    for thread in threads:
+        thread.start()
+
+    results: list[dict] = []
+    failures: list[str] = []
+    while any(thread.is_alive() for thread in threads) or not completed.empty():
+        try:
+            status, gpu_id, num_candidates, seed, payload = completed.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if status == "result":
+            assert isinstance(payload, dict)
+            results.append(payload)
+            results.sort(
+                key=lambda result: pair_order[
+                    (int(result["num_candidates"]), int(result["seed"]))
+                ]
+            )
+            print(
+                f"[gpu pair complete] gpu_id={gpu_id} N={num_candidates} seed={seed} "
+                f"completed={len(results)}/{len(pairs)}",
+                flush=True,
+            )
+            summarize(results, args)
+        else:
+            failure = (
+                f"gpu_id={gpu_id} N={num_candidates} seed={seed} failed:\n{payload}"
+            )
+            failures.append(failure)
+            print(f"[gpu pair failed] {failure}", flush=True)
+        completed.task_done()
+
+    for thread in threads:
+        thread.join()
+
+    if failures:
+        if results:
+            summarize(results, args)
+        raise RuntimeError(
+            "multi-GPU evaluation stopped after a worker failure:\n"
+            + "\n".join(failures)
+        )
+    if len(results) != len(pairs):
+        raise RuntimeError(
+            f"multi-GPU evaluation completed {len(results)}/{len(pairs)} pairs"
+        )
+    return results
 
 
 def summarize(results: list[dict], args: argparse.Namespace) -> dict:
@@ -556,6 +743,21 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
         "random_selection_probability": (
             None if args.actor_source == "plain_dp" else args.random_selection_probability
         ),
+        "num_gpu_workers": (
+            min(len(args.eval_gpu_ids), len(args.num_candidates) * len(args.seeds))
+            if args.device == "cuda"
+            else 0
+        ),
+        "gpu_ids": (
+            [
+                int(gpu_id)
+                for gpu_id in args.eval_gpu_ids[
+                    : len(args.num_candidates) * len(args.seeds)
+                ]
+            ]
+            if args.device == "cuda"
+            else []
+        ),
         "num_candidates": args.num_candidates,
         "seeds": args.seeds,
         "by_num_candidates": by_n,
@@ -604,6 +806,25 @@ def main() -> None:
         help="For DP-proposal actors, execute this many selected trajectory actions before replanning.",
     )
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help=(
+            "Number of GPU workers. Defaults to one, or to all entries in "
+            "--gpu-ids when that option is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Physical GPU IDs used by CUDA and MuJoCo EGL. By default, take "
+            "the first --num-gpus entries from CUDA_VISIBLE_DEVICES, or 0..N-1."
+        ),
+    )
     parser.add_argument(
         "--actor-source",
         choices=(
@@ -666,16 +887,20 @@ def main() -> None:
     args.dp_checkpoint = args.dp_checkpoint.resolve()
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        args.eval_gpu_ids = resolve_gpu_ids(args)
+    except ValueError as error:
+        parser.error(str(error))
     if args.actor_source == "plain_dp" and any(int(n) != 1 for n in args.num_candidates):
         parser.error("actor_source=plain_dp evaluates the standard DP queue; use --num-candidates 1")
+    if len(set(args.num_candidates)) != len(args.num_candidates):
+        parser.error("--num-candidates must not contain duplicates")
+    if len(set(args.seeds)) != len(args.seeds):
+        parser.error("--seeds must not contain duplicates")
     if args.rollouts_per_chunk <= 0:
         args.rollouts_per_chunk = args.n_rollouts
 
-    results = []
-    for n in args.num_candidates:
-        for seed in args.seeds:
-            results.append(run_pair(args, int(n), int(seed)))
-            summarize(results, args)
+    results = run_grid(args)
     summarize(results, args)
 
 

@@ -148,19 +148,16 @@ class DiffusionPolicyUNet(PolicyAlgo):
         self.action_queue = None
         self.reference_nets = None
         self.reference_margin_step = 0
+        # Optional function-space distillation against a frozen teacher
+        # installed by the training entry point from the deployed EMA.
+        self.reference_distillation_weight = 0.0
+        self.reference_distillation_batch_fraction = 0.0
         self.hazard_model = None
         self.hazard_action_mean = None
         self.hazard_action_std = None
         self.success_condition_dropout = 0.0
         self.inference_success_condition = 1.0
         self.inference_success_condition_mask = 1.0
-        # Optional L2-SP anchor used by chunk-IDQL round-to-round fine-tuning.
-        # These are deliberately plain tensors instead of module buffers: the
-        # original checkpoint remains the source of truth across resumes and
-        # the anchors must not inflate every actor serialization.
-        self.policy_l2_sp_weight = 0.0
-        self._policy_l2_sp_parameter_anchors = None
-        self._policy_l2_sp_numel = 0
 
         if self.reference_margin_enabled and self.hazard_constraint_enabled:
             raise ValueError(
@@ -168,61 +165,6 @@ class DiffusionPolicyUNet(PolicyAlgo):
             )
         if self.hazard_constraint_enabled:
             self._load_hazard_model()
-
-    def configure_policy_l2_sp_anchor(self, source_nets, weight):
-        """Anchor trainable policy parameters to a prior actor state."""
-        weight = float(weight)
-        if weight < 0.0:
-            raise ValueError("policy L2-SP weight must be non-negative")
-        if weight == 0.0:
-            self.policy_l2_sp_weight = 0.0
-            self._policy_l2_sp_parameter_anchors = None
-            self._policy_l2_sp_numel = 0
-            return
-
-        anchors = []
-        missing = []
-        for name, parameter in self.nets.named_parameters():
-            if name not in source_nets:
-                missing.append(name)
-                continue
-            source = source_nets[name]
-            if tuple(source.shape) != tuple(parameter.shape):
-                raise ValueError(
-                    f"policy L2-SP anchor shape mismatch for {name}: "
-                    f"source={tuple(source.shape)}, current={tuple(parameter.shape)}"
-                )
-            anchors.append(
-                (
-                    parameter,
-                    source.detach().to(
-                        device=parameter.device,
-                        dtype=parameter.dtype,
-                    ).clone(),
-                )
-            )
-        if missing:
-            raise KeyError(
-                "source actor is missing policy L2-SP parameters: "
-                f"{missing[:8]}"
-            )
-        self.policy_l2_sp_weight = weight
-        self._policy_l2_sp_parameter_anchors = tuple(anchors)
-        self._policy_l2_sp_numel = sum(
-            int(parameter.numel()) for parameter, _ in anchors
-        )
-        if self._policy_l2_sp_numel <= 0:
-            raise RuntimeError("policy L2-SP anchor contains no parameters")
-
-    def _policy_l2_sp_loss(self):
-        anchors = self._policy_l2_sp_parameter_anchors
-        if not anchors or self._policy_l2_sp_numel <= 0:
-            return None
-        squared_distance = sum(
-            (parameter - anchor).square().sum()
-            for parameter, anchor in anchors
-        )
-        return squared_distance / float(self._policy_l2_sp_numel)
 
     @property
     def reference_margin_enabled(self):
@@ -553,7 +495,11 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 input_batch["actions"] = actions.clamp(-1.0, 1.0)
             self.action_check_done = True
         
-        return TensorUtils.to_device(TensorUtils.to_float(input_batch), self.device)
+        return TensorUtils.to_device(
+            TensorUtils.to_float(input_batch),
+            self.device,
+            non_blocking=self.device.type == "cuda",
+        )
 
     def _sample_ddim_trajectory(
         self,
@@ -641,12 +587,22 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 # first two dimensions should be [B, T] for inputs
                 assert inputs["obs"][k].ndim - 2 == len(self.obs_shapes[k])
             
-            if self.reference_policy_enabled:
+            reference_distillation_enabled = (
+                float(getattr(self, "reference_distillation_weight", 0.0))
+                > 0.0
+            )
+            if self.reference_policy_enabled or reference_distillation_enabled:
                 if self.reference_nets is None:
+                    if reference_distillation_enabled:
+                        raise RuntimeError(
+                            "reference distillation requires an explicitly "
+                            "installed pretrained teacher"
+                        )
                     self._create_reference_nets()
                 obs_cond, reference_obs_cond = self._encode_current_and_reference(inputs)
             else:
                 obs_cond = self._encode_obs(inputs, self.nets)
+            unconditioned_obs_cond = obs_cond
             obs_cond, condition_stats = self._apply_success_condition(
                 obs_cond,
                 nets=self.nets,
@@ -675,6 +631,62 @@ class DiffusionPolicyUNet(PolicyAlgo):
             per_sample_energy = F.mse_loss(
                 noise_pred, noise, reduction="none"
             ).flatten(start_dim=1).mean(dim=1)
+
+            reference_distillation_loss = None
+            weighted_reference_distillation_loss = None
+            reference_distillation_rows = 0
+            if reference_distillation_enabled:
+                if self.reference_policy_enabled or self.hazard_constraint_enabled:
+                    raise RuntimeError(
+                        "reference distillation cannot be combined with the "
+                        "reference-margin or hazard objectives"
+                    )
+                fraction = float(self.reference_distillation_batch_fraction)
+                if not 0.0 < fraction <= 1.0:
+                    raise ValueError(
+                        "reference_distillation_batch_fraction must be in (0, 1]"
+                    )
+                reference_distillation_rows = min(
+                    B,
+                    max(1, int(round(float(B) * fraction))),
+                )
+                reference_indices = torch.randperm(
+                    B, device=self.device
+                )[:reference_distillation_rows]
+                student_reference_cond, _ = self._apply_success_condition(
+                    unconditioned_obs_cond[reference_indices],
+                    nets=self.nets,
+                    success_condition=torch.ones(
+                        reference_distillation_rows, device=self.device
+                    ),
+                    condition_mask=torch.ones(
+                        reference_distillation_rows, device=self.device
+                    ),
+                    validate=True,
+                )
+                student_reference_noise_pred = self.nets["policy"][
+                    "noise_pred_net"
+                ](
+                    noisy_actions[reference_indices],
+                    timesteps[reference_indices],
+                    global_cond=student_reference_cond,
+                )
+                with torch.no_grad():
+                    teacher_reference_noise_pred = self.reference_nets[
+                        "policy"
+                    ]["noise_pred_net"](
+                        noisy_actions[reference_indices],
+                        timesteps[reference_indices],
+                        global_cond=reference_obs_cond[reference_indices],
+                    )
+                reference_distillation_loss = F.mse_loss(
+                    student_reference_noise_pred,
+                    teacher_reference_noise_pred,
+                )
+                weighted_reference_distillation_loss = (
+                    float(self.reference_distillation_weight)
+                    * reference_distillation_loss
+                )
 
             if self.reference_margin_enabled:
                 anti_failure = batch["anti_failure"].flatten() > 0.5
@@ -850,28 +862,25 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 )
             else:
                 loss = per_sample_energy.mean()
+                if reference_distillation_loss is not None:
+                    loss = loss + weighted_reference_distillation_loss
 
-            base_loss = loss
-            policy_l2_sp_loss = self._policy_l2_sp_loss()
-            if policy_l2_sp_loss is not None:
-                weighted_policy_l2_sp_loss = (
-                    float(self.policy_l2_sp_weight) * policy_l2_sp_loss
-                )
-                loss = base_loss + weighted_policy_l2_sp_loss
-            else:
-                weighted_policy_l2_sp_loss = None
-            
             # logging
             losses = {
-                "l2_loss": base_loss,
+                "l2_loss": loss,
                 "total_loss": loss,
             }
-            if policy_l2_sp_loss is not None:
+            if reference_distillation_loss is not None:
                 losses.update(
                     {
-                        "policy_l2_sp_loss": policy_l2_sp_loss,
-                        "weighted_policy_l2_sp_loss": (
-                            weighted_policy_l2_sp_loss
+                        "diffusion_bc_loss": per_sample_energy.mean(),
+                        "reference_distillation_loss": reference_distillation_loss,
+                        "weighted_reference_distillation_loss": (
+                            weighted_reference_distillation_loss
+                        ),
+                        "reference_distillation_fraction": torch.as_tensor(
+                            float(reference_distillation_rows) / float(B),
+                            device=self.device,
                         ),
                     }
                 )
@@ -943,7 +952,13 @@ class DiffusionPolicyUNet(PolicyAlgo):
         PyTorch. All mutable learned state here is represented by parameters;
         non-learned buffers are constant after network construction.
         """
-        decay = self.ema.get_decay(self.ema.optimization_step)
+        reference_step = float(
+            getattr(self, "ema_reference_step", self.ema.optimization_step)
+        )
+        step_scale = float(getattr(self, "ema_update_step_scale", 1.0))
+        reference_decay = self.ema.get_decay(int(reference_step))
+        # Convert the reference-step retention to the current sample count.
+        decay = float(reference_decay) ** step_scale
         ema_parameters = self._averaged_ema_parameters
         model_parameters = self._model_ema_parameters
         if len(ema_parameters) != len(model_parameters):
@@ -951,30 +966,43 @@ class DiffusionPolicyUNet(PolicyAlgo):
         torch._foreach_lerp_(ema_parameters, model_parameters, 1.0 - decay)
         self.ema.decay = decay
         self.ema.optimization_step += 1
+        self.ema_reference_step = reference_step + step_scale
     
-    def log_info(self, info):
+    def log_info(self, info, materialize=True):
         """
         Process info dictionary from @train_on_batch to summarize
         information to pass to tensorboard for logging.
 
         Args:
             info (dict): dictionary of info
+            materialize (bool): convert scalar tensors to Python values
 
         Returns:
             loss_log (dict): name -> summary statistic
         """
         log = super(DiffusionPolicyUNet, self).log_info(info)
-        log["Loss"] = info["losses"].get(
-            "total_loss", info["losses"]["l2_loss"]
-        ).item()
-        if "policy_l2_sp_loss" in info["losses"]:
-            log["Base_Loss"] = info["losses"]["l2_loss"].item()
-            log["L2SP/RawLoss"] = info["losses"][
-                "policy_l2_sp_loss"
-            ].item()
-            log["L2SP/WeightedLoss"] = info["losses"][
-                "weighted_policy_l2_sp_loss"
-            ].item()
+        scalar = (
+            (lambda value: value.item())
+            if materialize
+            else (lambda value: value)
+        )
+        log["Loss"] = scalar(
+            info["losses"].get("total_loss", info["losses"]["l2_loss"])
+        )
+        for key, name in (
+            ("diffusion_bc_loss", "ReferenceDistillation/BCLoss"),
+            ("reference_distillation_loss", "ReferenceDistillation/RawLoss"),
+            (
+                "weighted_reference_distillation_loss",
+                "ReferenceDistillation/WeightedLoss",
+            ),
+            (
+                "reference_distillation_fraction",
+                "ReferenceDistillation/BatchFraction",
+            ),
+        ):
+            if key in info["losses"]:
+                log[name] = scalar(info["losses"][key])
         for key, name in (
             ("positive_loss", "ReferenceMargin/PositiveLoss"),
             ("failure_loss", "ReferenceMargin/FailureLoss"),
@@ -985,7 +1013,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
             ("margin_multiplier", "ReferenceMargin/Multiplier"),
         ):
             if key in info["losses"]:
-                log[name] = info["losses"][key].item()
+                log[name] = scalar(info["losses"][key])
         for key, name in (
             ("positive_reference_loss", "HazardConstraint/PositiveReferenceLoss"),
             ("hazard_loss", "HazardConstraint/HazardLoss"),
@@ -998,10 +1026,10 @@ class DiffusionPolicyUNet(PolicyAlgo):
             ("constraint_multiplier", "HazardConstraint/Multiplier"),
         ):
             if key in info["losses"]:
-                log[name] = info["losses"][key].item()
+                log[name] = scalar(info["losses"][key])
         if "success_condition" in info:
             for key, value in info["success_condition"].items():
-                log[f"SuccessCondition/{key}"] = value.item()
+                log[f"SuccessCondition/{key}"] = scalar(value)
         if "policy_grad_norms" in info:
             log["Policy_Grad_Norms"] = info["policy_grad_norms"]
         return log

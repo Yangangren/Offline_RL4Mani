@@ -36,10 +36,27 @@ def soft_update(source, target, tau):
         source (torch.nn.Module): source network to push target network parameters towards
         target (torch.nn.Module): target network to update
     """
-    for target_param, param in zip(target.parameters(), source.parameters()):
-        target_param.copy_(
-            target_param * (1.0 - tau) + param * tau
-        )
+    target_parameters = list(target.parameters())
+    source_parameters = list(source.parameters())
+    if len(target_parameters) != len(source_parameters):
+        raise RuntimeError("soft-update parameter structures do not match")
+    grouped_parameters = {}
+    for target_parameter, source_parameter in zip(
+        target_parameters,
+        source_parameters,
+    ):
+        if (
+            target_parameter.device != source_parameter.device
+            or target_parameter.dtype != source_parameter.dtype
+        ):
+            raise RuntimeError("soft-update parameter devices or dtypes differ")
+        key = (target_parameter.device, target_parameter.dtype)
+        targets, sources = grouped_parameters.setdefault(key, ([], []))
+        targets.append(target_parameter)
+        sources.append(source_parameter)
+    with torch.no_grad():
+        for targets, sources in grouped_parameters.values():
+            torch._foreach_lerp_(targets, sources, float(tau))
 
 
 def hard_update(source, target):
@@ -280,7 +297,7 @@ def backprop_for_loss(
     """
 
     # backprop
-    optim.zero_grad()
+    optim.zero_grad(set_to_none=True)
     loss.backward(retain_graph=retain_graph)
 
     # Optimizers already retain concrete parameter lists. Reuse them instead
@@ -301,11 +318,16 @@ def backprop_for_loss(
 
     # compute grad norms
     grad_norms = 0.
-    for parameter_index in range(len(parameters)):
-        p = parameters[parameter_index]
-        # only clip gradients for parameters for which requires_grad is True
-        if p.grad is not None:
-            grad_norms += p.grad.data.norm(2).pow(2).item()
+    gradients = [
+        parameter.grad.detach()
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if gradients:
+        norms = [
+            torch.linalg.vector_norm(gradient, ord=2) for gradient in gradients
+        ]
+        grad_norms = float(torch.stack(norms).square().sum().item())
 
     # step
     optim.step()

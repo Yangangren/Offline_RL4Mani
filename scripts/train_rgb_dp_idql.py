@@ -30,6 +30,7 @@ import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.train_utils as TrainUtils
+from robomimic.utils.dataset import SparseChunkSequenceDataset
 from robomimic.algo.diffusion_policy import replace_bn_with_gn
 
 
@@ -387,6 +388,11 @@ def build_single_loader(
                     )
                     else []
                 )
+                + (
+                    ["actor_condition"]
+                    if getattr(args, "conditioned_actor", False)
+                    else []
+                )
             )
         )
 
@@ -418,6 +424,19 @@ def build_single_loader(
         action_stats,
     ):
         raise RuntimeError("failed to install pretrained DP action normalization")
+
+    if bool(getattr(args, "sparse_chunk_loader", False)):
+        if dataset.hdf5_cache_mode == "all":
+            raise ValueError(
+                "--sparse-chunk-loader is incompatible with "
+                "--hdf5-cache-mode all; use low_dim (recommended) or disable "
+                "the sparse loader"
+            )
+        dataset = SparseChunkSequenceDataset(
+            dataset,
+            chunk_horizon=int(args.chunk_horizon),
+            observation_horizon=observation_horizon,
+        )
 
     generator = torch.Generator()
     distributed_world_size = int(
@@ -576,9 +595,13 @@ def process_critic_batch(
     return critic_batch
 
 
-def align_shared_batch_actions(raw_batch: dict) -> dict:
+def align_shared_batch_actions(raw_batch: dict, validate: bool = True) -> dict:
     """Validate once and give actor and critic the identical clipped tensor."""
     actions = raw_batch["actions"]
+    if not validate:
+        raw_batch = dict(raw_batch)
+        raw_batch["actions"] = actions.clamp(-1.0, 1.0)
+        return raw_batch
     if not torch.isfinite(actions).all():
         raise ValueError("shared actor/critic actions contain non-finite values")
     action_min = actions.min().item()
@@ -710,7 +733,8 @@ def actor_train_step(
     raw_batch: dict,
     epoch: int,
     obs_normalization_stats,
-) -> dict[str, float]:
+    defer_scalar_conversion: bool = False,
+) -> dict[str, Any]:
     actor_batch = actor_algo.process_batch_for_training(raw_batch)
     actor_batch = actor_algo.postprocess_batch_for_training(
         actor_batch,
@@ -718,11 +742,18 @@ def actor_train_step(
     )
     info = actor_algo.train_on_batch(actor_batch, epoch=epoch, validate=False)
     actor_algo.on_gradient_step()
-    log = actor_algo.log_info(info)
+    log = (
+        actor_algo.log_info(info, materialize=False)
+        if defer_scalar_conversion
+        else actor_algo.log_info(info)
+    )
+    allowed_types = (int, float, np.number, torch.Tensor)
     return {
-        f"actor/{key}" if not str(key).startswith("actor/") else str(key): float(value)
+        f"actor/{key}" if not str(key).startswith("actor/") else str(key): (
+            value if isinstance(value, torch.Tensor) else float(value)
+        )
         for key, value in log.items()
-        if isinstance(value, (int, float, np.number))
+        if isinstance(value, allowed_types)
     }
 
 

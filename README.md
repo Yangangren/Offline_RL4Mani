@@ -77,17 +77,57 @@ conda activate robomimic_stable
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 ROBOMIMIC_PYTHON="$CONDA_PREFIX/bin/python" \
 CHUNK_NUM_GPUS=8 \
-CHUNK_BATCH_SIZE=12 \
-CHUNK_NUM_WORKERS=2 \
+CHUNK_BATCH_SIZE=100 \
+CHUNK_NUM_WORKERS=6 \
+CHUNK_SCHEDULE_REFERENCE_BATCH_SIZE=100 \
 bash run_rgb_dp_chunk_idql.sh tool_hang train_chunk_idql_resilient
 ```
 
-`CHUNK_BATCH_SIZE` and `CHUNK_NUM_WORKERS` are per GPU. Thus, the example has
-an effective global batch size of 96 and starts 16 data-loading workers. Ranks
-receive separate shuffled sampler shards (with standard padding when the sample
-count is not divisible by eight) and synchronized parameter updates; only rank
-zero writes TensorBoard data, summaries, and checkpoints. Resume a distributed
-checkpoint with the same `CHUNK_NUM_GPUS` value.
+`CHUNK_BATCH_SIZE` and `CHUNK_NUM_WORKERS` are per GPU and are not globally
+capped. Thus, this example uses an effective batch of 800 and starts 48 data
+workers. The warmup, encoder-freeze, dynamics-ramp, hard-sync, target-tau, and
+actor-EMA settings are interpreted against
+`CHUNK_SCHEDULE_REFERENCE_BATCH_SIZE` (100 by default). For example, a
+1,000-step setting resolves to 125 optimizer steps at global batch 800, keeping
+the processed-sample timing at 100,000 rows. Learning rates are deliberately
+not scaled automatically; use the existing `CHUNK_ACTOR_*_LR`,
+`CHUNK_CRITIC_LR`, `CHUNK_ENCODER_LR`, and `CHUNK_VF_LR` controls.
+
+The sparse chunk loader is enabled by default with `HDF5_CACHE_MODE=low_dim`.
+It decodes the two actor-history images and one terminal-aware next image
+instead of both complete observation sequences. Set
+`CHUNK_SPARSE_LOADER=0` for the legacy dense loader.
+`CHUNK_GRADIENT_BUCKET_CAP_MB` controls the asynchronous flat all-reduce
+bucket size and defaults to 100 MiB.
+
+Ranks receive separate shuffled sampler shards (with standard padding when the
+sample count is not divisible by eight) and synchronized parameter updates;
+only rank zero writes TensorBoard data, summaries, and checkpoints. Resume a
+new-format distributed checkpoint with the same `CHUNK_NUM_GPUS` value.
+Checkpoints made before sample-aware schedules should be passed as
+`SOURCE_CHUNK_IDQL_CHECKPOINT` to start a fresh round instead of being
+resumed in place.
+
+### Multi-GPU chunk-IDQL evaluation
+
+Resilient evaluation can run independent `(candidate count, seed)` pairs on
+separate GPUs. For Tool Hang on eight GPUs:
+
+```bash
+conda activate robomimic_stable
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+ROBOMIMIC_PYTHON="$CONDA_PREFIX/bin/python" \
+EVAL_NUM_GPUS=8 \
+bash run_rgb_dp_chunk_idql.sh tool_hang eval_chunk_grid_resilient
+```
+
+The parent process dynamically schedules pairs across GPUs and alone writes
+the aggregate summary. Each worker binds both PyTorch and MuJoCo EGL to its
+assigned physical GPU. `EVAL_NUM_GPUS` defaults to one; use a space-separated
+list such as `EVAL_GPU_IDS="2 4 6 7"` to select specific physical devices (all
+listed devices are used when `EVAL_NUM_GPUS` is omitted). The same controls
+work with `eval_composed_chunk_grid_resilient`. Completed pair and chunk files
+retain the existing resume behavior.
 
 ## Docker
 
