@@ -80,7 +80,7 @@ class DistributedOptimizationSemanticsTest(unittest.TestCase):
                 join=True,
             )
 
-    def test_sample_scaled_ema_matches_reference_retention(self):
+    def test_actor_ema_advances_once_per_optimizer_update(self):
 
         class EmaState:
             optimization_step = 10
@@ -95,21 +95,18 @@ class DistributedOptimizationSemanticsTest(unittest.TestCase):
         model = torch.tensor([1.0])
         actor = argparse.Namespace(
             ema=EmaState(),
-            ema_reference_step=10.0,
-            ema_update_step_scale=8.0,
             _averaged_ema_parameters=[averaged],
             _model_ema_parameters=[model],
         )
         DiffusionPolicyUNet._update_ema(actor)
 
-        expected_decay = 0.9 ** 8
+        expected_decay = 0.9
         torch.testing.assert_close(
             averaged,
             torch.tensor([1.0 - expected_decay]),
         )
         self.assertAlmostEqual(actor.ema.decay, expected_decay)
         self.assertEqual(actor.ema.optimization_step, 11)
-        self.assertEqual(actor.ema_reference_step, 18.0)
 
     def test_q_and_v_updates_share_one_gradient_sync_phase(self):
         torch.manual_seed(7)
@@ -329,7 +326,7 @@ class ConditionalActorRecipeTest(unittest.TestCase):
 
 
 class BatchScaledSemanticsTest(unittest.TestCase):
-    def test_eight_gpu_batch_preserves_reference_sample_timing(self):
+    def test_only_data_exposure_schedules_are_sample_scaled(self):
         args = argparse.Namespace(
             schedule_reference_batch_size=100,
             batch_size=100,
@@ -349,17 +346,17 @@ class BatchScaledSemanticsTest(unittest.TestCase):
             backend="nccl",
             device=torch.device("cpu"),
         )
-        CHUNK.configure_batch_scaled_semantics(args, context)
+        CHUNK.configure_batch_semantics(args, context)
 
         self.assertEqual(args.effective_global_batch_size, 800)
         self.assertEqual(args.schedule_batch_ratio, 8.0)
-        for field in CHUNK.BATCH_SCALED_STEP_FIELDS:
+        for field in CHUNK.SAMPLE_SCALED_STEP_FIELDS:
             self.assertEqual(getattr(args, f"resolved_{field}"), 125)
-        self.assertAlmostEqual(
-            1.0 - args.resolved_target_tau,
-            (1.0 - args.target_tau) ** 8,
-            places=12,
+        self.assertEqual(
+            args.resolved_dynamics_target_sync_interval,
+            args.dynamics_target_sync_interval,
         )
+        self.assertEqual(args.resolved_target_tau, args.target_tau)
 
     def test_arbitrary_per_gpu_batch_is_not_constrained(self):
         self.assertEqual(

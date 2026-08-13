@@ -85,12 +85,13 @@ bash run_rgb_dp_chunk_idql.sh tool_hang train_chunk_idql_resilient
 
 `CHUNK_BATCH_SIZE` and `CHUNK_NUM_WORKERS` are per GPU and are not globally
 capped. Thus, this example uses an effective batch of 800 and starts 48 data
-workers. The warmup, encoder-freeze, dynamics-ramp, hard-sync, target-tau, and
-actor-EMA settings are interpreted against
-`CHUNK_SCHEDULE_REFERENCE_BATCH_SIZE` (100 by default). For example, a
-1,000-step setting resolves to 125 optimizer steps at global batch 800, keeping
-the processed-sample timing at 100,000 rows. Learning rates are deliberately
-not scaled automatically; use the existing `CHUNK_ACTOR_*_LR`,
+workers. Warmup, encoder-freeze, and dynamics-ramp settings are interpreted
+against `CHUNK_SCHEDULE_REFERENCE_BATCH_SIZE` (100 by default). For example, a
+1,000-step warmup resolves to 125 optimizer steps at global batch 800, keeping
+the processed-sample timing at 100,000 rows. Polyak target updates, actor EMA,
+and dynamics-target hard synchronization remain in optimizer-update units and
+are not sample-scaled. Learning rates are deliberately not scaled
+automatically; use the existing `CHUNK_ACTOR_*_LR`,
 `CHUNK_CRITIC_LR`, `CHUNK_ENCODER_LR`, and `CHUNK_VF_LR` controls.
 
 The sparse chunk loader is enabled by default with `HDF5_CACHE_MODE=low_dim`.

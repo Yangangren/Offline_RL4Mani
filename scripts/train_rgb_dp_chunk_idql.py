@@ -185,13 +185,12 @@ def initialize_distributed(args: argparse.Namespace) -> DistributedContext:
     return context
 
 
-BATCH_SCALED_STEP_FIELDS = (
+SAMPLE_SCALED_STEP_FIELDS = (
     "actor_lr_warmup_steps",
     "critic_vf_lr_warmup_steps",
     "dynamics_warmup_steps",
     "encoder_freeze_steps",
     "vf_encoder_freeze_steps",
-    "dynamics_target_sync_interval",
 )
 
 
@@ -216,19 +215,11 @@ def batch_scaled_step_count(
     )
 
 
-def batch_scaled_tau(reference_tau, reference_batch_size, effective_batch_size):
-    """Preserve target-network decay per processed sample."""
-    reference_tau = float(reference_tau)
-    if reference_tau <= 0.0 or reference_tau >= 1.0:
-        return reference_tau
-    batch_ratio = float(effective_batch_size) / float(reference_batch_size)
-    return float(-np.expm1(np.log1p(-reference_tau) * batch_ratio))
-
-
-def configure_batch_scaled_semantics(
+def configure_batch_semantics(
     args: argparse.Namespace,
     context: DistributedContext,
 ) -> None:
+    """Resolve sample-timed schedules without rescaling target tracking."""
     reference_batch_size = int(args.schedule_reference_batch_size)
     effective_batch_size = int(args.batch_size) * int(context.world_size)
     if reference_batch_size <= 0 or effective_batch_size <= 0:
@@ -237,7 +228,7 @@ def configure_batch_scaled_semantics(
     args.schedule_batch_ratio = (
         float(effective_batch_size) / float(reference_batch_size)
     )
-    for field in BATCH_SCALED_STEP_FIELDS:
+    for field in SAMPLE_SCALED_STEP_FIELDS:
         setattr(
             args,
             f"resolved_{field}",
@@ -247,10 +238,12 @@ def configure_batch_scaled_semantics(
                 effective_batch_size,
             ),
         )
-    args.resolved_target_tau = batch_scaled_tau(
-        args.target_tau,
-        reference_batch_size,
-        effective_batch_size,
+    # These control how learned parameters are tracked, so they remain in
+    # optimizer-update units. A large global batch is not equivalent to
+    # several sequential optimizer updates.
+    args.resolved_target_tau = float(args.target_tau)
+    args.resolved_dynamics_target_sync_interval = int(
+        args.dynamics_target_sync_interval
     )
 
 
@@ -1708,7 +1701,6 @@ def checkpoint_payload(
     args: argparse.Namespace,
     actor_model: dict,
     actor_ema_optimization_step: int,
-    actor_ema_reference_step: float,
     pretrained_dp_checkpoint: str,
     critics: nn.ModuleList,
     targets: nn.ModuleList,
@@ -1932,7 +1924,6 @@ def checkpoint_payload(
         "actor_frozen": bool(not trains_joint_actor(args)),
         "actor_encoder_trainable": bool(trains_joint_actor(args)),
         "actor_ema_optimization_step": int(actor_ema_optimization_step),
-        "actor_ema_reference_step": float(actor_ema_reference_step),
         "global_samples_seen": int(global_samples_seen),
         "rng_state": (
             rank_zero_runtime["rng_state"]
@@ -1969,7 +1960,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     args.distributed_rank = int(distributed.rank)
     args.distributed_local_rank = int(distributed.local_rank)
     args.distributed_world_size = int(distributed.world_size)
-    configure_batch_scaled_semantics(args, distributed)
+    configure_batch_semantics(args, distributed)
     if distributed.is_main_process:
         args.output_dir.mkdir(parents=True, exist_ok=True)
     if distributed.enabled:
@@ -2335,8 +2326,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             ("critic_vf_lr_num_cycles", float),
             *[
                 (f"resolved_{field}", int)
-                for field in BATCH_SCALED_STEP_FIELDS
+                for field in SAMPLE_SCALED_STEP_FIELDS
             ],
+            ("resolved_dynamics_target_sync_interval", int),
             ("resolved_target_tau", float),
         ]
         if trains_joint_actor(args):
@@ -2397,47 +2389,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     resume_state.get("actor_ema_optimization_step", 0)
                 )
             configure_conditioned_actor(actor_algo, args)
-        if actor_algo.ema is not None:
-            ema_state_source = (
-                resume_state
-                if resume_state is not None
-                else (
-                    source_for_warm_start
-                    if args.initialization == "source_chunk_idql_joint"
-                    else None
-                )
-            )
-            actor_algo.ema_update_step_scale = float(args.schedule_batch_ratio)
-            if (
-                ema_state_source is not None
-                and "actor_ema_reference_step" in ema_state_source
-            ):
-                ema_reference_step = float(
-                    ema_state_source["actor_ema_reference_step"]
-                )
-            else:
-                source_args = (ema_state_source or {}).get("args", {})
-                source_world_size = int(
-                    (ema_state_source or {})
-                    .get("distributed_training", {})
-                    .get("world_size", 1)
-                )
-                source_effective_batch = int(
-                    source_args.get(
-                        "effective_global_batch_size",
-                        int(source_args.get("batch_size", 100))
-                        * source_world_size,
-                    )
-                )
-                source_reference_batch = int(
-                    source_args.get("schedule_reference_batch_size", 100)
-                )
-                ema_reference_step = (
-                    float(actor_algo.ema.optimization_step)
-                    * float(source_effective_batch)
-                    / float(source_reference_batch)
-                )
-            actor_algo.ema_reference_step = ema_reference_step
         actor_algo.set_train()
         if actor_algo.reference_nets is not None:
             actor_algo.reference_nets.train()
@@ -2912,14 +2863,20 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 args.schedule_batch_ratio
             ),
             "learning_rates_automatically_scaled": False,
-            "step_inputs_are_reference_batch_steps": True,
-            "resolved_steps": {
+            "sample_scaled_step_inputs_are_reference_batch_steps": True,
+            "resolved_sample_scaled_steps": {
                 field: int(getattr(args, f"resolved_{field}"))
-                for field in BATCH_SCALED_STEP_FIELDS
+                for field in SAMPLE_SCALED_STEP_FIELDS
             },
             "reference_target_tau": float(args.target_tau),
             "resolved_target_tau": float(args.resolved_target_tau),
-            "actor_ema_sample_scaled": True,
+            "target_tau_step_unit": "optimizer_update",
+            "dynamics_target_sync_interval": int(
+                args.resolved_dynamics_target_sync_interval
+            ),
+            "dynamics_target_sync_step_unit": "optimizer_update",
+            "actor_ema_step_unit": "optimizer_update",
+            "actor_ema_sample_scaled": False,
         },
         "architecture": architecture,
         "hyperparameters": {
@@ -3239,9 +3196,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                         actor_algo.ema.optimization_step
                         if actor_algo.ema is not None
                         else 0
-                    ),
-                    actor_ema_reference_step=float(
-                        getattr(actor_algo, "ema_reference_step", 0.0)
                     ),
                     pretrained_dp_checkpoint=pretrained_dp_checkpoint,
                     critics=critics,

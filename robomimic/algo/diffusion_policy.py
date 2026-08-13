@@ -1030,13 +1030,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
         PyTorch. All mutable learned state here is represented by parameters;
         non-learned buffers are constant after network construction.
         """
-        reference_step = float(
-            getattr(self, "ema_reference_step", self.ema.optimization_step)
-        )
-        step_scale = float(getattr(self, "ema_update_step_scale", 1.0))
-        reference_decay = self.ema.get_decay(int(reference_step))
-        # Convert the reference-step retention to the current sample count.
-        decay = float(reference_decay) ** step_scale
+        decay = float(self.ema.get_decay(self.ema.optimization_step))
         ema_parameters = self._averaged_ema_parameters
         model_parameters = self._model_ema_parameters
         if len(ema_parameters) != len(model_parameters):
@@ -1044,7 +1038,6 @@ class DiffusionPolicyUNet(PolicyAlgo):
         torch._foreach_lerp_(ema_parameters, model_parameters, 1.0 - decay)
         self.ema.decay = decay
         self.ema.optimization_step += 1
-        self.ema_reference_step = reference_step + step_scale
     
     def log_info(self, info, materialize=True):
         """
