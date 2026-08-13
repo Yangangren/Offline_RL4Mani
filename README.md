@@ -127,7 +127,8 @@ assigned physical GPU. `EVAL_NUM_GPUS` defaults to one; use a space-separated
 list such as `EVAL_GPU_IDS="2 4 6 7"` to select specific physical devices (all
 listed devices are used when `EVAL_NUM_GPUS` is omitted). The same controls
 work with `eval_composed_chunk_grid_resilient`. Completed pair and chunk files
-retain the existing resume behavior.
+retain the existing resume behavior. For debugging, `SELECTION=actor_first`
+still generates and scores all N proposals but always executes candidate zero.
 
 ## Docker
 

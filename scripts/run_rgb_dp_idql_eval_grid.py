@@ -843,6 +843,7 @@ def main() -> None:
         choices=(
             "argmax",
             "greedy",
+            "actor_first",
             "softmax",
             "advantage_softmax",
             "epsilon_greedy",

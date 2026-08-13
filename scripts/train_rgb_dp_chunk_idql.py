@@ -74,6 +74,8 @@ ACTOR_CONDITION_DEFINITIONS = {
     "human_success": "human_demo=1; success_rollout=1; failure_rollout=0",
 }
 DYNAMICS_PREDICTION_MODE = "actor_encoder_direct"
+ACTOR_OPTIMIZER_TYPE = "adamw"
+ACTOR_WEIGHT_DECAY = 1e-6
 JOINT_ACTOR_INITIALIZATIONS = frozenset(
     ("pretrained_dp_joint", "source_chunk_idql_joint")
 )
@@ -900,7 +902,7 @@ def configure_chunk_actor_optimizer(
     total_steps: int,
     num_cycles: float,
 ) -> None:
-    """Use independent Adam learning rates for the three actor components."""
+    """Use the default DP AdamW recipe with explicit actor parameter groups."""
     policy = actor_algo.nets["policy"]
     expected_modules = (
         ("condition_adapter", float(adapter_lr)),
@@ -940,7 +942,10 @@ def configure_chunk_actor_optimizer(
     all_parameters = list(policy.parameters())
     if grouped_parameter_ids != {id(parameter) for parameter in all_parameters}:
         raise RuntimeError("the grouped actor optimizer does not cover the policy")
-    actor_algo.optimizers["policy"] = torch.optim.Adam(parameter_groups)
+    actor_algo.optimizers["policy"] = torch.optim.AdamW(
+        parameter_groups,
+        weight_decay=ACTOR_WEIGHT_DECAY,
+    )
     actor_algo.lr_schedulers["policy"] = make_step_lr_scheduler(
         actor_algo.optimizers["policy"],
         scheduler_type=scheduler_type,
@@ -2757,7 +2762,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "actor": actor_audit,
         "conditional_diffusion_actor": bool(args.conditioned_actor),
         "actor_condition_adapter": (
-            "SuccessConditionResidual"
+            "SuccessConditionFiLM"
             if args.conditioned_actor
             else None
         ),
@@ -2928,6 +2933,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "actor_adapter_lr": float(args.actor_adapter_lr),
             "actor_unet_lr": float(args.actor_unet_lr),
             "actor_obs_encoder_lr": float(args.actor_obs_encoder_lr),
+            "actor_optimizer_type": ACTOR_OPTIMIZER_TYPE,
+            "actor_weight_decay": ACTOR_WEIGHT_DECAY,
             "actor_reference_weight": float(args.actor_reference_weight),
             "actor_reference_batch_fraction": float(
                 args.actor_reference_batch_fraction
@@ -3401,8 +3408,8 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--actor-adapter-lr", type=float, default=1e-4)
-    parser.add_argument("--actor-unet-lr", type=float, default=1e-5)
-    parser.add_argument("--actor-obs-encoder-lr", type=float, default=1e-6)
+    parser.add_argument("--actor-unet-lr", type=float, default=1e-4)
+    parser.add_argument("--actor-obs-encoder-lr", type=float, default=1e-4)
     parser.add_argument("--actor-reference-weight", type=float, default=0.0)
     parser.add_argument(
         "--actor-reference-batch-fraction",
@@ -3435,7 +3442,7 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--condition-dropout", type=float, default=0.0)
-    parser.add_argument("--condition-hidden-dim", type=int, default=128)
+    parser.add_argument("--condition-hidden-dim", type=int, default=256)
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--encoder-lr", type=float, default=1e-5)
     parser.add_argument("--vf-lr", type=float, default=1e-4)

@@ -460,16 +460,16 @@ run_chunk_train() {
     --target-tau "${TARGET_TAU:-0.01}" \
     --dynamics-target-sync-interval "${DYNAMICS_TARGET_SYNC_INTERVAL:-1000}" \
     --actor-adapter-lr "${CHUNK_ACTOR_ADAPTER_LR:-1e-4}" \
-    --actor-unet-lr "${CHUNK_ACTOR_UNET_LR:-1e-5}" \
-    --actor-obs-encoder-lr "${CHUNK_ACTOR_OBS_ENCODER_LR:-1e-6}" \
+    --actor-unet-lr "${CHUNK_ACTOR_UNET_LR:-1e-4}" \
+    --actor-obs-encoder-lr "${CHUNK_ACTOR_OBS_ENCODER_LR:-1e-4}" \
     --actor-reference-weight "${CHUNK_ACTOR_REFERENCE_WEIGHT:-0.0}" \
     --actor-reference-batch-fraction "${CHUNK_ACTOR_REFERENCE_BATCH_FRACTION:-0.25}" \
     --actor-lr-scheduler "${CHUNK_ACTOR_LR_SCHEDULER:-cosine}" \
-    --actor-lr-warmup-steps "${CHUNK_ACTOR_LR_WARMUP_STEPS:-1000}" \
+    --actor-lr-warmup-steps "${CHUNK_ACTOR_LR_WARMUP_STEPS:-500}" \
     --actor-lr-num-cycles "${CHUNK_ACTOR_LR_NUM_CYCLES:-0.5}" \
     "${CHUNK_CONDITION_ARGS[@]}" \
     --condition-dropout "${CHUNK_CONDITION_DROPOUT:-${CONDITION_DROPOUT:-0.0}}" \
-    --condition-hidden-dim "${CHUNK_CONDITION_HIDDEN_DIM:-${CONDITION_HIDDEN_DIM:-128}}" \
+    --condition-hidden-dim "${CHUNK_CONDITION_HIDDEN_DIM:-${CONDITION_HIDDEN_DIM:-256}}" \
     --critic-lr "${CHUNK_CRITIC_LR:-${CRITIC_LR:-1e-4}}" \
     --encoder-lr "${CHUNK_ENCODER_LR:-1e-5}" \
     --vf-lr "${CHUNK_VF_LR:-${VF_LR:-1e-4}}" \

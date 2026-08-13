@@ -14,7 +14,12 @@ from robomimic.utils.dataset import (
     SequenceDataset,
     SparseChunkSequenceDataset,
 )
-from robomimic.algo.diffusion_policy import DiffusionPolicyUNet
+from robomimic.algo.diffusion_policy import (
+    DiffusionPolicyUNet,
+    SuccessConditionFiLM,
+    SuccessConditionResidual,
+)
+from robomimic.models.diffusion_policy_nets import ConditionalUnet1D
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -150,6 +155,176 @@ class DistributedOptimizationSemanticsTest(unittest.TestCase):
             self.assertTrue(
                 all(parameter.grad is not None for parameter in module.parameters())
             )
+
+
+class ConditionalActorRecipeTest(unittest.TestCase):
+    @staticmethod
+    def _minimal_actor():
+        class Encoder(torch.nn.Module):
+            def output_shape(self):
+                return [3]
+
+        actor = object.__new__(DiffusionPolicyUNet)
+        actor.nets = torch.nn.ModuleDict(
+            {
+                "policy": torch.nn.ModuleDict(
+                    {
+                        "obs_encoder": Encoder(),
+                        "noise_pred_net": ConditionalUnet1D(
+                            input_dim=4,
+                            global_cond_dim=6,
+                            diffusion_step_embed_dim=16,
+                            down_dims=(16, 32),
+                            kernel_size=3,
+                            n_groups=8,
+                        ),
+                    }
+                )
+            }
+        )
+        actor.algo_config = argparse.Namespace(
+            horizon=argparse.Namespace(observation_horizon=2)
+        )
+        actor.device = torch.device("cpu")
+        actor.ema = None
+        actor.optimizers = {}
+        return actor
+
+    def test_condition_film_preserves_pretrained_unet_at_install(self):
+        torch.manual_seed(7)
+        unet = ConditionalUnet1D(
+            input_dim=4,
+            global_cond_dim=6,
+            diffusion_step_embed_dim=16,
+            down_dims=(16, 32),
+            kernel_size=3,
+            n_groups=8,
+        ).eval()
+        actions = torch.randn(3, 16, 4)
+        timesteps = torch.tensor([1, 2, 3])
+        obs_condition = torch.randn(3, 6)
+        with torch.no_grad():
+            pretrained_output = unet(
+                actions,
+                timesteps,
+                global_cond=obs_condition,
+            )
+
+        unet.install_condition_extension(8)
+        adapter = SuccessConditionFiLM(global_cond_dim=6, hidden_dim=8)
+        for condition, mask in ((0.0, 1.0), (1.0, 1.0), (1.0, 0.0)):
+            conditioned = adapter(
+                obs_condition,
+                torch.full((3,), condition),
+                torch.full((3,), mask),
+            )
+            with torch.no_grad():
+                conditioned_output = unet(
+                    actions,
+                    timesteps,
+                    global_cond=conditioned,
+                )
+            torch.testing.assert_close(
+                conditioned_output,
+                pretrained_output,
+                rtol=0.0,
+                atol=0.0,
+            )
+
+        masked = adapter(
+            obs_condition,
+            torch.ones(3),
+            torch.zeros(3),
+        )
+        torch.testing.assert_close(masked[:, 6:], torch.zeros(3, 8))
+
+    def test_chunk_actor_optimizer_matches_default_dp_recipe(self):
+        actor = argparse.Namespace(
+            nets=torch.nn.ModuleDict(
+                {
+                    "policy": torch.nn.ModuleDict(
+                        {
+                            "condition_adapter": torch.nn.Linear(2, 4),
+                            "noise_pred_net": torch.nn.Linear(4, 4),
+                            "obs_encoder": torch.nn.Linear(4, 4),
+                        }
+                    )
+                }
+            ),
+            optimizers={},
+            lr_schedulers={},
+            step_lr_schedulers_every_batch={},
+        )
+        CHUNK.configure_chunk_actor_optimizer(
+            actor,
+            adapter_lr=1e-4,
+            unet_lr=1e-4,
+            obs_encoder_lr=1e-4,
+            scheduler_type="cosine",
+            warmup_steps=500,
+            total_steps=1000,
+            num_cycles=0.5,
+        )
+        optimizer = actor.optimizers["policy"]
+        self.assertIsInstance(optimizer, torch.optim.AdamW)
+        self.assertEqual(
+            actor.lr_schedulers["policy"].base_lrs,
+            [1e-4, 1e-4, 1e-4],
+        )
+        self.assertTrue(
+            all(
+                group["weight_decay"] == CHUNK.ACTOR_WEIGHT_DECAY
+                for group in optimizer.param_groups
+            )
+        )
+
+    def test_condition_film_checkpoint_installs_before_state_load(self):
+        source = self._minimal_actor()
+        source.install_success_condition_adapter(hidden_dim=8)
+        state = copy.deepcopy(source.nets.state_dict())
+
+        target = self._minimal_actor()
+        target._install_success_condition_adapter_from_state(state)
+        target.nets.load_state_dict(state)
+
+        self.assertIsInstance(
+            target.nets["policy"]["condition_adapter"],
+            SuccessConditionFiLM,
+        )
+        self.assertEqual(
+            target.nets["policy"]["noise_pred_net"].condition_extension_dim,
+            8,
+        )
+
+    def test_legacy_condition_adapter_checkpoint_remains_loadable(self):
+        source = self._minimal_actor()
+        source._install_legacy_success_condition_adapter(hidden_dim=8)
+        state = copy.deepcopy(source.nets.state_dict())
+
+        target = self._minimal_actor()
+        target._install_success_condition_adapter_from_state(state)
+        target.nets.load_state_dict(state)
+
+        self.assertIsInstance(
+            target.nets["policy"]["condition_adapter"],
+            SuccessConditionResidual,
+        )
+        self.assertEqual(
+            target.nets["policy"]["noise_pred_net"].condition_extension_dim,
+            0,
+        )
+
+    def test_chunk_defaults_use_human_only_and_default_dp_learning_rates(self):
+        defaults = {
+            action.dest: action.default
+            for action in CHUNK.make_parser()._actions
+        }
+        self.assertEqual(defaults["actor_condition_mode"], "human_only")
+        self.assertEqual(defaults["actor_adapter_lr"], 1e-4)
+        self.assertEqual(defaults["actor_unet_lr"], 1e-4)
+        self.assertEqual(defaults["actor_obs_encoder_lr"], 1e-4)
+        self.assertEqual(defaults["actor_lr_warmup_steps"], 500)
+        self.assertEqual(defaults["condition_hidden_dim"], 256)
 
 
 

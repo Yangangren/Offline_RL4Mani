@@ -85,7 +85,34 @@ class ConditionalResidualBlock1D(nn.Module):
         self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) \
             if in_channels != out_channels else nn.Identity()
 
-    def forward(self, x, cond):
+        self.condition_encoder = None
+
+    def install_condition_extension(self, extension_dim):
+        """Add a separate zero-initialized condition-to-FiLM projection."""
+        extension_dim = int(extension_dim)
+        if extension_dim <= 0:
+            raise ValueError("condition extension dimension must be positive")
+        if self.condition_encoder is not None:
+            if self.condition_encoder.in_features != extension_dim:
+                raise ValueError(
+                    "residual-block condition extension dimension "
+                    f"{self.condition_encoder.in_features} does not match "
+                    f"{extension_dim}"
+                )
+            return
+
+        base_linear = self.cond_encoder[1]
+        self.condition_encoder = nn.Linear(
+            extension_dim,
+            self.out_channels * 2,
+            bias=False,
+            device=base_linear.weight.device,
+            dtype=base_linear.weight.dtype,
+        )
+        with torch.no_grad():
+            self.condition_encoder.weight.zero_()
+
+    def forward(self, x, cond, condition_feature=None):
         """
             x : [ batch_size x in_channels x horizon ]
             cond : [ batch_size x cond_dim]
@@ -95,6 +122,12 @@ class ConditionalResidualBlock1D(nn.Module):
         """
         out = self.blocks[0](x)
         embed = self.cond_encoder(cond)
+        if condition_feature is not None:
+            if self.condition_encoder is None:
+                raise RuntimeError(
+                    "condition feature was provided before installing its FiLM projection"
+                )
+            embed = embed + self.condition_encoder(condition_feature).unsqueeze(-1)
 
         embed = embed.reshape(
             embed.shape[0], 2, self.out_channels, 1)
@@ -138,7 +171,9 @@ class ConditionalUnet1D(nn.Module):
             nn.Mish(),
             nn.Linear(dsed * 4, dsed),
         )
-        cond_dim = dsed + global_cond_dim
+        self.global_cond_dim = int(global_cond_dim)
+        self.condition_extension_dim = 0
+        cond_dim = dsed + self.global_cond_dim
 
         in_out = list(zip(all_dims[:-1], all_dims[1:]))
         mid_dim = all_dims[-1]
@@ -193,6 +228,24 @@ class ConditionalUnet1D(nn.Module):
             sum(p.numel() for p in self.parameters()))
         )
 
+    def install_condition_extension(self, extension_dim):
+        """Condition every residual block through new zero-initialized FiLM columns."""
+        extension_dim = int(extension_dim)
+        if extension_dim <= 0:
+            raise ValueError("condition extension dimension must be positive")
+        if self.condition_extension_dim:
+            if self.condition_extension_dim != extension_dim:
+                raise ValueError(
+                    "U-Net condition extension dimension "
+                    f"{self.condition_extension_dim} does not match {extension_dim}"
+                )
+            return
+
+        for module in self.modules():
+            if isinstance(module, ConditionalResidualBlock1D):
+                module.install_condition_extension(extension_dim)
+        self.condition_extension_dim = extension_dim
+
     def forward(self, 
             sample: torch.Tensor, 
             timestep: Union[torch.Tensor, float, int], 
@@ -218,7 +271,20 @@ class ConditionalUnet1D(nn.Module):
 
         global_feature = self.diffusion_step_encoder(timesteps)
 
+        condition_feature = None
         if global_cond is not None:
+            expected_global_dim = self.global_cond_dim + self.condition_extension_dim
+            if global_cond.shape[-1] != expected_global_dim:
+                raise ValueError(
+                    f"global condition dimension {global_cond.shape[-1]} does not "
+                    f"match expected {expected_global_dim}"
+                )
+            if self.condition_extension_dim:
+                global_cond, condition_feature = torch.split(
+                    global_cond,
+                    (self.global_cond_dim, self.condition_extension_dim),
+                    dim=-1,
+                )
             global_feature = torch.cat([
                 global_feature, global_cond
             ], axis=-1)
@@ -226,18 +292,18 @@ class ConditionalUnet1D(nn.Module):
         x = sample
         h = []
         for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
+            x = resnet(x, global_feature, condition_feature)
+            x = resnet2(x, global_feature, condition_feature)
             h.append(x)
             x = downsample(x)
 
         for mid_module in self.mid_modules:
-            x = mid_module(x, global_feature)
+            x = mid_module(x, global_feature, condition_feature)
 
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
             x = torch.cat((x, h.pop()), dim=1)
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
+            x = resnet(x, global_feature, condition_feature)
+            x = resnet2(x, global_feature, condition_feature)
             x = upsample(x)
 
         x = self.final_conv(x)

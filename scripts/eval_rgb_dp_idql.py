@@ -51,6 +51,7 @@ DEFAULT_OUTPUT = ROOT / "rollouts/square_rgb_dp/one_step_idql_eval"
 SELECTION_CHOICES = (
     "argmax",
     "greedy",
+    "actor_first",
     "softmax",
     "advantage_softmax",
     "epsilon_greedy",
@@ -69,6 +70,8 @@ def choose_candidate_index(
     """Choose one candidate and report uniform epsilon exploration separately."""
     if len(q) == 1:
         return int(torch.argmax(q).item()), False
+    if selection == "actor_first":
+        return 0, False
     if selection in ("argmax", "greedy"):
         return int(torch.argmax(q).item()), False
     if selection == "epsilon_greedy":

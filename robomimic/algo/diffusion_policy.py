@@ -47,6 +47,38 @@ class SuccessConditionResidual(nn.Module):
         return obs_cond + self.net(cond)
 
 
+class SuccessConditionFiLM(nn.Module):
+    """Embed a binary actor condition for FiLM injection at every U-Net block."""
+
+    def __init__(self, global_cond_dim: int, hidden_dim: int = 256, input_dim: int = 2):
+        super().__init__()
+        self.global_cond_dim = int(global_cond_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.input_dim = int(input_dim)
+        self.net = nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.register_buffer(
+            "film_adapter_version",
+            torch.tensor(1, dtype=torch.int64),
+        )
+
+    def forward(self, obs_cond, success_condition, condition_mask):
+        success_condition = success_condition.to(
+            device=obs_cond.device,
+            dtype=obs_cond.dtype,
+        ).view(-1, 1)
+        condition_mask = condition_mask.to(
+            device=obs_cond.device,
+            dtype=obs_cond.dtype,
+        ).view(-1, 1)
+        cond = torch.cat((success_condition, condition_mask), dim=-1)
+        condition_feature = self.net(cond) * condition_mask
+        return torch.cat((obs_cond, condition_feature), dim=-1)
+
+
 @register_algo_factory_func("diffusion_policy")
 def algo_config_to_class(algo_config):
     """
@@ -304,18 +336,27 @@ class DiffusionPolicyUNet(PolicyAlgo):
         lr = optimizer.param_groups[0].get("lr", 1e-4) if optimizer.param_groups else 1e-4
         optimizer.add_param_group({"params": missing, "lr": lr})
 
-    def install_success_condition_adapter(self, hidden_dim: int = 128) -> None:
-        """Install a success/failure condition adapter without changing the DP function."""
+    def install_success_condition_adapter(self, hidden_dim: int = 256) -> None:
+        """Install per-block condition FiLM without changing the DP function."""
         policy = self.nets["policy"]
         global_cond_dim = self._global_condition_dim()
         if "condition_adapter" in policy:
             adapter = policy["condition_adapter"]
+            if not isinstance(adapter, SuccessConditionFiLM):
+                raise RuntimeError(
+                    "the actor already contains a legacy residual condition adapter"
+                )
             if int(adapter.global_cond_dim) != global_cond_dim:
                 raise ValueError(
                     f"condition adapter global_cond_dim={adapter.global_cond_dim}, expected {global_cond_dim}"
                 )
+            if int(adapter.hidden_dim) != int(hidden_dim):
+                raise ValueError(
+                    f"condition adapter hidden_dim={adapter.hidden_dim}, expected {hidden_dim}"
+                )
         else:
-            policy["condition_adapter"] = SuccessConditionResidual(
+            policy["noise_pred_net"].install_condition_extension(int(hidden_dim))
+            policy["condition_adapter"] = SuccessConditionFiLM(
                 global_cond_dim=global_cond_dim,
                 hidden_dim=int(hidden_dim),
             ).to(self.device)
@@ -323,7 +364,33 @@ class DiffusionPolicyUNet(PolicyAlgo):
         if self.ema is not None:
             ema_policy = self.ema.averaged_model["policy"]
             if "condition_adapter" not in ema_policy:
+                ema_policy["noise_pred_net"].install_condition_extension(
+                    int(hidden_dim)
+                )
                 ema_policy["condition_adapter"] = deepcopy(policy["condition_adapter"]).to(self.device)
+        self._refresh_ema_parameter_views()
+        self._ensure_policy_optimizer_has_trainable_params()
+
+    def _install_legacy_success_condition_adapter(self, hidden_dim: int) -> None:
+        """Install the former observation-residual adapter for old checkpoints."""
+        policy = self.nets["policy"]
+        global_cond_dim = self._global_condition_dim()
+        if "condition_adapter" not in policy:
+            policy["condition_adapter"] = SuccessConditionResidual(
+                global_cond_dim=global_cond_dim,
+                hidden_dim=int(hidden_dim),
+            ).to(self.device)
+        elif not isinstance(policy["condition_adapter"], SuccessConditionResidual):
+            raise RuntimeError(
+                "cannot load a legacy residual adapter into a FiLM-conditioned actor"
+            )
+
+        if self.ema is not None:
+            ema_policy = self.ema.averaged_model["policy"]
+            if "condition_adapter" not in ema_policy:
+                ema_policy["condition_adapter"] = deepcopy(
+                    policy["condition_adapter"]
+                ).to(self.device)
         self._refresh_ema_parameter_views()
         self._ensure_policy_optimizer_has_trainable_params()
 
@@ -348,14 +415,25 @@ class DiffusionPolicyUNet(PolicyAlgo):
         first_weight_key = prefix + "0.weight"
         if final_weight_key not in state_dict:
             return
-        global_cond_dim = int(state_dict[final_weight_key].shape[0])
+        film_version_key = "policy.condition_adapter.film_adapter_version"
         hidden_dim = int(state_dict[first_weight_key].shape[0])
+        if film_version_key in state_dict:
+            embedding_dim = int(state_dict[final_weight_key].shape[0])
+            if embedding_dim != hidden_dim:
+                raise ValueError(
+                    "checkpoint condition FiLM embedding dimension "
+                    f"{embedding_dim} does not match hidden dimension {hidden_dim}"
+                )
+            self.install_success_condition_adapter(hidden_dim=hidden_dim)
+            return
+
+        global_cond_dim = int(state_dict[final_weight_key].shape[0])
         if global_cond_dim != self._global_condition_dim():
             raise ValueError(
                 f"checkpoint condition adapter global_cond_dim={global_cond_dim}, "
                 f"expected {self._global_condition_dim()}"
             )
-        self.install_success_condition_adapter(hidden_dim=hidden_dim)
+        self._install_legacy_success_condition_adapter(hidden_dim=hidden_dim)
 
     def _success_condition_inputs(
         self,
