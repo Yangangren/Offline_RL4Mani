@@ -770,6 +770,27 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
             raise AttributeError(name)
         return getattr(self.dataset, name)
 
+    def _get_next_obs_sequence(
+        self,
+        *,
+        demo_id,
+        index_in_demo,
+        demo_length,
+        valid_length,
+    ):
+        next_index_in_demo = min(
+            demo_length - 1,
+            index_in_demo + valid_length - 1,
+        )
+        return self.dataset.get_obs_sequence_from_demo(
+            demo_id,
+            index_in_demo=next_index_in_demo,
+            keys=self.dataset.obs_keys,
+            num_frames_to_stack=0,
+            seq_length=1,
+            prefix="next_obs",
+        )
+
     def __getitem__(self, index):
         base = self.dataset
         demo_id = base._index_to_demo_id[index]
@@ -811,17 +832,11 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
             )
         )
         valid_length = int(action_mask.sum())
-        next_index_in_demo = min(
-            demo_length - 1,
-            index_in_demo + valid_length - 1,
-        )
-        meta["next_obs"] = base.get_obs_sequence_from_demo(
-            demo_id,
-            index_in_demo=next_index_in_demo,
-            keys=base.obs_keys,
-            num_frames_to_stack=0,
-            seq_length=1,
-            prefix="next_obs",
+        meta["next_obs"] = self._get_next_obs_sequence(
+            demo_id=demo_id,
+            index_in_demo=index_in_demo,
+            demo_length=demo_length,
+            valid_length=valid_length,
         )
         meta["chunk_sparse_next_obs"] = np.float32(1.0)
 
@@ -858,6 +873,63 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                 base._lang_emb,
                 (self.observation_horizon, 1),
             )
+        return meta
+
+
+class SparseOneStepSequenceDataset(SparseChunkSequenceDataset):
+    """Load only the image frames consumed by one-step IDQL.
+
+    The diffusion actor still receives the full action sequence and its complete
+    observation history. The critic receives a single immediate ``next_obs``
+    frame, stored at time index zero and identified by a dedicated marker.
+    """
+
+    def __init__(self, dataset, observation_horizon):
+        super().__init__(
+            dataset,
+            chunk_horizon=1,
+            observation_horizon=observation_horizon,
+        )
+
+    def __getitem__(self, index):
+        meta = super().__getitem__(index)
+        meta["one_step_sparse_next_obs"] = meta.pop("chunk_sparse_next_obs")
+        return meta
+
+
+class SparseDQLSequenceDataset(SparseChunkSequenceDataset):
+    """Load only the current and next observation stacks consumed by DQL."""
+
+    def __init__(self, dataset, observation_horizon):
+        super().__init__(
+            dataset,
+            chunk_horizon=1,
+            observation_horizon=observation_horizon,
+        )
+
+    def _get_next_obs_sequence(
+        self,
+        *,
+        demo_id,
+        index_in_demo,
+        demo_length,
+        valid_length,
+    ):
+        del demo_length, valid_length
+        return self.dataset.get_obs_sequence_from_demo(
+            demo_id,
+            index_in_demo=index_in_demo,
+            keys=self.dataset.obs_keys,
+            num_frames_to_stack=self.observation_horizon - 1,
+            seq_length=1,
+            prefix="next_obs",
+        )
+
+    def __getitem__(self, index):
+        meta = super().__getitem__(index)
+        meta["dql_sparse_observation_stacks"] = meta.pop(
+            "chunk_sparse_next_obs"
+        )
         return meta
 
 

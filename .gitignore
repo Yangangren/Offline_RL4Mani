@@ -125,6 +125,6 @@ rollouts/
 trained_models/
 datasets/
 robomimic/exps/
-
+figures/
 *.txt
 *.yml

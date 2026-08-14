@@ -30,6 +30,11 @@ from robomimic.algo.diffusion_policy import replace_bn_with_gn
 from robomimic.models.chunk_iql_nets import SequentialActionChunkEncoder, make_mlp
 from robomimic.models.obs_core import CropRandomizer
 
+from rgb_dp_distributed import (
+    all_reduce_gradients as bounded_all_reduce_gradients,
+    mean_distributed_scalars as reduce_distributed_scalars,
+)
+
 from train_rgb_dp_idql import (
     REWARD_DEFINITIONS,
     RiseLateFusionMLP,
@@ -323,124 +328,26 @@ def all_reduce_gradients(
     bucket_cap_mb: float = 25.0,
     preserve_unused_parameters: bool = True,
 ) -> None:
-    """Average dense gradients with fixed-order asynchronous NCCL buckets."""
-    if not context.enabled:
-        return
-    cap_bytes = max(1, int(float(bucket_cap_mb) * 1024 * 1024))
-    trainable_parameters = [
-        parameter for parameter in parameters if parameter.requires_grad
-    ]
-    if not trainable_parameters:
-        return
-
-    globally_used = None
-    usage_work = None
-    if preserve_unused_parameters:
-        globally_used = torch.tensor(
-            [parameter.grad is not None for parameter in trainable_parameters],
-            dtype=torch.int32,
-            device=context.device,
-        )
-        usage_work = dist.all_reduce(
-            globally_used,
-            op=dist.ReduceOp.MAX,
-            async_op=True,
-        )
-
-    bucket: list[torch.Tensor] = []
-    bucket_bytes = 0
-    bucket_key = None
-    pending = []
-
-    def launch() -> None:
-        nonlocal bucket, bucket_bytes, bucket_key
-        if not bucket:
-            return
-        gradients = tuple(bucket)
-        flat = torch.cat([gradient.reshape(-1) for gradient in gradients])
-        work = dist.all_reduce(flat, op=dist.ReduceOp.SUM, async_op=True)
-        pending.append((work, flat, gradients))
-        bucket = []
-        bucket_bytes = 0
-        bucket_key = None
-
-    # Every rank reduces every trainable parameter in the same order. Locally
-    # unused parameters contribute zeros so collective ordering cannot diverge.
-    for parameter in trainable_parameters:
-        if parameter.grad is None:
-            parameter.grad = torch.zeros_like(
-                parameter,
-                memory_format=torch.preserve_format,
-            )
-        gradient = parameter.grad
-        if gradient.is_sparse:
-            raise RuntimeError("chunk-IDQL distributed gradients must be dense")
-        key = (gradient.device, gradient.dtype)
-        gradient_bytes = int(gradient.numel() * gradient.element_size())
-        if bucket and (
-            key != bucket_key or bucket_bytes + gradient_bytes > cap_bytes
-        ):
-            launch()
-        bucket_key = key
-        bucket.append(gradient)
-        bucket_bytes += gradient_bytes
-    launch()
-
-    scale = 1.0 / float(context.world_size)
-    for work, flat, gradients in pending:
-        work.wait()
-        flat.mul_(scale)
-        offset = 0
-        for gradient in gradients:
-            count = int(gradient.numel())
-            gradient.copy_(flat[offset : offset + count].view_as(gradient))
-            offset += count
-    if usage_work is not None:
-        usage_work.wait()
-        globally_used_host = globally_used.cpu().tolist()
-        for parameter, parameter_is_used in zip(
-            trainable_parameters,
-            globally_used_host,
-        ):
-            if not parameter_is_used:
-                parameter.grad = None
+    """Average gradients with a bounded window of flat async buckets."""
+    bounded_all_reduce_gradients(
+        parameters,
+        context,
+        bucket_cap_mb=bucket_cap_mb,
+        preserve_unused_parameters=preserve_unused_parameters,
+    )
 
 
 def mean_distributed_scalars(
     metrics: dict[str, Any],
     context: DistributedContext,
+    reductions: dict[str, str] | None = None,
 ) -> dict[str, float]:
-    """Materialize and optionally average scalar tensors with one synchronization."""
-    if not metrics:
-        return {}
-    keys = sorted(metrics)
-    scalar_tensors = []
-    for key in keys:
-        value = metrics[key]
-        if isinstance(value, torch.Tensor):
-            if value.numel() != 1:
-                raise ValueError(f"metric {key!r} is not scalar: {tuple(value.shape)}")
-            scalar_tensors.append(
-                value.detach().reshape(()).to(
-                    device=context.device,
-                    dtype=torch.float32,
-                    non_blocking=True,
-                )
-            )
-        else:
-            scalar_tensors.append(
-                torch.as_tensor(
-                    value,
-                    device=context.device,
-                    dtype=torch.float32,
-                )
-            )
-    values = torch.stack(scalar_tensors)
-    if context.enabled:
-        dist.all_reduce(values, op=dist.ReduceOp.SUM)
-        values.mul_(1.0 / float(context.world_size))
-    host_values = values.cpu().tolist()
-    return {key: float(value) for key, value in zip(keys, host_values)}
+    """Reduce metrics by mean unless a per-key operation is supplied."""
+    return reduce_distributed_scalars(
+        metrics,
+        context,
+        reductions=reductions,
+    )
 
 
 def gather_rank_runtime_states(
@@ -1244,11 +1151,15 @@ def masked_dynamics_losses(
     predicted: torch.Tensor,
     target: torch.Tensor,
     exact_next: torch.Tensor,
+    *,
+    distributed_context: DistributedContext | None = None,
+    global_valid_row_count: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rows = exact_next.reshape(-1) > 0.5
-    if not torch.any(rows):
-        zero = predicted.new_tensor(0.0)
-        return zero, zero, zero
+    if predicted.ndim < 2 or target.ndim < 2:
+        raise ValueError(
+            "dynamics features must include batch and feature dimensions"
+        )
     predicted = predicted[rows]
     target = target[rows]
     if predicted.shape != target.shape:
@@ -1258,9 +1169,51 @@ def masked_dynamics_losses(
         )
     predicted = F.normalize(predicted, dim=-1)
     target = F.normalize(target, dim=-1)
-    smooth_l1 = F.smooth_l1_loss(predicted, target)
-    cosine = (1.0 - F.cosine_similarity(predicted, target, dim=-1)).mean()
-    rmse = torch.sqrt(F.mse_loss(predicted, target).clamp_min(1e-12))
+
+    local_valid_row_count = rows.sum().detach()
+    if global_valid_row_count is None:
+        global_valid_row_count = local_valid_row_count.clone()
+        if distributed_context is not None and distributed_context.enabled:
+            dist.all_reduce(global_valid_row_count, op=dist.ReduceOp.SUM)
+    if global_valid_row_count.numel() != 1:
+        raise ValueError("global dynamics valid-row count must be scalar")
+    world_size = (
+        int(distributed_context.world_size)
+        if distributed_context is not None and distributed_context.enabled
+        else 1
+    )
+    denominator = global_valid_row_count.to(dtype=predicted.dtype).clamp_min(1.0)
+    # Gradient synchronization averages rank gradients. Scaling each local
+    # row-loss sum by world_size / global_count therefore reproduces the
+    # gradient of one mean over all valid rows, including when a rank has no
+    # valid rows. Empty reductions remain connected to ``predicted`` so every
+    # rank participates in the same backward and collective sequence.
+    gradient_scale = predicted.new_tensor(float(world_size)) / denominator
+    smooth_l1_per_row = (
+        F.smooth_l1_loss(
+            predicted,
+            target,
+            reduction="none",
+        )
+        .flatten(start_dim=1)
+        .mean(dim=1)
+    )
+    smooth_l1 = smooth_l1_per_row.sum() * gradient_scale
+    cosine_per_row = 1.0 - F.cosine_similarity(predicted, target, dim=-1)
+    cosine = cosine_per_row.sum() * gradient_scale
+
+    squared_error_per_row = (
+        (predicted - target).square().flatten(start_dim=1).mean(dim=1)
+    )
+    global_squared_error_sum = squared_error_per_row.sum().detach().clone()
+    if distributed_context is not None and distributed_context.enabled:
+        dist.all_reduce(global_squared_error_sum, op=dist.ReduceOp.SUM)
+    global_mse = global_squared_error_sum / denominator
+    rmse = torch.where(
+        global_valid_row_count > 0,
+        torch.sqrt(global_mse.clamp_min(1e-12)),
+        torch.zeros_like(global_mse),
+    )
     return smooth_l1, cosine, rmse
 
 
@@ -1310,6 +1263,7 @@ def compute_chunk_losses(
     use_huber: bool,
     dynamics_weight: float,
     dynamics_cosine_weight: float,
+    distributed_context: DistributedContext | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
     device = batch["actions"].device
     crop_seeds = torch.randint(
@@ -1372,6 +1326,11 @@ def compute_chunk_losses(
                 )
 
     regression = F.smooth_l1_loss if use_huber else F.mse_loss
+    global_valid_row_count = (
+        batch["exact_next"].reshape(-1) > 0.5
+    ).sum().detach()
+    if distributed_context is not None and distributed_context.enabled:
+        dist.all_reduce(global_valid_row_count, op=dist.ReduceOp.SUM)
     critic_losses = []
     dynamics_l1 = []
     dynamics_cosine = []
@@ -1384,6 +1343,8 @@ def compute_chunk_losses(
             output["predicted_next_encoder"],
             target_features,
             batch["exact_next"],
+            distributed_context=distributed_context,
+            global_valid_row_count=global_valid_row_count,
         )
         dynamics_loss = (
             float(dynamics_weight) * dyn_l1
@@ -1981,14 +1942,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if not resume_state.get("rise_style_rgb_chunk_idql", False):
             raise ValueError("resume checkpoint is not a chunk IDQL checkpoint")
         saved_distributed = resume_state.get("distributed_training", {})
-        if (
-            distributed.enabled
-            and bool(saved_distributed.get("enabled", False))
-            and int(saved_distributed.get("world_size", 1))
+        if bool(saved_distributed.get("enabled", False)) and (
+            not distributed.enabled
+            or int(saved_distributed.get("world_size", 1))
             != distributed.world_size
         ):
             raise ValueError(
-                "distributed resume requires the same world size: checkpoint="
+                "distributed checkpoints require distributed resume with the "
+                "same world size: checkpoint="
                 f"{saved_distributed.get('world_size')} requested="
                 f"{distributed.world_size}"
             )
@@ -2321,6 +2282,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     if resume_state is not None:
         saved_args = resume_state.get("args", {})
         schedule_fields = [
+            ("batch_size", int),
+            ("effective_global_batch_size", int),
+            ("schedule_reference_batch_size", int),
+            ("steps_per_epoch", int),
             ("critic_vf_lr_scheduler", str),
             ("critic_vf_lr_total_steps", int),
             ("critic_vf_lr_num_cycles", float),
@@ -2598,6 +2563,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 )
         history = list(resume_state.get("history", []))
         rank_runtime_states = resume_state.get("distributed_rank_states")
+        if (
+            distributed.enabled
+            and bool(saved_distributed.get("enabled", False))
+            and rank_runtime_states is None
+        ):
+            raise ValueError(
+                "distributed checkpoint is missing per-rank runtime states"
+            )
         if distributed.enabled and rank_runtime_states is not None:
             if len(rank_runtime_states) != distributed.world_size:
                 raise ValueError(
@@ -2938,7 +2911,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "world_size": int(distributed.world_size),
             "backend": distributed.backend,
             "launcher": "torchrun" if distributed.enabled else "python",
-            "gradient_sync": "async_bucketed_mean_all_reduce",
+            "gradient_sync": "bounded_async_bucketed_mean_all_reduce",
             "critic_vf_gradient_sync_phases_per_step": 1,
             "actor_gradient_sync_phases_per_step": int(
                 trains_joint_actor(args)
@@ -3020,6 +2993,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 use_huber=args.use_huber,
                 dynamics_weight=effective_dynamics,
                 dynamics_cosine_weight=effective_dynamics_cosine,
+                distributed_context=distributed,
             )
             update_networks(
                 critics,
@@ -3134,7 +3108,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             metrics["data/effective_global_batch_rows"] = float(
                 raw_batch["actions"].shape[0] * distributed.world_size
             )
-            metrics = mean_distributed_scalars(metrics, distributed)
+            metrics = mean_distributed_scalars(
+                metrics,
+                distributed,
+                reductions={
+                    "data/action_min": "min",
+                    "data/action_max": "max",
+                },
+            )
             records.append(metrics)
             should_log = (
                 global_step % int(args.log_every) == 0
@@ -3318,8 +3299,8 @@ def make_parser() -> argparse.ArgumentParser:
         type=int,
         default=100,
         help=(
-            "Reference global batch used to express step-based warmups, "
-            "freezes, target synchronization, target tau, and actor EMA."
+            "Reference global batch used to express sample-timed warmups, "
+            "dynamics ramps, and encoder freezes."
         ),
     )
     parser.add_argument(

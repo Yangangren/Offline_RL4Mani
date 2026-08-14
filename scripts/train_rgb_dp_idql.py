@@ -22,6 +22,7 @@ from typing import Any
 import h5py
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 import robomimic.models.obs_nets as ObsNets
@@ -30,8 +31,25 @@ import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.train_utils as TrainUtils
-from robomimic.utils.dataset import SparseChunkSequenceDataset
+from robomimic.utils.dataset import (
+    SparseChunkSequenceDataset,
+    SparseDQLSequenceDataset,
+    SparseOneStepSequenceDataset,
+)
 from robomimic.algo.diffusion_policy import replace_bn_with_gn
+
+from rgb_dp_distributed import (
+    DistributedContext,
+    all_reduce_gradients,
+    broadcast_module_buffers,
+    broadcast_module_state,
+    gather_rank_runtime_states,
+    initialize_distributed,
+    mean_distributed_scalars,
+    modules_have_mutable_batch_norm,
+    restore_process_rng_state,
+    seed_process,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +69,44 @@ REWARD_DEFINITIONS = {
     "task": "source_task_reward",
     "rise": "expert_transition=1; non_expert_transition=0",
 }
+
+
+def batch_scaled_step_count(
+    reference_steps: int,
+    reference_batch_size: int,
+    effective_batch_size: int,
+) -> int:
+    """Translate reference-batch steps to the same processed-sample count."""
+    reference_steps = int(reference_steps)
+    if reference_steps <= 0:
+        return 0
+    return max(
+        1,
+        int(
+            round(
+                reference_steps
+                * float(reference_batch_size)
+                / float(effective_batch_size)
+            )
+        ),
+    )
+
+
+def configure_batch_semantics(args: argparse.Namespace, world_size: int) -> None:
+    """Resolve sample-timed LR warmup while preserving update-timed targets."""
+    reference_batch_size = int(args.schedule_reference_batch_size)
+    effective_batch_size = int(args.batch_size) * int(world_size)
+    if reference_batch_size <= 0 or effective_batch_size <= 0:
+        raise ValueError("reference and effective batch sizes must be positive")
+    args.effective_global_batch_size = effective_batch_size
+    args.schedule_batch_ratio = (
+        float(effective_batch_size) / float(reference_batch_size)
+    )
+    args.resolved_lr_warmup_steps = batch_scaled_step_count(
+        args.lr_warmup_steps,
+        reference_batch_size,
+        effective_batch_size,
+    )
 
 
 def jsonable(value: Any) -> Any:
@@ -425,18 +481,41 @@ def build_single_loader(
     ):
         raise RuntimeError("failed to install pretrained DP action normalization")
 
-    if bool(getattr(args, "sparse_chunk_loader", False)):
+    sparse_chunk_loader = bool(getattr(args, "sparse_chunk_loader", False))
+    sparse_one_step_loader = bool(
+        getattr(args, "sparse_one_step_loader", False)
+    )
+    sparse_dql_loader = bool(getattr(args, "sparse_dql_loader", False))
+    sparse_loader_count = sum(
+        (sparse_chunk_loader, sparse_one_step_loader, sparse_dql_loader)
+    )
+    if sparse_loader_count > 1:
+        raise ValueError(
+            "sparse chunk, one-step, and DQL loading are mutually exclusive"
+        )
+    if sparse_loader_count:
         if dataset.hdf5_cache_mode == "all":
             raise ValueError(
-                "--sparse-chunk-loader is incompatible with "
+                "sparse image loading is incompatible with "
                 "--hdf5-cache-mode all; use low_dim (recommended) or disable "
                 "the sparse loader"
             )
-        dataset = SparseChunkSequenceDataset(
-            dataset,
-            chunk_horizon=int(args.chunk_horizon),
-            observation_horizon=observation_horizon,
-        )
+        if sparse_chunk_loader:
+            dataset = SparseChunkSequenceDataset(
+                dataset,
+                chunk_horizon=int(args.chunk_horizon),
+                observation_horizon=observation_horizon,
+            )
+        elif sparse_one_step_loader:
+            dataset = SparseOneStepSequenceDataset(
+                dataset,
+                observation_horizon=observation_horizon,
+            )
+        else:
+            dataset = SparseDQLSequenceDataset(
+                dataset,
+                observation_horizon=observation_horizon,
+            )
 
     generator = torch.Generator()
     distributed_world_size = int(
@@ -551,13 +630,28 @@ def process_critic_batch(
 ) -> dict:
     """Extract RISE's one-step tuple from the shared sequence batch."""
     current_index = int(actor_algo.algo_config.horizon.observation_horizon) - 1
+    sparse_next_obs = "one_step_sparse_next_obs" in raw_batch
+    if sparse_next_obs:
+        invalid_sparse_shapes = {
+            key: tuple(raw_batch["next_obs"][key].shape)
+            for key in actor_algo.obs_shapes
+            if raw_batch["next_obs"][key].ndim < 2
+            or int(raw_batch["next_obs"][key].shape[1]) != 1
+        }
+        if invalid_sparse_shapes:
+            raise ValueError(
+                "sparse one-step next observations must have one time step: "
+                f"{invalid_sparse_shapes}"
+            )
     critic_batch = {
         "obs": {
             key: raw_batch["obs"][key][:, current_index]
             for key in actor_algo.obs_shapes
         },
         "next_obs": {
-            key: raw_batch["next_obs"][key][:, current_index]
+            key: raw_batch["next_obs"][key][
+                :, 0 if sparse_next_obs else current_index
+            ]
             for key in actor_algo.obs_shapes
         },
         "actions": raw_batch["actions"][:, current_index],
@@ -698,34 +792,41 @@ def update_critics(
     *,
     target_tau: float,
     max_gradient_norm: float | None,
+    gradient_sync_fn=None,
 ) -> None:
-    """Port of RISE IDQL._update_critic, including update order."""
-    for critic_loss, critic, critic_target, optimizer in zip(
-        critic_losses,
-        critics,
-        critic_targets,
-        critic_optimizers,
-    ):
-        TorchUtils.backprop_for_loss(
-            net=critic,
-            optim=optimizer,
-            loss=critic_loss,
-            max_grad_norm=max_gradient_norm,
-            retain_graph=False,
+    """Backpropagate Q1/Q2/V, synchronize once, then update all networks."""
+    optimizers = [*critic_optimizers, vf_optimizer]
+    parameter_groups = [
+        [
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        ]
+        for optimizer in optimizers
+    ]
+    for optimizer in optimizers:
+        optimizer.zero_grad(set_to_none=True)
+    for loss in critic_losses:
+        loss.backward()
+    vf_loss.backward()
+
+    if gradient_sync_fn is not None:
+        gradient_sync_fn(
+            parameter
+            for parameters in parameter_groups
+            for parameter in parameters
         )
-        with torch.no_grad():
-            TorchUtils.soft_update(
-                source=critic,
-                target=critic_target,
-                tau=float(target_tau),
-            )
-    TorchUtils.backprop_for_loss(
-        net=vf,
-        optim=vf_optimizer,
-        loss=vf_loss,
-        max_grad_norm=max_gradient_norm,
-        retain_graph=False,
-    )
+    if max_gradient_norm is not None:
+        for parameters in parameter_groups:
+            torch.nn.utils.clip_grad_norm_(parameters, max_gradient_norm)
+    for optimizer in optimizers:
+        optimizer.step()
+    for critic, critic_target in zip(critics, critic_targets):
+        TorchUtils.soft_update(
+            source=critic,
+            target=critic_target,
+            tau=float(target_tau),
+        )
 
 
 def actor_train_step(
@@ -928,9 +1029,20 @@ def checkpoint_payload(
     action_normalization_stats: dict,
     epoch: int,
     global_step: int,
+    global_samples_seen: int,
     history: list[dict],
     loader_generator: torch.Generator,
+    rank_runtime_states: list[dict[str, Any]] | None = None,
+    distributed_context: DistributedContext | None = None,
 ) -> dict[str, Any]:
+    rank_zero_runtime = (
+        rank_runtime_states[0] if rank_runtime_states is not None else None
+    )
+    distributed_world_size = int(
+        distributed_context.world_size
+        if distributed_context is not None
+        else 1
+    )
     return {
         "rise_style_rgb_idql": True,
         "hybrid_dp_chunk_actor_iql": True,
@@ -951,12 +1063,17 @@ def checkpoint_payload(
         "args": vars(args),
         "epoch": int(epoch),
         "step": int(global_step),
+        "global_samples_seen": int(global_samples_seen),
         "history": history,
         "pretrained_dp_checkpoint": str(args.checkpoint),
         "task": str(args.task),
         "dataset": str(args.dataset),
-        "single_dataloader": True,
-        "sampling": "uniform_shuffled_SequenceDataset_indices",
+        "single_dataloader": distributed_world_size == 1,
+        "sampling": (
+            "distributed_shuffled_SequenceDataset_indices"
+            if distributed_world_size > 1
+            else "uniform_shuffled_SequenceDataset_indices"
+        ),
         "reward_mode": str(args.reward_mode),
         "reward_definition": REWARD_DEFINITIONS[args.reward_mode],
         "actor_training_objective": "diffusion_bc_full_chunk",
@@ -997,8 +1114,30 @@ def checkpoint_payload(
         "actor_ema_optimization_step": int(
             actor_algo.ema.optimization_step if actor_algo.ema is not None else 0
         ),
-        "rng_state": rng_state(),
-        "loader_generator_state": loader_generator.get_state(),
+        "rng_state": (
+            rank_zero_runtime["rng_state"]
+            if rank_zero_runtime is not None
+            else rng_state()
+        ),
+        "loader_generator_state": (
+            rank_zero_runtime["loader_generator_state"]
+            if rank_zero_runtime is not None
+            else loader_generator.get_state()
+        ),
+        "distributed_training": {
+            "enabled": bool(
+                distributed_context is not None
+                and distributed_context.enabled
+            ),
+            "world_size": distributed_world_size,
+            "backend": (
+                distributed_context.backend
+                if distributed_context is not None
+                else "none"
+            ),
+            "gradient_sync": "mean_all_reduce_before_optimizer_step",
+        },
+        "distributed_rank_states": rank_runtime_states,
     }
 
 
@@ -1027,6 +1166,8 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "reward_mode",
         "seed",
         "batch_size",
+        "effective_global_batch_size",
+        "schedule_reference_batch_size",
         "steps_per_epoch",
         "critic_hidden_dims",
         "num_critics",
@@ -1040,6 +1181,7 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "vf_lr",
         "lr_scheduler",
         "lr_warmup_steps",
+        "resolved_lr_warmup_steps",
         "lr_num_cycles",
         "lr_total_steps",
         "use_huber",
@@ -1055,6 +1197,12 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
 
 
 def train(args: argparse.Namespace) -> dict:
+    distributed = initialize_distributed(args)
+    args.distributed = bool(distributed.enabled)
+    args.distributed_rank = int(distributed.rank)
+    args.distributed_local_rank = int(distributed.local_rank)
+    args.distributed_world_size = int(distributed.world_size)
+    configure_batch_semantics(args, distributed.world_size)
     if not args.dataset.is_file():
         raise FileNotFoundError(
             f"{args.dataset} does not exist; run scripts/build_rgb_dp_idql_dataset.py first"
@@ -1065,14 +1213,15 @@ def train(args: argparse.Namespace) -> dict:
         raise ValueError("expectile must be in [0.5, 1.0)")
     if int(args.num_critics) < 2:
         raise ValueError("RISE-style clipped double Q requires at least two critics")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed.is_main_process:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed.enabled:
+        dist.barrier()
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
+    device = distributed.device
+    # Construct identical initial models on every rank. Rank-specific streams
+    # are installed after initialization and any resume state is loaded.
+    seed_process(args.seed, device)
 
     actor_policy, dp_checkpoint = FileUtils.policy_from_checkpoint(
         ckpt_path=str(args.checkpoint),
@@ -1106,17 +1255,19 @@ def train(args: argparse.Namespace) -> dict:
     args.lr_total_steps = int(args.epochs) * int(args.steps_per_epoch)
     if (
         args.lr_scheduler == "cosine"
-        and int(args.lr_warmup_steps) >= int(args.lr_total_steps)
+        and int(args.resolved_lr_warmup_steps) >= int(args.lr_total_steps)
     ):
         raise ValueError(
-            f"lr_warmup_steps={args.lr_warmup_steps} must be smaller than "
-            f"the {args.lr_total_steps} total training steps"
+            "resolved_lr_warmup_steps="
+            f"{args.resolved_lr_warmup_steps} (reference "
+            f"{args.lr_warmup_steps}) must be smaller than the "
+            f"{args.lr_total_steps} total training steps"
         )
     configure_actor_optimizer(
         actor_algo,
         args.actor_lr,
         scheduler_type=args.lr_scheduler,
-        warmup_steps=args.lr_warmup_steps,
+        warmup_steps=args.resolved_lr_warmup_steps,
         total_steps=args.lr_total_steps,
         num_cycles=args.lr_num_cycles,
     )
@@ -1149,7 +1300,7 @@ def train(args: argparse.Namespace) -> dict:
         make_step_lr_scheduler(
             optimizer,
             scheduler_type=args.lr_scheduler,
-            warmup_steps=args.lr_warmup_steps,
+            warmup_steps=args.resolved_lr_warmup_steps,
             total_steps=args.lr_total_steps,
             num_cycles=args.lr_num_cycles,
         )
@@ -1158,13 +1309,14 @@ def train(args: argparse.Namespace) -> dict:
     vf_lr_scheduler = make_step_lr_scheduler(
         vf_optimizer,
         scheduler_type=args.lr_scheduler,
-        warmup_steps=args.lr_warmup_steps,
+        warmup_steps=args.resolved_lr_warmup_steps,
         total_steps=args.lr_total_steps,
         num_cycles=args.lr_num_cycles,
     )
 
     start_epoch = 0
     global_step = 0
+    global_samples_seen = 0
     history: list[dict] = []
     if args.resume_checkpoint is not None:
         checkpoint = torch.load(
@@ -1174,6 +1326,18 @@ def train(args: argparse.Namespace) -> dict:
         )
         if not checkpoint.get("rise_style_rgb_idql", False):
             raise ValueError("resume checkpoint is not from train_rgb_dp_idql.py")
+        saved_distributed = checkpoint.get("distributed_training", {})
+        if bool(saved_distributed.get("enabled", False)) and (
+            not distributed.enabled
+            or int(saved_distributed.get("world_size", 1))
+            != distributed.world_size
+        ):
+            raise ValueError(
+                "distributed checkpoints require distributed resume with the "
+                "same world size: checkpoint="
+                f"{saved_distributed.get('world_size')} requested="
+                f"{distributed.world_size}"
+            )
         validate_resume_args(args, checkpoint)
         checkpoint_action_stats = checkpoint.get("action_normalization_stats")
         if checkpoint_action_stats is None or not action_normalization_stats_match(
@@ -1244,6 +1408,12 @@ def train(args: argparse.Namespace) -> dict:
             )
         start_epoch = int(checkpoint["epoch"])
         global_step = int(checkpoint["step"])
+        global_samples_seen = int(
+            checkpoint.get(
+                "global_samples_seen",
+                global_step * int(args.effective_global_batch_size),
+            )
+        )
         if scheduler_enabled:
             scheduler_steps = [
                 int(actor_algo.lr_schedulers["policy"].last_epoch),
@@ -1260,19 +1430,83 @@ def train(args: argparse.Namespace) -> dict:
                     f"checkpoint global_step={global_step}"
                 )
         history = list(checkpoint.get("history", []))
-        loader_generator.set_state(checkpoint["loader_generator_state"].cpu())
-        restore_rng_state(checkpoint.get("rng_state"))
+        rank_runtime_states = checkpoint.get("distributed_rank_states")
+        if distributed.enabled and bool(saved_distributed.get("enabled", False)):
+            if not isinstance(rank_runtime_states, (list, tuple)):
+                raise ValueError(
+                    "distributed checkpoint is missing per-rank runtime states"
+                )
+            if len(rank_runtime_states) != distributed.world_size:
+                raise ValueError(
+                    "distributed checkpoint rank-state count does not match "
+                    f"world_size={distributed.world_size}"
+                )
+            rank_runtime = rank_runtime_states[distributed.rank]
+            if int(rank_runtime.get("rank", -1)) != distributed.rank:
+                raise ValueError("distributed checkpoint rank states are unordered")
+            loader_generator.set_state(
+                rank_runtime["loader_generator_state"].cpu()
+            )
+            restore_process_rng_state(rank_runtime.get("rng_state"), device)
+        elif distributed.enabled:
+            # A serial checkpoint can initialize a distributed continuation,
+            # but every new rank needs an independent deterministic stream.
+            loader_generator.manual_seed(int(args.seed) + distributed.rank)
+            seed_process(int(args.seed) + distributed.rank, device)
+        else:
+            loader_generator.set_state(
+                checkpoint["loader_generator_state"].cpu()
+            )
+            saved_rng_state = checkpoint.get("rng_state")
+            if saved_rng_state and "cuda_local" in saved_rng_state:
+                restore_process_rng_state(saved_rng_state, device)
+            else:
+                restore_rng_state(saved_rng_state)
         del checkpoint
-        print(
-            f"Resumed {args.resume_checkpoint} at epoch={start_epoch} step={global_step}",
-            flush=True,
-        )
+        if distributed.is_main_process:
+            print(
+                f"Resumed {args.resume_checkpoint} at epoch={start_epoch} "
+                f"step={global_step}",
+                flush=True,
+            )
 
     actor_algo.set_train()
     critics.train()
     critic_targets.train()
     critic_targets.requires_grad_(False)
     vf.train()
+    synchronized_modules: list[nn.Module] = [
+        actor_algo.nets,
+        critics,
+        critic_targets,
+        vf,
+    ]
+    if actor_algo.ema is not None:
+        synchronized_modules.append(actor_algo.ema.averaged_model)
+    broadcast_module_state(synchronized_modules, distributed)
+    gradient_sync_fn = (
+        (
+            lambda parameters: all_reduce_gradients(
+                parameters,
+                distributed,
+                bucket_cap_mb=args.gradient_bucket_cap_mb,
+            )
+        )
+        if distributed.enabled
+        else None
+    )
+    actor_algo.gradient_sync_fn = gradient_sync_fn
+    training_buffer_modules = [
+        actor_algo.nets,
+        critics,
+        critic_targets,
+        vf,
+    ]
+    synchronize_training_buffers = modules_have_mutable_batch_norm(
+        training_buffer_modules
+    )
+    if distributed.enabled and args.resume_checkpoint is None:
+        seed_process(int(args.seed) + distributed.rank, device)
     trainability = actor_trainability(actor_algo)
     architecture = {
         "actor": trainability,
@@ -1302,10 +1536,20 @@ def train(args: argparse.Namespace) -> dict:
         },
         "loader": {
             "class": dataset.__class__.__name__,
-            "num_loaders": 1,
-            "sampler": "RandomSampler_without_replacement",
+            "sparse_one_step_loader": bool(args.sparse_one_step_loader),
+            "observation_loading": (
+                "actor_observation_history_plus_one_immediate_next_observation"
+                if args.sparse_one_step_loader
+                else "full_obs_and_next_obs_sequences"
+            ),
+            "num_loaders": int(distributed.world_size),
+            "sampler": loader.sampler.__class__.__name__,
             "balanced_sampling": False,
             "batch_size": int(args.batch_size),
+            "batch_size_per_rank": int(args.batch_size),
+            "effective_global_batch_size": int(
+                args.effective_global_batch_size
+            ),
             "num_batches": int(len(loader)),
             "steps_per_epoch": int(args.steps_per_epoch),
             "steps_per_epoch_source": str(args.steps_per_epoch_source),
@@ -1317,10 +1561,25 @@ def train(args: argparse.Namespace) -> dict:
                 "deterministic random permutation"
             ),
             "automatic_steps_formula": (
-                "floor(sequence_dataset_size / batch_size) because drop_last=True"
-                if len(dataset) >= int(args.batch_size)
-                else "1 because drop_last=False for a dataset smaller than one batch"
+                "DataLoader_length_after_distributed_sharding_and_drop_last"
             ),
+        },
+        "batch_semantics": {
+            "batch_size_control": "per_gpu_BATCH_SIZE",
+            "batch_size_per_rank": int(args.batch_size),
+            "world_size": int(distributed.world_size),
+            "effective_global_batch_size": int(
+                args.effective_global_batch_size
+            ),
+            "schedule_reference_batch_size": int(
+                args.schedule_reference_batch_size
+            ),
+            "effective_to_reference_ratio": float(args.schedule_batch_ratio),
+            "learning_rates_automatically_scaled": False,
+            "reference_lr_warmup_steps": int(args.lr_warmup_steps),
+            "resolved_lr_warmup_steps": int(args.resolved_lr_warmup_steps),
+            "target_tau_step_unit": "optimizer_update",
+            "actor_ema_step_unit": "optimizer_update",
         },
         "normalization": {
             "action": "pretrained_dp_checkpoint_action_normalization_stats",
@@ -1344,6 +1603,7 @@ def train(args: argparse.Namespace) -> dict:
             "vf_lr": float(args.vf_lr),
             "lr_scheduler": str(args.lr_scheduler),
             "lr_warmup_steps": int(args.lr_warmup_steps),
+            "resolved_lr_warmup_steps": int(args.resolved_lr_warmup_steps),
             "lr_num_cycles": float(args.lr_num_cycles),
             "lr_total_steps": int(args.lr_total_steps),
             "lr_scheduler_step_unit": "optimizer_update",
@@ -1364,11 +1624,25 @@ def train(args: argparse.Namespace) -> dict:
             "loss_weight": 0.0,
             "target_encoder": False,
         },
+        "distributed": {
+            "enabled": bool(distributed.enabled),
+            "world_size": int(distributed.world_size),
+            "backend": distributed.backend,
+            "launcher": "torchrun" if distributed.enabled else "python",
+            "gradient_sync": "bounded_async_bucketed_mean_all_reduce",
+            "gradient_bucket_cap_mb": float(args.gradient_bucket_cap_mb),
+            "per_step_buffer_broadcast": bool(
+                synchronize_training_buffers
+            ),
+            "rank_zero_writes_only": True,
+        },
     }
-    write_json(args.output_dir / "training_config.json", startup)
-    print(json.dumps(jsonable(startup), indent=2), flush=True)
-
-    writer = make_tensorboard_writer(args.output_dir)
+    if distributed.is_main_process:
+        write_json(args.output_dir / "training_config.json", startup)
+        print(json.dumps(jsonable(startup), indent=2), flush=True)
+        writer = make_tensorboard_writer(args.output_dir)
+    else:
+        writer = None
     max_gradient_norm = (
         None
         if args.max_gradient_norm is None or float(args.max_gradient_norm) <= 0.0
@@ -1376,6 +1650,8 @@ def train(args: argparse.Namespace) -> dict:
     )
 
     for epoch in range(start_epoch + 1, int(args.epochs) + 1):
+        if distributed.enabled and hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)
         epoch_iterator = iter(loader)
         epoch_records: list[dict[str, float]] = []
         for step_in_epoch in range(1, int(args.steps_per_epoch) + 1):
@@ -1385,6 +1661,11 @@ def train(args: argparse.Namespace) -> dict:
                 epoch_iterator = iter(loader)
                 raw_batch = next(epoch_iterator)
             raw_batch = align_shared_batch_actions(raw_batch)
+            if synchronize_training_buffers:
+                broadcast_module_buffers(
+                    training_buffer_modules,
+                    distributed,
+                )
             learning_rates_used = {
                 "actor": float(
                     actor_algo.optimizers["policy"].param_groups[0]["lr"]
@@ -1417,6 +1698,7 @@ def train(args: argparse.Namespace) -> dict:
                 vf_loss,
                 target_tau=args.target_tau,
                 max_gradient_norm=max_gradient_norm,
+                gradient_sync_fn=gradient_sync_fn,
             )
             del critic_batch, critic_losses, vf_loss
 
@@ -1425,6 +1707,7 @@ def train(args: argparse.Namespace) -> dict:
                 raw_batch,
                 epoch,
                 obs_normalization_stats,
+                defer_scalar_conversion=True,
             )
             for scheduler in critic_lr_schedulers:
                 if scheduler is not None:
@@ -1440,18 +1723,36 @@ def train(args: argparse.Namespace) -> dict:
                     "actor/source_mask_applied": 0.0,
                 }
             )
+            global_samples_seen += int(
+                raw_batch["actions"].shape[0] * distributed.world_size
+            )
             global_step += 1
-            metrics = scalar_metrics(critic_info)
+            metrics = dict(critic_info)
             metrics.update(actor_info)
             metrics["lr/actor"] = learning_rates_used["actor"]
             metrics["lr/critic"] = learning_rates_used["critic"]
             metrics["lr/vf"] = learning_rates_used["vf"]
+            metrics["distributed/world_size"] = float(distributed.world_size)
+            metrics["data/effective_global_batch_rows"] = float(
+                raw_batch["actions"].shape[0] * distributed.world_size
+            )
+            metrics = mean_distributed_scalars(
+                metrics,
+                distributed,
+                reductions={
+                    "data/action_min": "min",
+                    "data/action_max": "max",
+                },
+            )
             epoch_records.append(metrics)
 
             if writer is not None:
                 for key, value in metrics.items():
                     writer.add_scalar(key, value, global_step)
-            if global_step % int(args.log_every) == 0:
+            if (
+                distributed.is_main_process
+                and global_step % int(args.log_every) == 0
+            ):
                 print(
                     json.dumps(
                         {
@@ -1467,6 +1768,7 @@ def train(args: argparse.Namespace) -> dict:
         epoch_summary = {
             "epoch": int(epoch),
             "global_step": int(global_step),
+            "global_samples_seen": int(global_samples_seen),
             "metrics": mean_metrics(epoch_records),
         }
         history.append(epoch_summary)
@@ -1474,6 +1776,7 @@ def train(args: argparse.Namespace) -> dict:
             **startup,
             "last_completed_epoch": int(epoch),
             "global_step": int(global_step),
+            "global_samples_seen": int(global_samples_seen),
             "last_epoch_metrics": epoch_summary["metrics"],
             "history": history,
             "checkpoints": {
@@ -1481,56 +1784,82 @@ def train(args: argparse.Namespace) -> dict:
                 "last": str(args.output_dir / "last.pt"),
             },
         }
-        write_json(args.output_dir / "partial_summary.json", partial_summary)
+        if distributed.is_main_process:
+            write_json(args.output_dir / "partial_summary.json", partial_summary)
 
         should_save = (
             epoch % int(args.save_every_epochs) == 0
             or epoch == int(args.epochs)
         )
         if should_save:
-            payload = checkpoint_payload(
-                args=args,
-                actor_algo=actor_algo,
-                critics=critics,
-                critic_targets=critic_targets,
-                vf=vf,
-                critic_optimizers=critic_optimizers,
-                vf_optimizer=vf_optimizer,
-                critic_lr_schedulers=critic_lr_schedulers,
-                vf_lr_scheduler=vf_lr_scheduler,
-                action_normalization_stats=action_stats,
-                epoch=epoch,
-                global_step=global_step,
-                history=history,
-                loader_generator=loader_generator,
+            rank_runtime_states = (
+                gather_rank_runtime_states(loader_generator, distributed)
+                if distributed.enabled
+                else None
             )
-            latest_path = args.output_dir / "latest.pt"
-            atomic_torch_save(payload, latest_path)
-            if (
-                int(args.snapshot_every_epochs) > 0
-                and epoch % int(args.snapshot_every_epochs) == 0
-            ):
-                snapshot = args.output_dir / "models" / f"model_epoch_{epoch}.pt"
-                replace_with_hardlink(latest_path, snapshot)
-            if writer is not None:
-                writer.flush()
-            print(f"Saved {latest_path} at epoch={epoch} step={global_step}", flush=True)
+            if distributed.is_main_process:
+                payload = checkpoint_payload(
+                    args=args,
+                    actor_algo=actor_algo,
+                    critics=critics,
+                    critic_targets=critic_targets,
+                    vf=vf,
+                    critic_optimizers=critic_optimizers,
+                    vf_optimizer=vf_optimizer,
+                    critic_lr_schedulers=critic_lr_schedulers,
+                    vf_lr_scheduler=vf_lr_scheduler,
+                    action_normalization_stats=action_stats,
+                    epoch=epoch,
+                    global_step=global_step,
+                    global_samples_seen=global_samples_seen,
+                    history=history,
+                    loader_generator=loader_generator,
+                    rank_runtime_states=rank_runtime_states,
+                    distributed_context=distributed,
+                )
+                latest_path = args.output_dir / "latest.pt"
+                atomic_torch_save(payload, latest_path)
+                if (
+                    int(args.snapshot_every_epochs) > 0
+                    and epoch % int(args.snapshot_every_epochs) == 0
+                ):
+                    snapshot = (
+                        args.output_dir / "models" / f"model_epoch_{epoch}.pt"
+                    )
+                    replace_with_hardlink(latest_path, snapshot)
+                if writer is not None:
+                    writer.flush()
+                print(
+                    f"Saved {latest_path} at epoch={epoch} step={global_step}",
+                    flush=True,
+                )
+        if distributed.enabled:
+            dist.barrier()
 
-    last_path = args.output_dir / "last.pt"
-    if int(args.epochs) > start_epoch:
-        latest_path = args.output_dir / "latest.pt"
-        replace_with_hardlink(latest_path, last_path)
-    elif not last_path.exists():
-        if args.resume_checkpoint is None:
-            raise RuntimeError("training was already complete but last.pt is missing")
-        replace_with_hardlink(args.resume_checkpoint, last_path)
-    final_summary = json.loads((args.output_dir / "partial_summary.json").read_text())
-    final_summary["complete"] = True
-    final_summary["checkpoints"]["last"] = str(last_path)
-    write_json(args.output_dir / "summary.json", final_summary)
+    if distributed.is_main_process:
+        last_path = args.output_dir / "last.pt"
+        if int(args.epochs) > start_epoch:
+            latest_path = args.output_dir / "latest.pt"
+            replace_with_hardlink(latest_path, last_path)
+        elif not last_path.exists():
+            if args.resume_checkpoint is None:
+                raise RuntimeError(
+                    "training was already complete but last.pt is missing"
+                )
+            replace_with_hardlink(args.resume_checkpoint, last_path)
+        final_summary = json.loads(
+            (args.output_dir / "partial_summary.json").read_text()
+        )
+        final_summary["complete"] = True
+        final_summary["checkpoints"]["last"] = str(last_path)
+        write_json(args.output_dir / "summary.json", final_summary)
+        print(f"Training complete: {last_path}", flush=True)
+    else:
+        final_summary = {}
     if writer is not None:
         writer.close()
-    print(f"Training complete: {last_path}", flush=True)
+    if distributed.enabled:
+        dist.barrier()
     return final_summary
 
 
@@ -1546,6 +1875,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument(
+        "--distributed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable torchrun data-parallel training. This is also enabled "
+            "automatically when WORLD_SIZE is greater than one."
+        ),
+    )
+    parser.add_argument(
+        "--distributed-backend",
+        choices=("auto", "nccl", "gloo"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--gradient-bucket-cap-mb",
+        type=float,
+        default=100.0,
+        help="Maximum size of each flat gradient all-reduce bucket in MiB.",
+    )
+    parser.add_argument(
+        "--local-rank",
+        "--local_rank",
+        type=int,
+        default=None,
+        help="Local process rank supplied by torchrun; the environment wins.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument(
@@ -1555,6 +1911,24 @@ def parse_args() -> argparse.Namespace:
         help="Defaults to len(train_loader), i.e. one full uniformly shuffled dataset pass.",
     )
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--schedule-reference-batch-size",
+        type=int,
+        default=64,
+        help=(
+            "Reference global batch used to express the LR warmup in "
+            "processed-sample units."
+        ),
+    )
+    parser.add_argument(
+        "--sparse-one-step-loader",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Load only the actor observation history and the critic's immediate "
+            "next observation while preserving the full action sequence."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
@@ -1615,6 +1989,14 @@ def parse_args() -> argparse.Namespace:
         args.critic_late_fusion_key = None
     if args.lr_warmup_steps < 0:
         parser.error("lr-warmup-steps must be non-negative")
+    if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
+        parser.error("steps-per-epoch must be positive when specified")
+    if args.batch_size <= 0:
+        parser.error("batch-size must be positive")
+    if args.schedule_reference_batch_size <= 0:
+        parser.error("schedule-reference-batch-size must be positive")
+    if args.gradient_bucket_cap_mb <= 0.0:
+        parser.error("gradient-bucket-cap-mb must be positive")
     if args.lr_num_cycles <= 0.0:
         parser.error("lr-num-cycles must be positive")
     if args.save_every_epochs <= 0:
@@ -1622,5 +2004,14 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def main() -> None:
+    args = parse_args()
+    try:
+        train(args)
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
 if __name__ == "__main__":
-    train(parse_args())
+    main()

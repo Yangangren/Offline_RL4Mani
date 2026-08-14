@@ -69,12 +69,137 @@ def _distributed_gradient_worker(rank, init_path):
         torch.distributed.destroy_process_group()
 
 
+def _distributed_masked_dynamics_worker(rank, init_path):
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        context = CHUNK.DistributedContext(
+            enabled=True,
+            rank=rank,
+            local_rank=rank,
+            world_size=2,
+            backend="gloo",
+            device=torch.device("cpu"),
+        )
+        all_bases = torch.tensor(
+            [
+                [
+                    [0.2, -0.5, 0.7],
+                    [0.8, 0.1, -0.4],
+                    [-0.3, 0.6, 0.9],
+                ],
+                [
+                    [0.5, 0.4, -0.8],
+                    [-0.6, 0.9, 0.3],
+                    [0.7, -0.2, 0.1],
+                ],
+            ],
+            dtype=torch.float64,
+        )
+        all_targets = torch.tensor(
+            [
+                [
+                    [0.6, -0.1, 0.5],
+                    [-0.2, 0.8, 0.4],
+                    [0.9, 0.3, -0.7],
+                ],
+                [
+                    [-0.4, 0.7, 0.2],
+                    [0.3, -0.9, 0.6],
+                    [0.1, 0.5, 0.8],
+                ],
+            ],
+            dtype=torch.float64,
+        )
+        mask_cases = (
+            # Unequal valid counts: one row on rank zero, three on rank one.
+            torch.tensor([[1, 0, 0], [1, 1, 1]], dtype=torch.float64),
+            # One rank has no valid rows and must still backpropagate a zero.
+            torch.tensor([[0, 0, 0], [1, 0, 1]], dtype=torch.float64),
+            # The globally empty case must also remain graph-connected.
+            torch.zeros((2, 3), dtype=torch.float64),
+        )
+        for all_masks in mask_cases:
+            parameter = torch.nn.Parameter(
+                torch.tensor([0.15, -0.25, 0.05], dtype=torch.float64)
+            )
+            l1, cosine, rmse = CHUNK.masked_dynamics_losses(
+                all_bases[rank] + parameter,
+                all_targets[rank],
+                all_masks[rank],
+                distributed_context=context,
+            )
+            loss = l1 + 0.7 * cosine
+            loss.backward()
+            if parameter.grad is None:
+                raise AssertionError("empty masked loss disconnected its gradient")
+            CHUNK.all_reduce_gradients([parameter], context)
+
+            reference_parameter = torch.nn.Parameter(
+                torch.tensor([0.15, -0.25, 0.05], dtype=torch.float64)
+            )
+            reference_l1, reference_cosine, reference_rmse = (
+                CHUNK.masked_dynamics_losses(
+                    all_bases.reshape(-1, 3) + reference_parameter,
+                    all_targets.reshape(-1, 3),
+                    all_masks.reshape(-1),
+                )
+            )
+            reference_loss = reference_l1 + 0.7 * reference_cosine
+            reference_loss.backward()
+            torch.testing.assert_close(
+                parameter.grad,
+                reference_parameter.grad,
+                rtol=1e-10,
+                atol=1e-12,
+            )
+            torch.testing.assert_close(
+                rmse,
+                reference_rmse,
+                rtol=1e-10,
+                atol=1e-12,
+            )
+
+            averaged_metrics = CHUNK.mean_distributed_scalars(
+                {"l1": l1, "cosine": cosine, "rmse": rmse},
+                context,
+            )
+            expected_metrics = {
+                "l1": reference_l1,
+                "cosine": reference_cosine,
+                "rmse": reference_rmse,
+            }
+            for key, expected in expected_metrics.items():
+                torch.testing.assert_close(
+                    torch.tensor(averaged_metrics[key], dtype=torch.float64),
+                    expected.detach(),
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 class DistributedOptimizationSemanticsTest(unittest.TestCase):
     def test_async_all_reduce_preserves_unused_gradient_semantics(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             init_path = str(Path(temp_dir) / "distributed_init")
             torch.multiprocessing.spawn(
                 _distributed_gradient_worker,
+                args=(init_path,),
+                nprocs=2,
+                join=True,
+            )
+
+    def test_masked_dynamics_matches_one_global_valid_row_mean(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_path = str(Path(temp_dir) / "masked_dynamics_init")
+            torch.multiprocessing.spawn(
+                _distributed_masked_dynamics_worker,
                 args=(init_path,),
                 nprocs=2,
                 join=True,

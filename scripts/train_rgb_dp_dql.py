@@ -16,13 +16,13 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import random
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -36,6 +36,7 @@ from train_rgb_dp_idql import (
     actor_trainability,
     align_shared_batch_actions,
     atomic_torch_save,
+    batch_scaled_step_count,
     build_single_loader,
     configure_actor_optimizer,
     dataset_audit,
@@ -52,6 +53,19 @@ from train_rgb_dp_idql import (
     scalar_metrics,
     write_json,
 )
+from rgb_dp_distributed import (
+    DistributedContext,
+    all_reduce_gradients,
+    broadcast_module_buffers,
+    broadcast_module_state,
+    capture_process_rng_state,
+    gather_rank_runtime_states,
+    initialize_distributed,
+    mean_distributed_scalars,
+    modules_have_mutable_batch_norm,
+    restore_process_rng_state,
+    seed_process,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +81,33 @@ DEFAULT_OUTPUT = (
     ROOT
     / "trained_models/square_rgb_dp/dql/200demo_100success_50failure_task_reward"
 )
+
+
+def configure_dql_batch_semantics(
+    args: argparse.Namespace,
+    world_size: int,
+) -> None:
+    """Resolve sample-timed schedules while preserving update-timed targets."""
+    reference_batch_size = int(args.schedule_reference_batch_size)
+    effective_batch_size = int(args.batch_size) * int(world_size)
+    if reference_batch_size <= 0 or effective_batch_size <= 0:
+        raise ValueError("reference and effective batch sizes must be positive")
+    args.effective_global_batch_size = effective_batch_size
+    args.schedule_batch_ratio = (
+        float(effective_batch_size) / float(reference_batch_size)
+    )
+    args.resolved_lr_warmup_steps = batch_scaled_step_count(
+        args.lr_warmup_steps,
+        reference_batch_size,
+        effective_batch_size,
+    )
+    args.resolved_dql_critic_warmup_steps = batch_scaled_step_count(
+        args.dql_critic_warmup_steps,
+        reference_batch_size,
+        effective_batch_size,
+    )
+
+
 class DQLStackedActionValueNetwork(nn.Module):
     """One-step Q network over the same observation stack as the DP actor.
 
@@ -551,11 +592,19 @@ def compute_critic_loss(
 def choose_q_values(
     predictions: list[torch.Tensor],
     q_head: str,
+    distributed_context: DistributedContext | None = None,
 ) -> tuple[torch.Tensor, int]:
     if q_head == "min":
         return torch.cat(predictions, dim=1).min(dim=1, keepdim=True).values, -1
     if q_head == "random":
-        index = int(torch.randint(len(predictions), (), device=predictions[0].device))
+        index_tensor = torch.randint(
+            len(predictions),
+            (),
+            device=predictions[0].device,
+        )
+        if distributed_context is not None and distributed_context.enabled:
+            dist.broadcast(index_tensor, src=0)
+        index = int(index_tensor)
     else:
         index = int(q_head.removeprefix("q")) - 1
         if not 0 <= index < len(predictions):
@@ -578,6 +627,7 @@ def diffusion_q_loss(
     q_head: str,
     denominator_floor: float,
     clip_actions: bool,
+    distributed_context: DistributedContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Official Diffusion-QL cross-head normalized policy-improvement loss."""
     chunks = sample_action_chunks(
@@ -599,7 +649,11 @@ def diffusion_q_loss(
             )
             for critic in critics
         ]
-        policy_q, head_index = choose_q_values(policy_predictions, q_head)
+        policy_q, head_index = choose_q_values(
+            policy_predictions,
+            q_head,
+            distributed_context=distributed_context,
+        )
         with torch.no_grad():
             if head_index < 0:
                 normalization_q = policy_q
@@ -608,9 +662,11 @@ def diffusion_q_loss(
                 # normalize it by another head evaluated on generated actions.
                 other_index = (head_index + 1) % len(policy_predictions)
                 normalization_q = policy_predictions[other_index]
-            denominator = normalization_q.abs().mean().clamp_min(
-                float(denominator_floor)
-            )
+            denominator = normalization_q.abs().mean()
+            if distributed_context is not None and distributed_context.enabled:
+                dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
+                denominator.mul_(1.0 / float(distributed_context.world_size))
+            denominator.clamp_min_(float(denominator_floor))
             dataset_predictions = [
                 critic(
                     obs_dict=critic_observations,
@@ -645,7 +701,10 @@ def actor_train_step(
     critic_batch: dict,
     args: argparse.Namespace,
     global_step: int,
-) -> dict[str, float]:
+    distributed_context: DistributedContext | None = None,
+    gradient_sync_fn=None,
+    defer_scalar_conversion: bool = False,
+) -> dict[str, Any]:
     bc_loss, bc_info = diffusion_bc_loss(actor_algo, actor_batch)
     available = int(next(iter(actor_batch["obs"].values())).shape[0])
     q_batch_size = min(int(args.dql_q_batch_size), available)
@@ -654,7 +713,7 @@ def actor_train_step(
     q_guidance_active = (
         float(args.dql_eta) > 0.0
         and q_batch_size > 0
-        and int(global_step) >= int(args.dql_critic_warmup_steps)
+        and int(global_step) >= int(args.resolved_dql_critic_warmup_steps)
     )
     if q_guidance_active:
         goal_observations = critic_batch["goal_obs"]
@@ -680,6 +739,7 @@ def actor_train_step(
             q_head=str(args.dql_q_head),
             denominator_floor=float(args.dql_q_denominator_floor),
             clip_actions=bool(args.dql_clip_actions),
+            distributed_context=distributed_context,
         )
 
     active_eta = float(args.dql_eta) if q_guidance_active else 0.0
@@ -687,37 +747,47 @@ def actor_train_step(
     optimizer = actor_algo.optimizers["policy"]
     optimizer.zero_grad(set_to_none=True)
     actor_loss.backward()
+    if gradient_sync_fn is not None:
+        gradient_sync_fn(
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        )
     gradient_norm = torch.nn.utils.clip_grad_norm_(
-        actor_algo.nets.parameters(),
+        (
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        ),
         float(args.actor_max_gradient_norm),
     )
     optimizer.step()
     ema_update_due = (
         actor_algo.ema is not None
-        and int(global_step) + 1 >= int(args.dql_critic_warmup_steps)
+        and int(global_step) + 1
+        >= int(args.resolved_dql_critic_warmup_steps)
         and (int(global_step) + 1) % int(args.dql_actor_ema_update_every) == 0
     )
     if ema_update_due:
         actor_algo._update_ema()
     actor_algo.on_gradient_step()
 
-    return scalar_metrics(
-        {
-            "actor/loss": actor_loss.detach(),
-            "actor/gradient_norm": gradient_norm,
-            "actor/q_batch_size": float(q_batch_size),
-            "actor/dql_eta": active_eta,
-            "actor/q_guidance_active": float(q_guidance_active),
-            "actor/ema_updated": float(ema_update_due),
-            "actor/effective_q_scale": (
-                float(args.dql_eta) / q_info["actor/q_denominator"]
-                if "actor/q_denominator" in q_info
-                else 0.0
-            ),
-            **bc_info,
-            **q_info,
-        }
-    )
+    metrics = {
+        "actor/loss": actor_loss.detach(),
+        "actor/gradient_norm": gradient_norm,
+        "actor/q_batch_size": float(q_batch_size),
+        "actor/dql_eta": active_eta,
+        "actor/q_guidance_active": float(q_guidance_active),
+        "actor/ema_updated": float(ema_update_due),
+        "actor/effective_q_scale": (
+            float(args.dql_eta) / q_info["actor/q_denominator"]
+            if "actor/q_denominator" in q_info
+            else 0.0
+        ),
+        **bc_info,
+        **q_info,
+    }
+    return metrics if defer_scalar_conversion else scalar_metrics(metrics)
 
 
 def soft_update_targets(
@@ -741,6 +811,7 @@ def make_train_validation_loaders(
     dataset,
     args: argparse.Namespace,
     loader_generator: torch.Generator,
+    distributed_context: DistributedContext | None = None,
 ):
     """Create a fixed episode-level validation view of the shared dataset."""
     validation_fraction = float(args.validation_fraction)
@@ -795,19 +866,41 @@ def make_train_validation_loaders(
         "pin_memory": bool(args.pin_memory and args.device == "cuda"),
         **loader_kwargs,
     }
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    distributed_enabled = bool(
+        distributed_context is not None and distributed_context.enabled
+    )
+    train_sampler = None
+    if distributed_enabled:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset,
+            num_replicas=int(distributed_context.world_size),
+            rank=int(distributed_context.rank),
+            shuffle=True,
+            seed=int(args.seed),
+            drop_last=False,
+        )
     train_loader = torch.utils.data.DataLoader(
-        torch.utils.data.Subset(dataset, train_indices),
-        shuffle=True,
-        drop_last=len(train_indices) >= int(args.batch_size),
+        train_dataset,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        drop_last=(
+            len(train_sampler)
+            if train_sampler is not None
+            else len(train_indices)
+        )
+        >= int(args.batch_size),
         generator=loader_generator,
         **common,
     )
-    validation_loader = torch.utils.data.DataLoader(
-        torch.utils.data.Subset(dataset, validation_indices),
-        shuffle=False,
-        drop_last=False,
-        **common,
-    )
+    validation_loader = None
+    if not distributed_enabled or distributed_context.is_main_process:
+        validation_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(dataset, validation_indices),
+            shuffle=False,
+            drop_last=False,
+            **common,
+        )
     return train_loader, validation_loader, {
         "validation_fraction": validation_fraction,
         "split_unit": "episode",
@@ -821,6 +914,12 @@ def make_train_validation_loaders(
             else len(demos)
         ),
         "validation_episodes": int(validation_count),
+        "distributed_training_shards": (
+            int(distributed_context.world_size)
+            if distributed_enabled
+            else 1
+        ),
+        "validation_rank_zero_only": bool(distributed_enabled),
     }
 
 
@@ -833,6 +932,7 @@ def evaluate_critic_loader(
     critic_targets: nn.ModuleList,
     obs_normalization_stats,
     args: argparse.Namespace,
+    process_device: torch.device | None = None,
 ) -> dict[str, float] | None:
     if loader is None:
         return None
@@ -840,7 +940,11 @@ def evaluate_critic_loader(
     critics.eval()
     critic_targets.eval().requires_grad_(False)
     records = []
-    saved_rng = rng_state()
+    saved_rng = (
+        capture_process_rng_state(process_device)
+        if process_device is not None
+        else rng_state()
+    )
     try:
         for batch_index, raw_batch in enumerate(loader):
             if (
@@ -873,7 +977,10 @@ def evaluate_critic_loader(
             )
             records.append(scalar_metrics({**info, "critic/loss": loss}))
     finally:
-        restore_rng_state(saved_rng)
+        if process_device is not None:
+            restore_process_rng_state(saved_rng, process_device)
+        else:
+            restore_rng_state(saved_rng)
         critics.train(critic_was_training)
         critic_targets.eval().requires_grad_(False)
     return mean_metrics(records) if records else None
@@ -919,10 +1026,21 @@ def checkpoint_payload(
     action_normalization_stats: dict,
     epoch: int,
     global_step: int,
+    global_samples_seen: int,
     history: list[dict],
     loader_generator: torch.Generator,
     best_validation_critic_loss: float,
+    rank_runtime_states: list[dict[str, Any]] | None = None,
+    distributed_context: DistributedContext | None = None,
 ) -> dict[str, Any]:
+    rank_zero_runtime = (
+        rank_runtime_states[0] if rank_runtime_states is not None else None
+    )
+    distributed_world_size = int(
+        distributed_context.world_size
+        if distributed_context is not None
+        else 1
+    )
     return {
         "stacked_pretrained_dql_critic": True,
         # Reuse the raw-RGB actor / critic evaluator shared with IDQL.
@@ -942,13 +1060,18 @@ def checkpoint_payload(
         "args": vars(args),
         "epoch": int(epoch),
         "step": int(global_step),
+        "global_samples_seen": int(global_samples_seen),
         "history": history,
         "best_validation_critic_loss": float(best_validation_critic_loss),
         "pretrained_dp_checkpoint": str(args.checkpoint),
         "task": str(args.task),
         "dataset": str(args.dataset),
-        "single_dataloader": True,
-        "sampling": "uniform_shuffled_SequenceDataset_indices",
+        "single_dataloader": distributed_world_size == 1,
+        "sampling": (
+            "distributed_shuffled_SequenceDataset_indices"
+            if distributed_world_size > 1
+            else "uniform_shuffled_SequenceDataset_indices"
+        ),
         "reward_mode": str(getattr(args, "dataset_reward_mode", "rise")),
         "reward_definition": REWARD_DEFINITIONS[
             str(getattr(args, "dataset_reward_mode", "rise"))
@@ -985,8 +1108,32 @@ def checkpoint_payload(
         "actor_ema_optimization_step": int(
             actor_algo.ema.optimization_step if actor_algo.ema is not None else 0
         ),
-        "rng_state": rng_state(),
-        "loader_generator_state": loader_generator.get_state(),
+        "rng_state": (
+            rank_zero_runtime["rng_state"]
+            if rank_zero_runtime is not None
+            else rng_state()
+        ),
+        "loader_generator_state": (
+            rank_zero_runtime["loader_generator_state"]
+            if rank_zero_runtime is not None
+            else loader_generator.get_state()
+        ),
+        "distributed_training": {
+            "enabled": bool(
+                distributed_context is not None
+                and distributed_context.enabled
+            ),
+            "world_size": distributed_world_size,
+            "backend": (
+                distributed_context.backend
+                if distributed_context is not None
+                else "none"
+            ),
+            "gradient_sync": "mean_all_reduce_before_optimizer_step",
+            "random_q_head_sync": "rank_zero_broadcast",
+            "q_denominator_sync": "global_mean",
+        },
+        "distributed_rank_states": rank_runtime_states,
     }
 
 
@@ -999,6 +1146,8 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "reward_mode",
         "seed",
         "batch_size",
+        "effective_global_batch_size",
+        "schedule_reference_batch_size",
         "steps_per_epoch",
         "critic_hidden_dims",
         "num_critics",
@@ -1010,6 +1159,8 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "critic_lr",
         "lr_scheduler",
         "lr_warmup_steps",
+        "resolved_lr_warmup_steps",
+        "lr_total_steps",
         "lr_num_cycles",
         "dql_eta",
         "dql_bc_weight",
@@ -1020,6 +1171,7 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "dql_q_denominator_floor",
         "dql_clip_actions",
         "dql_critic_warmup_steps",
+        "resolved_dql_critic_warmup_steps",
         "dql_actor_ema_update_every",
         "actor_max_gradient_norm",
         "critic_max_gradient_norm",
@@ -1038,6 +1190,12 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
 
 
 def train(args: argparse.Namespace) -> dict:
+    distributed = initialize_distributed(args)
+    args.distributed = bool(distributed.enabled)
+    args.distributed_rank = int(distributed.rank)
+    args.distributed_local_rank = int(distributed.local_rank)
+    args.distributed_world_size = int(distributed.world_size)
+    configure_dql_batch_semantics(args, distributed.world_size)
     if not args.dataset.is_file():
         raise FileNotFoundError(
             f"{args.dataset} does not exist; build it with run_rgb_dp_idql.sh first"
@@ -1062,14 +1220,14 @@ def train(args: argparse.Namespace) -> dict:
         raise ValueError("dql_critic_warmup_steps must be non-negative")
     if int(args.dql_actor_ema_update_every) <= 0:
         raise ValueError("dql_actor_ema_update_every must be positive")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed.is_main_process:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed.enabled:
+        dist.barrier()
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
+    device = distributed.device
+    # Build identical models before installing independent rank-local streams.
+    seed_process(args.seed, device)
 
     actor_policy, dp_checkpoint = FileUtils.policy_from_checkpoint(
         ckpt_path=str(args.checkpoint),
@@ -1090,6 +1248,7 @@ def train(args: argparse.Namespace) -> dict:
         dataset,
         args,
         loader_generator,
+        distributed_context=distributed,
     )
     if loader is None:
         loader = original_loader
@@ -1106,17 +1265,19 @@ def train(args: argparse.Namespace) -> dict:
     args.lr_total_steps = int(args.epochs) * int(args.steps_per_epoch)
     if (
         args.lr_scheduler == "cosine"
-        and int(args.lr_warmup_steps) >= int(args.lr_total_steps)
+        and int(args.resolved_lr_warmup_steps) >= int(args.lr_total_steps)
     ):
         raise ValueError(
-            f"lr_warmup_steps={args.lr_warmup_steps} must be smaller than "
+            "resolved_lr_warmup_steps="
+            f"{args.resolved_lr_warmup_steps} (reference "
+            f"{args.lr_warmup_steps}) must be smaller than "
             f"total training steps={args.lr_total_steps}"
         )
     configure_actor_optimizer(
         actor_algo,
         args.actor_lr,
         scheduler_type=args.lr_scheduler,
-        warmup_steps=args.lr_warmup_steps,
+        warmup_steps=args.resolved_lr_warmup_steps,
         total_steps=args.lr_total_steps,
         num_cycles=args.lr_num_cycles,
     )
@@ -1154,13 +1315,14 @@ def train(args: argparse.Namespace) -> dict:
     critic_lr_scheduler = make_step_lr_scheduler(
         critic_optimizer,
         scheduler_type=args.lr_scheduler,
-        warmup_steps=args.lr_warmup_steps,
+        warmup_steps=args.resolved_lr_warmup_steps,
         total_steps=args.lr_total_steps,
         num_cycles=args.lr_num_cycles,
     )
 
     start_epoch = 0
     global_step = 0
+    global_samples_seen = 0
     history: list[dict] = []
     best_validation_critic_loss = float("inf")
     if args.resume_checkpoint is not None:
@@ -1171,12 +1333,28 @@ def train(args: argparse.Namespace) -> dict:
         )
         if not checkpoint.get("rise_style_rgb_dql", False):
             raise ValueError("resume checkpoint is not from train_rgb_dp_dql.py")
+        saved_distributed = checkpoint.get("distributed_training", {})
+        if bool(saved_distributed.get("enabled", False)) and (
+            not distributed.enabled
+            or int(saved_distributed.get("world_size", 1))
+            != distributed.world_size
+        ):
+            raise ValueError(
+                "distributed checkpoints require distributed resume with the "
+                "same world size: checkpoint="
+                f"{saved_distributed.get('world_size')} requested="
+                f"{distributed.world_size}"
+            )
         if not bool(checkpoint.get("stacked_pretrained_dql_critic", False)):
             incompatibility = {
                 "resume_checkpoint": str(args.resume_checkpoint),
                 "reason": "critic architecture and stable DQL target semantics changed",
             }
-            write_json(args.output_dir / "resume_incompatible.json", incompatibility)
+            if distributed.is_main_process:
+                write_json(
+                    args.output_dir / "resume_incompatible.json",
+                    incompatibility,
+                )
             raise ValueError(
                 "cannot resume a pre-fix DQL checkpoint; use a new DQL_OUTPUT_DIR"
             )
@@ -1210,21 +1388,81 @@ def train(args: argparse.Namespace) -> dict:
             )
         start_epoch = int(checkpoint["epoch"])
         global_step = int(checkpoint["step"])
+        global_samples_seen = int(
+            checkpoint.get(
+                "global_samples_seen",
+                global_step * int(args.effective_global_batch_size),
+            )
+        )
         history = list(checkpoint.get("history", []))
         best_validation_critic_loss = float(
             checkpoint.get("best_validation_critic_loss", float("inf"))
         )
-        loader_generator.set_state(checkpoint["loader_generator_state"].cpu())
-        restore_rng_state(checkpoint.get("rng_state"))
+        rank_runtime_states = checkpoint.get("distributed_rank_states")
+        if distributed.enabled and bool(saved_distributed.get("enabled", False)):
+            if not isinstance(rank_runtime_states, (list, tuple)):
+                raise ValueError(
+                    "distributed checkpoint is missing per-rank runtime states"
+                )
+            if len(rank_runtime_states) != distributed.world_size:
+                raise ValueError(
+                    "distributed checkpoint rank-state count does not match "
+                    f"world_size={distributed.world_size}"
+                )
+            rank_runtime = rank_runtime_states[distributed.rank]
+            if int(rank_runtime.get("rank", -1)) != distributed.rank:
+                raise ValueError("distributed checkpoint rank states are unordered")
+            loader_generator.set_state(
+                rank_runtime["loader_generator_state"].cpu()
+            )
+            restore_process_rng_state(rank_runtime.get("rng_state"), device)
+        elif distributed.enabled:
+            loader_generator.manual_seed(int(args.seed) + distributed.rank)
+            seed_process(int(args.seed) + distributed.rank, device)
+        else:
+            loader_generator.set_state(
+                checkpoint["loader_generator_state"].cpu()
+            )
+            saved_rng_state = checkpoint.get("rng_state")
+            if saved_rng_state and "cuda_local" in saved_rng_state:
+                restore_process_rng_state(saved_rng_state, device)
+            else:
+                restore_rng_state(saved_rng_state)
         del checkpoint
-        print(
-            f"Resumed {args.resume_checkpoint} at epoch={start_epoch} step={global_step}",
-            flush=True,
-        )
+        if distributed.is_main_process:
+            print(
+                f"Resumed {args.resume_checkpoint} at epoch={start_epoch} "
+                f"step={global_step}",
+                flush=True,
+            )
 
     actor_algo.set_train()
     critics.train()
     critic_targets.eval().requires_grad_(False)
+    synchronized_modules: list[nn.Module] = [
+        actor_algo.nets,
+        critics,
+        critic_targets,
+    ]
+    if actor_algo.ema is not None:
+        synchronized_modules.append(actor_algo.ema.averaged_model)
+    broadcast_module_state(synchronized_modules, distributed)
+    gradient_sync_fn = (
+        (
+            lambda parameters: all_reduce_gradients(
+                parameters,
+                distributed,
+                bucket_cap_mb=args.gradient_bucket_cap_mb,
+            )
+        )
+        if distributed.enabled
+        else None
+    )
+    synchronize_training_buffers = modules_have_mutable_batch_norm(
+        synchronized_modules
+    )
+    if distributed.enabled and args.resume_checkpoint is None:
+        seed_process(int(args.seed) + distributed.rank, device)
     trainability = actor_trainability(actor_algo)
     startup = {
         "stacked_pretrained_dql_critic": True,
@@ -1239,13 +1477,48 @@ def train(args: argparse.Namespace) -> dict:
         },
         "loader": {
             "class": dataset.__class__.__name__,
-            "num_loaders": 1 + int(validation_loader is not None),
-            "sampler": "RandomSampler_without_replacement",
+            "sparse_dql_loader": bool(args.sparse_dql_loader),
+            "observation_loading": (
+                "current_and_next_observation_stacks_only"
+                if args.sparse_dql_loader
+                else "full_obs_and_next_obs_sequences"
+            ),
+            "num_loaders": int(distributed.world_size)
+            + int(validation_loader is not None),
+            "sampler": loader.sampler.__class__.__name__,
             "batch_size": int(args.batch_size),
+            "batch_size_per_rank": int(args.batch_size),
+            "effective_global_batch_size": int(
+                args.effective_global_batch_size
+            ),
             "num_batches": int(len(loader)),
             "steps_per_epoch": int(args.steps_per_epoch),
             "steps_per_epoch_source": str(args.steps_per_epoch_source),
             "seed": int(args.seed),
+        },
+        "batch_semantics": {
+            "batch_size_control": "per_gpu_BATCH_SIZE",
+            "batch_size_per_rank": int(args.batch_size),
+            "world_size": int(distributed.world_size),
+            "effective_global_batch_size": int(
+                args.effective_global_batch_size
+            ),
+            "schedule_reference_batch_size": int(
+                args.schedule_reference_batch_size
+            ),
+            "effective_to_reference_ratio": float(args.schedule_batch_ratio),
+            "learning_rates_automatically_scaled": False,
+            "dql_q_batch_size_per_rank": int(args.dql_q_batch_size),
+            "reference_lr_warmup_steps": int(args.lr_warmup_steps),
+            "resolved_lr_warmup_steps": int(args.resolved_lr_warmup_steps),
+            "reference_dql_critic_warmup_steps": int(
+                args.dql_critic_warmup_steps
+            ),
+            "resolved_dql_critic_warmup_steps": int(
+                args.resolved_dql_critic_warmup_steps
+            ),
+            "target_tau_step_unit": "optimizer_update",
+            "actor_ema_update_every_step_unit": "optimizer_update",
         },
         "normalization": {
             "action": "pretrained_dp_checkpoint_action_normalization_stats",
@@ -1290,20 +1563,44 @@ def train(args: argparse.Namespace) -> dict:
             "dql_q_normalization": "official_cross_head_generated_action_q",
             "dql_q_denominator_floor": float(args.dql_q_denominator_floor),
             "dql_critic_warmup_steps": int(args.dql_critic_warmup_steps),
+            "resolved_dql_critic_warmup_steps": int(
+                args.resolved_dql_critic_warmup_steps
+            ),
             "dql_actor_ema_update_every": int(
                 args.dql_actor_ema_update_every
             ),
             "actor_max_gradient_norm": float(args.actor_max_gradient_norm),
             "critic_max_gradient_norm": float(args.critic_max_gradient_norm),
             "lr_scheduler": str(args.lr_scheduler),
+            "lr_warmup_steps": int(args.lr_warmup_steps),
+            "resolved_lr_warmup_steps": int(args.resolved_lr_warmup_steps),
             "lr_total_steps": int(args.lr_total_steps),
         },
+        "distributed": {
+            "enabled": bool(distributed.enabled),
+            "world_size": int(distributed.world_size),
+            "backend": distributed.backend,
+            "launcher": "torchrun" if distributed.enabled else "python",
+            "gradient_sync": "bounded_async_bucketed_mean_all_reduce",
+            "gradient_bucket_cap_mb": float(args.gradient_bucket_cap_mb),
+            "random_q_head_sync": "rank_zero_broadcast",
+            "q_denominator_sync": "global_mean",
+            "validation": "rank_zero_then_broadcast",
+            "per_step_buffer_broadcast": bool(
+                synchronize_training_buffers
+            ),
+            "rank_zero_writes_only": True,
+        },
     }
-    write_json(args.output_dir / "startup_audit.json", startup)
-    print(json.dumps(jsonable(startup), indent=2), flush=True)
-
-    writer = make_tensorboard_writer(args.output_dir)
+    if distributed.is_main_process:
+        write_json(args.output_dir / "startup_audit.json", startup)
+        print(json.dumps(jsonable(startup), indent=2), flush=True)
+        writer = make_tensorboard_writer(args.output_dir)
+    else:
+        writer = None
     for epoch in range(start_epoch + 1, int(args.epochs) + 1):
+        if distributed.enabled and hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)
         epoch_iterator = iter(loader)
         epoch_records: list[dict[str, float]] = []
         for step_in_epoch in range(1, int(args.steps_per_epoch) + 1):
@@ -1313,6 +1610,11 @@ def train(args: argparse.Namespace) -> dict:
                 epoch_iterator = iter(loader)
                 raw_batch = next(epoch_iterator)
             raw_batch = align_shared_batch_actions(raw_batch)
+            if synchronize_training_buffers:
+                broadcast_module_buffers(
+                    synchronized_modules,
+                    distributed,
+                )
             learning_rates = {
                 "lr/actor": float(
                     actor_algo.optimizers["policy"].param_groups[0]["lr"]
@@ -1345,8 +1647,10 @@ def train(args: argparse.Namespace) -> dict:
                 clip_actions=bool(args.dql_clip_actions),
             )
             critic_loss.backward()
+            if gradient_sync_fn is not None:
+                gradient_sync_fn(critic_optimizer.param_groups[0]["params"])
             critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
-                critics.parameters(),
+                critic_optimizer.param_groups[0]["params"],
                 float(args.critic_max_gradient_norm),
             )
             critic_optimizer.step()
@@ -1363,25 +1667,37 @@ def train(args: argparse.Namespace) -> dict:
                 critic_batch=critic_batch,
                 args=args,
                 global_step=global_step,
+                distributed_context=distributed,
+                gradient_sync_fn=gradient_sync_fn,
+                defer_scalar_conversion=True,
             )
             soft_update_targets(critics, critic_targets, float(args.target_tau))
             if critic_lr_scheduler is not None:
                 critic_lr_scheduler.step()
 
-            global_step += 1
-            metrics = scalar_metrics(
-                {
-                    **critic_info,
-                    "critic/gradient_norm": critic_gradient_norm,
-                }
+            global_samples_seen += int(
+                raw_batch["actions"].shape[0] * distributed.world_size
             )
+            global_step += 1
+            metrics = {
+                **critic_info,
+                "critic/gradient_norm": critic_gradient_norm,
+            }
             metrics.update(actor_info)
             metrics.update(learning_rates)
+            metrics["distributed/world_size"] = float(distributed.world_size)
+            metrics["data/effective_global_batch_rows"] = float(
+                raw_batch["actions"].shape[0] * distributed.world_size
+            )
+            metrics = mean_distributed_scalars(metrics, distributed)
             epoch_records.append(metrics)
             if writer is not None:
                 for key, value in metrics.items():
                     writer.add_scalar(key, value, global_step)
-            if global_step % int(args.log_every) == 0:
+            if (
+                distributed.is_main_process
+                and global_step % int(args.log_every) == 0
+            ):
                 print(
                     json.dumps(
                         {
@@ -1401,7 +1717,18 @@ def train(args: argparse.Namespace) -> dict:
             critic_targets=critic_targets,
             obs_normalization_stats=obs_normalization_stats,
             args=args,
+            process_device=device,
         )
+        if distributed.enabled:
+            validation_payload = [
+                validation_metrics if distributed.is_main_process else None
+            ]
+            dist.broadcast_object_list(
+                validation_payload,
+                src=0,
+                device=device,
+            )
+            validation_metrics = validation_payload[0]
         validation_loss = (
             float(validation_metrics["critic/loss"])
             if validation_metrics is not None
@@ -1413,6 +1740,7 @@ def train(args: argparse.Namespace) -> dict:
         epoch_summary = {
             "epoch": int(epoch),
             "global_step": int(global_step),
+            "global_samples_seen": int(global_samples_seen),
             "metrics": mean_metrics(epoch_records),
             "validation": validation_metrics,
         }
@@ -1421,6 +1749,7 @@ def train(args: argparse.Namespace) -> dict:
             **startup,
             "last_completed_epoch": int(epoch),
             "global_step": int(global_step),
+            "global_samples_seen": int(global_samples_seen),
             "last_epoch_metrics": epoch_summary["metrics"],
             "last_validation_metrics": validation_metrics,
             "best_validation_critic_loss": (
@@ -1437,7 +1766,11 @@ def train(args: argparse.Namespace) -> dict:
                 "last": str(args.output_dir / "last.pt"),
             },
         }
-        write_json(args.output_dir / "partial_summary.json", partial_summary)
+        if distributed.is_main_process:
+            write_json(
+                args.output_dir / "partial_summary.json",
+                partial_summary,
+            )
 
         should_save = (
             epoch % int(args.save_every_epochs) == 0
@@ -1445,59 +1778,87 @@ def train(args: argparse.Namespace) -> dict:
             or is_best_validation
         )
         if should_save:
-            payload = checkpoint_payload(
-                args=args,
-                actor_algo=actor_algo,
-                critics=critics,
-                critic_targets=critic_targets,
-                critic_optimizer=critic_optimizer,
-                critic_lr_scheduler=critic_lr_scheduler,
-                action_normalization_stats=action_stats,
-                epoch=epoch,
-                global_step=global_step,
-                history=history,
-                loader_generator=loader_generator,
-                best_validation_critic_loss=best_validation_critic_loss,
+            rank_runtime_states = (
+                gather_rank_runtime_states(loader_generator, distributed)
+                if distributed.enabled
+                else None
             )
-            latest_path = args.output_dir / "latest.pt"
-            atomic_torch_save(payload, latest_path)
-            if is_best_validation:
-                replace_with_hardlink(
-                    latest_path,
-                    args.output_dir / "best_critic_loss.pt",
+            if distributed.is_main_process:
+                payload = checkpoint_payload(
+                    args=args,
+                    actor_algo=actor_algo,
+                    critics=critics,
+                    critic_targets=critic_targets,
+                    critic_optimizer=critic_optimizer,
+                    critic_lr_scheduler=critic_lr_scheduler,
+                    action_normalization_stats=action_stats,
+                    epoch=epoch,
+                    global_step=global_step,
+                    global_samples_seen=global_samples_seen,
+                    history=history,
+                    loader_generator=loader_generator,
+                    best_validation_critic_loss=best_validation_critic_loss,
+                    rank_runtime_states=rank_runtime_states,
+                    distributed_context=distributed,
                 )
-            if (
-                int(args.snapshot_every_epochs) > 0
-                and epoch % int(args.snapshot_every_epochs) == 0
-            ):
-                replace_with_hardlink(
-                    latest_path,
-                    args.output_dir / "models" / f"model_epoch_{epoch}.pt",
+                latest_path = args.output_dir / "latest.pt"
+                atomic_torch_save(payload, latest_path)
+                if is_best_validation:
+                    replace_with_hardlink(
+                        latest_path,
+                        args.output_dir / "best_critic_loss.pt",
+                    )
+                if (
+                    int(args.snapshot_every_epochs) > 0
+                    and epoch % int(args.snapshot_every_epochs) == 0
+                ):
+                    replace_with_hardlink(
+                        latest_path,
+                        args.output_dir
+                        / "models"
+                        / f"model_epoch_{epoch}.pt",
+                    )
+                if writer is not None:
+                    writer.flush()
+                print(
+                    f"Saved {latest_path} at epoch={epoch} "
+                    f"step={global_step}",
+                    flush=True,
                 )
-            if writer is not None:
-                writer.flush()
-            print(
-                f"Saved {latest_path} at epoch={epoch} step={global_step}",
-                flush=True,
-            )
+        if distributed.enabled:
+            dist.barrier()
 
-    last_path = args.output_dir / "last.pt"
-    if int(args.epochs) > start_epoch:
-        replace_with_hardlink(args.output_dir / "latest.pt", last_path)
-    elif not last_path.exists():
-        if args.resume_checkpoint is None:
-            raise RuntimeError("training is complete but last.pt is missing")
-        replace_with_hardlink(args.resume_checkpoint, last_path)
-    final_summary = json.loads((args.output_dir / "partial_summary.json").read_text())
-    final_summary["complete"] = True
-    final_summary["last_checkpoint"] = str(last_path)
-    write_json(args.output_dir / "summary.json", final_summary)
+    if distributed.is_main_process:
+        last_path = args.output_dir / "last.pt"
+        if int(args.epochs) > start_epoch:
+            replace_with_hardlink(args.output_dir / "latest.pt", last_path)
+        elif not last_path.exists():
+            if args.resume_checkpoint is None:
+                raise RuntimeError("training is complete but last.pt is missing")
+            replace_with_hardlink(args.resume_checkpoint, last_path)
+        final_summary = json.loads(
+            (args.output_dir / "partial_summary.json").read_text()
+        )
+        final_summary["complete"] = True
+        final_summary["last_checkpoint"] = str(last_path)
+        write_json(args.output_dir / "summary.json", final_summary)
+        print(
+            json.dumps(
+                jsonable(
+                    {key: value for key, value in final_summary.items() if key != "history"}
+                ),
+                indent=2,
+            )
+        )
+    else:
+        final_summary = {}
     if writer is not None:
         writer.close()
+    if distributed.enabled:
+        dist.barrier()
     close_dataset = getattr(dataset, "close", None)
     if callable(close_dataset):
         close_dataset()
-    print(json.dumps(jsonable({k: v for k, v in final_summary.items() if k != "history"}), indent=2))
     return final_summary
 
 
@@ -1509,10 +1870,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument(
+        "--distributed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable torchrun data-parallel training. This is also enabled "
+            "automatically when WORLD_SIZE is greater than one."
+        ),
+    )
+    parser.add_argument(
+        "--distributed-backend",
+        choices=("auto", "nccl", "gloo"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--gradient-bucket-cap-mb",
+        type=float,
+        default=100.0,
+        help="Maximum size of each flat gradient all-reduce bucket in MiB.",
+    )
+    parser.add_argument(
+        "--local-rank",
+        "--local_rank",
+        type=int,
+        default=None,
+        help="Local process rank supplied by torchrun; the environment wins.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument(
+        "--schedule-reference-batch-size",
+        type=int,
+        default=100,
+        help=(
+            "Reference global batch used to express LR and DQL critic "
+            "warmups in processed-sample units."
+        ),
+    )
+    parser.add_argument(
+        "--sparse-dql-loader",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Load only the current and next observation stacks while "
+            "preserving the full action and metadata sequence."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
@@ -1577,6 +1983,14 @@ def parse_args() -> argparse.Namespace:
         args.critic_late_fusion_key = None
     if args.lr_warmup_steps < 0:
         parser.error("lr-warmup-steps must be non-negative")
+    if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
+        parser.error("steps-per-epoch must be positive when specified")
+    if args.batch_size <= 0:
+        parser.error("batch-size must be positive")
+    if args.schedule_reference_batch_size <= 0:
+        parser.error("schedule-reference-batch-size must be positive")
+    if args.gradient_bucket_cap_mb <= 0.0:
+        parser.error("gradient-bucket-cap-mb must be positive")
     if args.lr_num_cycles <= 0.0:
         parser.error("lr-num-cycles must be positive")
     if args.actor_max_gradient_norm <= 0.0:
@@ -1590,5 +2004,14 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def main() -> None:
+    args = parse_args()
+    try:
+        train(args)
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
 if __name__ == "__main__":
-    train(parse_args())
+    main()

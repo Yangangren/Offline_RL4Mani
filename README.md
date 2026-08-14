@@ -67,6 +67,81 @@ It offers a broad set of demonstration datasets collected on robot manipulation 
 
 The robomimic framework also makes reproducing the results from different benchmarks and datasets easy. See the [datasets page](https://robomimic.github.io/docs/datasets/overview.html) for more information on downloading datasets and reproducing experiments.
 
+### Multi-GPU one-step IDQL
+
+The one-step RGB diffusion-policy IDQL launcher supports single-node
+distributed training. For example, to train Transport on four GPUs:
+
+```bash
+conda activate robomimic_stable
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+ROBOMIMIC_PYTHON="$CONDA_PREFIX/bin/python" \
+IDQL_NUM_GPUS=4 \
+BATCH_SIZE=64 \
+NUM_WORKERS=4 \
+IDQL_SCHEDULE_REFERENCE_BATCH_SIZE=64 \
+bash run_rgb_dp_idql.sh transport train_resilient
+```
+
+`BATCH_SIZE` and `NUM_WORKERS` are per GPU, so this example has a global batch
+of 256 and 16 data workers. Set `IDQL_NUM_GPUS=1` (the default) to retain the
+direct single-process launcher. The LR warmup is sample-scaled relative to
+`IDQL_SCHEDULE_REFERENCE_BATCH_SIZE` (64 by default); target-network Polyak
+updates and actor EMA remain in optimizer-update units. Learning rates are not
+scaled automatically. `IDQL_GRADIENT_BUCKET_CAP_MB` controls the flat
+all-reduce bucket size and defaults to 100 MiB; `IDQL_DISTRIBUTED_BACKEND`
+defaults to `auto`. Resume distributed checkpoints with the same GPU count and
+per-rank batch semantics.
+
+One-step IDQL uses sparse RGB loading by default: each sample reads the actor's
+observation history and one immediate next observation while retaining the full
+diffusion action sequence. Set `IDQL_SPARSE_ONE_STEP_LOADER=0` to use the dense
+loader for debugging or equivalence checks.
+
+Evaluation grids can run independent rollout jobs on multiple GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+EVAL_NUM_GPUS=4 \
+bash run_rgb_dp_idql.sh tool_hang eval_grid_resilient
+```
+
+Set `EVAL_GPU_IDS="0 1 2 3"` when explicit physical CUDA / MuJoCo EGL device
+binding is needed. Direct `eval` remains a single-GPU command.
+
+### Multi-GPU Tool Hang DQL
+
+DQL uses one process per GPU for training. `BATCH_SIZE`, `NUM_WORKERS`, and
+`DQL_Q_BATCH_SIZE` are per GPU; learning rates are not scaled automatically.
+For example, four-GPU Tool Hang training is:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+DQL_NUM_GPUS=4 \
+BATCH_SIZE=100 \
+NUM_WORKERS=4 \
+bash run_rgb_dp_dql.sh tool_hang train_resilient
+```
+
+The LR and critic warmups are sample-scaled from the reference global batch of
+100. Target-network Polyak updates and actor EMA cadence remain optimizer-step
+based. DQL sparse loading is enabled by default and loads the current and next
+observation stacks while retaining the full action sequence. For Tool Hang this
+reduces the two-camera RGB reads from 68 to 8 images per sample. Set
+`DQL_SPARSE_LOADER=0` for a dense equivalence run.
+
+Multi-GPU evaluation assigns independent candidate-count / seed pairs to GPU
+workers instead of using distributed model inference:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+EVAL_NUM_GPUS=4 \
+bash run_rgb_dp_dql.sh tool_hang eval_grid_resilient
+```
+
+Use `EVAL_GPU_IDS="0 1 2 3"` to bind explicit physical CUDA / MuJoCo EGL
+devices. Each evaluation worker owns a complete model and simulator.
+
 ### Multi-GPU Tool Hang chunk-IDQL
 
 The project-specific chunk-IDQL launcher supports single-node distributed

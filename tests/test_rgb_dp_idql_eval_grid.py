@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import subprocess
 import threading
 import time
 import unittest
@@ -10,7 +11,9 @@ from pathlib import Path
 from unittest import mock
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts/run_rgb_dp_idql_eval_grid.py"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts/run_rgb_dp_idql_eval_grid.py"
+LAUNCHER = ROOT / "run_rgb_dp_idql.sh"
 SPEC = importlib.util.spec_from_file_location("rgb_dp_idql_eval_grid", SCRIPT)
 EVAL_GRID = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -18,6 +21,36 @@ SPEC.loader.exec_module(EVAL_GRID)
 
 
 class MultiGpuEvalGridTest(unittest.TestCase):
+    def run_launcher(self, stage):
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "ROBOMIMIC_PYTHON": "/bin/echo",
+                "IDQL_NUM_GPUS": "1",
+                "EVAL_NUM_GPUS": "4",
+                "EVAL_GPU_IDS": "2 4 6 7",
+                "USER": environment.get("USER", "test"),
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(LAUNCHER), "tool_hang", stage],
+            cwd=ROOT,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout + result.stderr
+
+    def test_launcher_forwards_gpu_controls_only_to_eval_grid(self):
+        grid_output = self.run_launcher("eval_grid_resilient")
+        self.assertIn("--num-gpus 4", grid_output)
+        self.assertIn("--gpu-ids 2 4 6 7", grid_output)
+
+        direct_output = self.run_launcher("eval")
+        self.assertNotIn("--num-gpus", direct_output)
+        self.assertNotIn("--gpu-ids", direct_output)
+
     def test_resolve_visible_gpu_ids_and_child_environment(self):
         args = argparse.Namespace(device="cuda", num_gpus=2, gpu_ids=None)
         with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "3,5,7"}, clear=False):

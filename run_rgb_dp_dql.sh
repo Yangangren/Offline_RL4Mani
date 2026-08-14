@@ -75,6 +75,23 @@ export PYTHONFAULTHANDLER=1
 
 PYTHON=${ROBOMIMIC_PYTHON:-/home/ryan/miniconda3/envs/robomimic_stable/bin/python}
 export ROBOMIMIC_PYTHON="$PYTHON"
+DQL_NUM_GPUS=${DQL_NUM_GPUS:-1}
+if [[ ! "$DQL_NUM_GPUS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "DQL_NUM_GPUS must be a positive integer; got '$DQL_NUM_GPUS'." >&2
+  exit 2
+fi
+if (( DQL_NUM_GPUS > 1 )) && [[ "${DEVICE:-cuda}" != "cuda" ]]; then
+  echo "DQL_NUM_GPUS>1 requires DEVICE=cuda." >&2
+  exit 2
+fi
+EVAL_GPU_ARGS=()
+if [[ -n "${EVAL_NUM_GPUS:-}" ]]; then
+  EVAL_GPU_ARGS+=(--num-gpus "$EVAL_NUM_GPUS")
+fi
+if [[ -n "${EVAL_GPU_IDS:-}" ]]; then
+  read -r -a eval_gpu_id_args <<< "$EVAL_GPU_IDS"
+  EVAL_GPU_ARGS+=(--gpu-ids "${eval_gpu_id_args[@]}")
+fi
 
 DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
 DQL_REWARD_MODE=${DQL_REWARD_MODE:-task}
@@ -108,6 +125,10 @@ fi
 PERSISTENT_WORKERS_ARG=--persistent-workers
 if [[ "${PERSISTENT_WORKERS:-1}" == "0" ]]; then
   PERSISTENT_WORKERS_ARG=--no-persistent-workers
+fi
+SPARSE_DQL_LOADER_ARG=--sparse-dql-loader
+if [[ "${DQL_SPARSE_LOADER:-1}" == "0" ]]; then
+  SPARSE_DQL_LOADER_ARG=--no-sparse-dql-loader
 fi
 CRITIC_GROUP_NORM=${CRITIC_GROUP_NORM:-$TASK_CRITIC_GROUP_NORM}
 CRITIC_GROUP_NORM_ARG=--no-critic-group-norm
@@ -143,14 +164,32 @@ run_train() {
   local resume_path=${1:-}
   local -a resume_args=()
   local -a steps_per_epoch_args=()
+  local -a distributed_args=()
+  local -a train_launcher=("$PYTHON" -B)
   if [[ -n "$resume_path" ]]; then
     resume_args=(--resume-checkpoint "$resume_path")
   fi
   if [[ -n "${STEPS_PER_EPOCH:-}" ]]; then
     steps_per_epoch_args=(--steps-per-epoch "$STEPS_PER_EPOCH")
   fi
-  "$PYTHON" -B scripts/train_rgb_dp_dql.py \
+  if (( DQL_NUM_GPUS > 1 )); then
+    train_launcher=(
+      "$PYTHON" -B -m torch.distributed.run
+      --standalone
+      --nnodes=1
+      "--nproc-per-node=$DQL_NUM_GPUS"
+    )
+    distributed_args=(
+      --distributed
+      --distributed-backend "${DQL_DISTRIBUTED_BACKEND:-auto}"
+      --gradient-bucket-cap-mb "${DQL_GRADIENT_BUCKET_CAP_MB:-100}"
+    )
+    export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
+    echo "[rgb_dp_dql] distributed training: GPUs=$DQL_NUM_GPUS per-rank-batch=${BATCH_SIZE:-100} per-rank-q-batch=${DQL_Q_BATCH_SIZE:-8}" >&2
+  fi
+  "${train_launcher[@]}" scripts/train_rgb_dp_dql.py \
     --task "$TASK" \
+    "${distributed_args[@]}" \
     --dataset "$IDQL_DATASET" \
     --checkpoint "$DP_CHECKPOINT" \
     --output-dir "$DQL_OUTPUT_DIR" \
@@ -159,11 +198,13 @@ run_train() {
     --seed "${SEED:-0}" \
     --epochs "${EPOCHS:-50}" \
     "${steps_per_epoch_args[@]}" \
+    --schedule-reference-batch-size "${DQL_SCHEDULE_REFERENCE_BATCH_SIZE:-100}" \
     --batch-size "${BATCH_SIZE:-100}" \
     --num-workers "${NUM_WORKERS:-4}" \
     --prefetch-factor "${PREFETCH_FACTOR:-2}" \
     "$PIN_MEMORY_ARG" \
     "$PERSISTENT_WORKERS_ARG" \
+    "$SPARSE_DQL_LOADER_ARG" \
     --hdf5-cache-mode "${HDF5_CACHE_MODE:-low_dim}" \
     --reward-mode "$DQL_REWARD_MODE" \
     --discount "${DISCOUNT:-0.99}" \
@@ -265,6 +306,7 @@ case "$STAGE" in
       --expected-task "$TASK" \
       --output-dir "$EVAL_OUTPUT" \
       --device "${DEVICE:-cuda}" \
+      "${EVAL_GPU_ARGS[@]}" \
       --actor-source hybrid_dp_chunk_actor \
       --critic-source "${CRITIC_SOURCE:-target}" \
       --n-rollouts "${N_ROLLOUTS:-50}" \
