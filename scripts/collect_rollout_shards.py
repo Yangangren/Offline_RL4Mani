@@ -19,11 +19,14 @@ robosuite crashes visible while collection is running.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import h5py
@@ -52,6 +55,54 @@ COMMON_ENV = {
     "TORCH_COMPILE_DISABLE": "1",
     "TORCHDYNAMO_DISABLE": "1",
 }
+
+PROVENANCE_KEY = "experiment_provenance"
+PROVENANCE_SCHEMA_VERSION = 2
+SHARD_PROVENANCE_ATTR = "collection_provenance_json"
+UINT32_SEED_MODULUS = 1 << 32
+COLLECTOR_SEED_SCHEME = "identity_if_uint32_else_sha256_v2(raw_integer_seed)"
+
+
+def to_uint32_seed(value: int) -> int:
+    """Map any integer deterministically into NumPy's accepted seed range."""
+    raw_seed = int(value)
+    if 0 <= raw_seed < UINT32_SEED_MODULUS:
+        return raw_seed
+    encoded = f"collect_rollout_shards_seed_v2:{raw_seed}".encode("ascii")
+    digest = hashlib.sha256(encoded).digest()
+    return int.from_bytes(digest[:4], byteorder="big", signed=False)
+
+
+def derive_shard_attempt_seed(args, spec: dict, attempt: int) -> int:
+    """Derive the actual evaluator seed while retaining the logical seed."""
+    if spec.get("policy_seed") is not None:
+        return to_uint32_seed(spec["seed"])
+    nominal_seed = int(spec.get("nominal_seed", spec["seed"]))
+    raw_seed = nominal_seed + (int(attempt) - 1) * int(args.retry_seed_offset)
+    return to_uint32_seed(raw_seed)
+
+
+def validate_collector_seeds(args) -> None:
+    """Reject invalid or aliased configured collector seeds."""
+    if int(args.seed_base) < 0:
+        raise ValueError("--seed-base must be non-negative")
+    if int(args.retry_seed_offset) < 0:
+        raise ValueError("--retry-seed-offset must be non-negative")
+    if args.num_env_seeds is not None and int(args.num_env_seeds) <= 0:
+        raise ValueError("--num-env-seeds must be positive")
+    if args.policy_seeds is None:
+        return
+    if len(args.policy_seeds) == 0:
+        raise ValueError("--policy-seeds requires at least one seed")
+    logical_seeds = [int(seed) for seed in args.policy_seeds]
+    if any(seed < 0 for seed in logical_seeds):
+        raise ValueError("--policy-seeds must be non-negative")
+    effective_seeds = [to_uint32_seed(seed) for seed in logical_seeds]
+    if len(set(effective_seeds)) != len(effective_seeds):
+        raise ValueError(
+            "--policy-seeds produce duplicate effective uint32 seeds under "
+            f"{COLLECTOR_SEED_SCHEME}"
+        )
 
 
 class TeeLogger:
@@ -86,6 +137,244 @@ def sorted_demo_keys(dataset: h5py.File) -> list[str]:
     )
 
 
+def file_identity(path: Path | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    resolved = path.expanduser().resolve()
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return {
+            "path": str(resolved),
+            "exists": False,
+            "size": None,
+            "mtime_ns": None,
+        }
+    return {
+        "path": str(resolved),
+        "exists": True,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def common_collection_inputs(args: argparse.Namespace) -> dict[str, object]:
+    idql_backend = args.idql_checkpoint is not None
+    return {
+        "policy_backend": "chunk_idql" if idql_backend else "robomimic_agent",
+        "checkpoints": {
+            "agent": file_identity(args.agent),
+            "idql": file_identity(args.idql_checkpoint),
+            "dp": file_identity(args.dp_checkpoint),
+        },
+        "dataset_obs": bool(args.dataset_obs),
+        "idql_policy": (
+            {
+                "expected_task": args.expected_task,
+                "device": args.device,
+                "actor_source": args.actor_source,
+                "critic_source": args.critic_source,
+                "num_candidates": int(args.num_candidates),
+                "candidate_batch_size": int(args.candidate_batch_size),
+                "execution_horizon": int(args.execution_horizon),
+                "selection": args.selection,
+                "random_selection_probability": float(
+                    args.random_selection_probability
+                ),
+                "clip_actions": bool(args.clip_actions),
+                "require_success_condition_adapter": bool(
+                    args.require_success_condition_adapter
+                ),
+                "forbid_success_condition_adapter": bool(
+                    args.forbid_success_condition_adapter
+                ),
+                "inference_success_condition": float(
+                    args.inference_success_condition
+                ),
+                "inference_condition_mask": float(args.inference_condition_mask),
+                "env_hard_reset": bool(args.env_hard_reset),
+                "reset_to_initial_state": bool(args.reset_to_initial_state),
+            }
+            if idql_backend
+            else None
+        ),
+    }
+
+
+def make_experiment_provenance(inputs: dict[str, object]) -> dict[str, object]:
+    canonical = json.dumps(
+        inputs,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    return {
+        "schema_version": PROVENANCE_SCHEMA_VERSION,
+        "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "inputs": inputs,
+    }
+
+
+def shard_experiment_provenance(
+    args: argparse.Namespace,
+    spec: dict,
+    attempt: int,
+    *,
+    common_inputs: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if common_inputs is None:
+        common_inputs = common_collection_inputs(args)
+    split_seed_grid = spec.get("policy_seed") is not None
+    evaluator_seed = (
+        None
+        if split_seed_grid
+        else derive_shard_attempt_seed(args, spec, attempt)
+    )
+    return make_experiment_provenance(
+        {
+            "scope": "rollout_shard",
+            "common": common_inputs,
+            "shard": {
+                "shard_index": int(spec["shard_index"]),
+                "rollouts_per_shard": int(args.rollouts_per_shard),
+                "horizon": int(args.horizon),
+                "attempt": int(attempt),
+                "seed_scheme": COLLECTOR_SEED_SCHEME,
+                "nominal_seed": int(spec.get("nominal_seed", spec["seed"])),
+                "evaluator_seed": evaluator_seed,
+                "nominal_env_seed": (
+                    None
+                    if spec.get("nominal_env_seed") is None
+                    else int(spec["nominal_env_seed"])
+                ),
+                "env_seed": (
+                    None
+                    if spec.get("env_seed") is None
+                    else int(spec["env_seed"])
+                ),
+                "nominal_policy_seed": (
+                    None
+                    if spec.get("nominal_policy_seed") is None
+                    else int(spec["nominal_policy_seed"])
+                ),
+                "policy_seed": (
+                    None
+                    if spec.get("policy_seed") is None
+                    else int(spec["policy_seed"])
+                ),
+                "env_index": (
+                    None
+                    if spec.get("env_index") is None
+                    else int(spec["env_index"])
+                ),
+                "retry_seed_offset": (
+                    None if split_seed_grid else int(args.retry_seed_offset)
+                ),
+            },
+        }
+    )
+
+
+def expected_shard_provenances(
+    args: argparse.Namespace,
+    spec: dict,
+    *,
+    common_inputs: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    return [
+        shard_experiment_provenance(
+            args,
+            spec,
+            attempt,
+            common_inputs=common_inputs,
+        )
+        for attempt in range(1, int(args.max_retries) + 1)
+    ]
+
+
+def collection_experiment_provenance(
+    args: argparse.Namespace,
+    shard_provenances: list[dict[str, object]],
+    *,
+    common_inputs: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if common_inputs is None:
+        common_inputs = common_collection_inputs(args)
+    return make_experiment_provenance(
+        {
+            "scope": "merged_rollout_collection",
+            "common": common_inputs,
+            "collection": {
+                "num_shards": int(args.num_shards),
+                "num_env_seeds": (
+                    None
+                    if args.num_env_seeds is None
+                    else int(args.num_env_seeds)
+                ),
+                "policy_seeds": (
+                    None
+                    if args.policy_seeds is None
+                    else [int(seed) for seed in args.policy_seeds]
+                ),
+                "rollouts_per_shard": int(args.rollouts_per_shard),
+                "horizon": int(args.horizon),
+                "seed_base": int(args.seed_base),
+                "max_retries": int(args.max_retries),
+                "retry_seed_offset": int(args.retry_seed_offset),
+                "success_return_threshold": float(
+                    args.success_return_threshold
+                ),
+                "min_success_rollouts": args.min_success_rollouts,
+                "min_failure_rollouts": args.min_failure_rollouts,
+                "shard_fingerprints": [
+                    provenance["fingerprint"]
+                    for provenance in shard_provenances
+                ],
+            },
+        }
+    )
+
+
+def provenance_from_hdf5(dataset: h5py.File) -> dict | None:
+    if "data" not in dataset:
+        return None
+    value = dataset["data"].attrs.get(SHARD_PROVENANCE_ATTR)
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if not isinstance(value, str):
+        return None
+    try:
+        provenance = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return provenance if isinstance(provenance, dict) else None
+
+
+def read_shard_provenance(path: Path) -> dict | None:
+    try:
+        with h5py.File(path, "r") as dataset:
+            return provenance_from_hdf5(dataset)
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+def stamp_shard_provenance(
+    path: Path,
+    provenance: dict[str, object],
+) -> None:
+    encoded = json.dumps(
+        provenance,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    with h5py.File(path, "r+") as dataset:
+        dataset["data"].attrs[SHARD_PROVENANCE_ATTR] = encoded
+        dataset.flush()
+
+
 def valid_shard(
     path: Path,
     expected: int,
@@ -93,6 +382,7 @@ def valid_shard(
     require_idql_diagnostics: bool = False,
     expected_selection: str | None = None,
     expected_random_selection_probability: float | None = None,
+    expected_provenances: list[dict[str, object]] | None = None,
 ) -> bool:
     if not path.exists():
         return False
@@ -102,6 +392,12 @@ def valid_shard(
                 return False
             if "env_args" not in dataset["data"].attrs:
                 return False
+            if expected_provenances is not None:
+                stored_provenance = provenance_from_hdf5(dataset)
+                if stored_provenance is None or not any(
+                    stored_provenance == expected for expected in expected_provenances
+                ):
+                    return False
             if expected_selection is not None:
                 stored_selection = dataset["data"].attrs.get("selection")
                 if isinstance(stored_selection, bytes):
@@ -193,7 +489,8 @@ def build_shard_specs(args) -> list[dict]:
         return [
             {
                 "shard_index": shard_index,
-                "seed": args.seed_base + shard_index,
+                "seed": to_uint32_seed(args.seed_base + shard_index),
+                "nominal_seed": int(args.seed_base) + shard_index,
                 "env_seed": None,
                 "policy_seed": None,
             }
@@ -202,14 +499,20 @@ def build_shard_specs(args) -> list[dict]:
 
     specs = []
     for env_index in range(args.num_env_seeds):
-        env_seed = args.seed_base + env_index
-        for policy_seed in args.policy_seeds:
+        nominal_env_seed = int(args.seed_base) + env_index
+        env_seed = to_uint32_seed(nominal_env_seed)
+        for configured_policy_seed in args.policy_seeds:
+            nominal_policy_seed = int(configured_policy_seed)
+            policy_seed = to_uint32_seed(nominal_policy_seed)
             specs.append(
                 {
                     "shard_index": len(specs),
                     "seed": env_seed,
+                    "nominal_seed": nominal_env_seed,
                     "env_seed": env_seed,
-                    "policy_seed": int(policy_seed),
+                    "nominal_env_seed": nominal_env_seed,
+                    "policy_seed": policy_seed,
+                    "nominal_policy_seed": nominal_policy_seed,
                     "env_index": env_index,
                 }
             )
@@ -217,10 +520,7 @@ def build_shard_specs(args) -> list[dict]:
 
 
 def rollout_command(args, shard: Path, spec: dict, attempt: int) -> list[str]:
-    if spec.get("policy_seed") is None:
-        attempt_seed = int(spec["seed"]) + (attempt - 1) * args.retry_seed_offset
-    else:
-        attempt_seed = int(spec["seed"])
+    attempt_seed = derive_shard_attempt_seed(args, spec, attempt)
 
     if args.idql_checkpoint is not None:
         eval_output = (
@@ -343,19 +643,29 @@ def collect(args) -> list[dict]:
     total_success = 0
     total_failure = 0
     require_idql_diagnostics = args.idql_checkpoint is not None
+    common_inputs = common_collection_inputs(args)
     specs = build_shard_specs(args)
     for spec in specs:
         shard_index = int(spec["shard_index"])
         seed = int(spec["seed"])
+        nominal_seed = int(spec.get("nominal_seed", seed))
         shard = args.output_dir / f"shard_{shard_index:03d}.hdf5"
         log = args.output_dir / f"shard_{shard_index:03d}.log"
         base_record = {
+            "shard_index": shard_index,
             "seed": seed,
-            "nominal_seed": seed,
+            "nominal_seed": nominal_seed,
             "env_seed": spec.get("env_seed"),
+            "nominal_env_seed": spec.get("nominal_env_seed"),
             "policy_seed": spec.get("policy_seed"),
+            "nominal_policy_seed": spec.get("nominal_policy_seed"),
             "env_index": spec.get("env_index"),
         }
+        expected_provenances = expected_shard_provenances(
+            args,
+            spec,
+            common_inputs=common_inputs,
+        )
         record = None
         if (
             not args.force_shards
@@ -370,16 +680,30 @@ def collect(args) -> list[dict]:
                     if require_idql_diagnostics
                     else None
                 ),
+                expected_provenances=expected_provenances,
             )
         ):
-            print(f"[reuse] {shard}", flush=True)
+            stored_provenance = read_shard_provenance(shard)
+            assert stored_provenance is not None
+            stored_shard_inputs = stored_provenance["inputs"]["shard"]
+            source_attempt = int(stored_shard_inputs["attempt"])
+            evaluator_seed = stored_shard_inputs["evaluator_seed"]
+            record_seed = seed if evaluator_seed is None else int(evaluator_seed)
+            print(
+                f"[reuse] {shard} "
+                f"provenance={stored_provenance['fingerprint']}",
+                flush=True,
+            )
             stats = parse_stats(log.read_text(errors="replace")) if log.exists() else None
             record = {
                 "shard": str(shard),
                 "log": str(log),
                 **base_record,
+                "seed": record_seed,
                 "attempts": 0,
+                "source_attempt": source_attempt,
                 "stats": stats,
+                PROVENANCE_KEY: stored_provenance,
             }
         else:
             if shard.exists():
@@ -387,10 +711,19 @@ def collect(args) -> list[dict]:
             logger = TeeLogger(log, mode="w")
             try:
                 for attempt in range(1, args.max_retries + 1):
+                    provenance = shard_experiment_provenance(
+                        args,
+                        spec,
+                        attempt,
+                        common_inputs=common_inputs,
+                    )
                     command = rollout_command(args, shard, spec, attempt)
                     if spec.get("policy_seed") is None:
-                        attempt_seed = seed + (attempt - 1) * args.retry_seed_offset
-                        seed_desc = f"seed={seed} attempt_seed={attempt_seed}"
+                        attempt_seed = derive_shard_attempt_seed(args, spec, attempt)
+                        seed_desc = (
+                            f"nominal_seed={nominal_seed} seed={seed} "
+                            f"attempt_seed={attempt_seed}"
+                        )
                         record_seed = attempt_seed
                     else:
                         seed_desc = (
@@ -400,7 +733,8 @@ def collect(args) -> list[dict]:
                         record_seed = seed
                     logger.line(
                         f"\n[collect shard={shard_index} {seed_desc} "
-                        f"attempt={attempt}/{args.max_retries}]"
+                        f"attempt={attempt}/{args.max_retries} "
+                        f"provenance={provenance['fingerprint']}]"
                     )
                     if shard.exists():
                         shard.unlink()
@@ -424,6 +758,29 @@ def collect(args) -> list[dict]:
                         ),
                     )
                     if ok:
+                        if common_collection_inputs(args) != common_inputs:
+                            shard.unlink(missing_ok=True)
+                            raise RuntimeError(
+                                "checkpoint identity or another collection input "
+                                f"changed while collecting shard {shard_index}"
+                            )
+                        stamp_shard_provenance(shard, provenance)
+                        ok = valid_shard(
+                            shard,
+                            args.rollouts_per_shard,
+                            args.dataset_obs,
+                            require_idql_diagnostics=require_idql_diagnostics,
+                            expected_selection=(
+                                args.selection if require_idql_diagnostics else None
+                            ),
+                            expected_random_selection_probability=(
+                                args.random_selection_probability
+                                if require_idql_diagnostics
+                                else None
+                            ),
+                            expected_provenances=[provenance],
+                        )
+                    if ok:
                         stats = parse_stats(stdout)
                         logger.line(f"[complete] {shard} stats={json.dumps(stats)}")
                         record = {
@@ -432,7 +789,9 @@ def collect(args) -> list[dict]:
                             **base_record,
                             "seed": record_seed,
                             "attempts": attempt,
+                            "source_attempt": attempt,
                             "stats": stats,
+                            PROVENANCE_KEY: provenance,
                         }
                         break
                     logger.line(
@@ -488,14 +847,212 @@ def collect(args) -> list[dict]:
     return shard_records
 
 
+def validate_merge_shards(
+    args: argparse.Namespace,
+    shard_records: list[dict],
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    if not shard_records:
+        raise ValueError("cannot merge an empty shard collection")
+    common_inputs = common_collection_inputs(args)
+    specs_by_index = {
+        int(spec["shard_index"]): spec for spec in build_shard_specs(args)
+    }
+    seen_indices: set[int] = set()
+    provenances: list[dict[str, object]] = []
+    require_idql_diagnostics = args.idql_checkpoint is not None
+
+    for record in shard_records:
+        try:
+            shard_index = int(record["shard_index"])
+            shard_path = Path(record["shard"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "each shard record must contain shard_index and shard"
+            ) from error
+        if shard_index in seen_indices:
+            raise ValueError(f"duplicate shard_index in merge: {shard_index}")
+        seen_indices.add(shard_index)
+        spec = specs_by_index.get(shard_index)
+        if spec is None:
+            raise ValueError(
+                f"shard_index {shard_index} is outside the configured seed grid"
+            )
+
+        stored_provenance = read_shard_provenance(shard_path)
+        if stored_provenance is None:
+            raise ValueError(
+                f"shard is missing valid experiment provenance: {shard_path}"
+            )
+        if record.get(PROVENANCE_KEY) != stored_provenance:
+            raise ValueError(
+                f"shard record provenance differs from HDF5 metadata: {shard_path}"
+            )
+        expected_provenances = expected_shard_provenances(
+            args,
+            spec,
+            common_inputs=common_inputs,
+        )
+        if not any(
+            stored_provenance == expected
+            for expected in expected_provenances
+        ):
+            raise ValueError(
+                f"shard provenance does not match the current collection: {shard_path}"
+            )
+        stored_attempt = int(
+            stored_provenance["inputs"]["shard"]["attempt"]
+        )
+        if int(record.get("source_attempt", -1)) != stored_attempt:
+            raise ValueError(
+                f"shard attempt metadata differs from provenance: {shard_path}"
+            )
+        if not valid_shard(
+            shard_path,
+            args.rollouts_per_shard,
+            args.dataset_obs,
+            require_idql_diagnostics=require_idql_diagnostics,
+            expected_selection=(
+                args.selection if require_idql_diagnostics else None
+            ),
+            expected_random_selection_probability=(
+                args.random_selection_probability
+                if require_idql_diagnostics
+                else None
+            ),
+            expected_provenances=[stored_provenance],
+        ):
+            raise ValueError(
+                f"shard failed structural or provenance validation: {shard_path}"
+            )
+        provenances.append(stored_provenance)
+
+    return common_inputs, provenances
+
+
+@contextlib.contextmanager
+def atomic_hdf5_output(path: Path, validator):
+    """Build and validate a sibling HDF5 file before atomically publishing it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with h5py.File(temporary, "w") as output:
+            yield output
+        validator(temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _decode_hdf5_strings(values) -> list[str]:
+    return [
+        value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        for value in values
+    ]
+
+
+def validate_merged_output(
+    path: Path,
+    *,
+    args: argparse.Namespace,
+    shard_records: list[dict],
+    common_inputs: dict[str, object],
+    shard_provenances: list[dict[str, object]],
+    collection_provenance: dict[str, object],
+    expected_masks: dict[str, list[str]],
+    all_keys: list[str],
+    total_samples: int,
+) -> None:
+    """Validate the temporary merge and revalidate every source before publish."""
+    final_common, final_provenances = validate_merge_shards(args, shard_records)
+    if final_common != common_inputs or final_provenances != shard_provenances:
+        raise RuntimeError(
+            "checkpoint identity or shard provenance changed while merging"
+        )
+
+    require_idql_diagnostics = args.idql_checkpoint is not None
+    if not valid_shard(
+        path,
+        len(all_keys),
+        args.dataset_obs,
+        require_idql_diagnostics=require_idql_diagnostics,
+        expected_selection=(args.selection if require_idql_diagnostics else None),
+        expected_random_selection_probability=(
+            args.random_selection_probability
+            if require_idql_diagnostics
+            else None
+        ),
+        expected_provenances=[collection_provenance],
+    ):
+        raise RuntimeError(f"temporary merged dataset failed validation: {path}")
+
+    source_fingerprints = {
+        Path(record["shard"]).name: record[PROVENANCE_KEY]["fingerprint"]
+        for record in shard_records
+    }
+    if len(source_fingerprints) != len(shard_records):
+        raise ValueError("source shard basenames must be unique during merge")
+
+    with h5py.File(path, "r") as dataset:
+        if sorted_demo_keys(dataset) != all_keys:
+            raise RuntimeError("temporary merged dataset has invalid demo keys")
+        if int(dataset["data"].attrs.get("total", -1)) != int(total_samples):
+            raise RuntimeError("temporary merged dataset has an invalid sample total")
+        for mask_name, expected in expected_masks.items():
+            mask_path = f"mask/{mask_name}"
+            if mask_path not in dataset:
+                raise RuntimeError(
+                    f"temporary merged dataset is missing mask {mask_name}"
+                )
+            actual = _decode_hdf5_strings(dataset[mask_path][:])
+            if actual != expected:
+                raise RuntimeError(
+                    f"temporary merged dataset has invalid mask {mask_name}"
+                )
+        for demo_key in all_keys:
+            episode = dataset[f"data/{demo_key}"]
+            source_name = episode.attrs.get("source_shard")
+            fingerprint = episode.attrs.get(
+                "source_shard_provenance_fingerprint"
+            )
+            if isinstance(source_name, bytes):
+                source_name = source_name.decode("utf-8")
+            if isinstance(fingerprint, bytes):
+                fingerprint = fingerprint.decode("utf-8")
+            if source_fingerprints.get(str(source_name)) != fingerprint:
+                raise RuntimeError(
+                    f"temporary merged dataset has invalid source provenance for {demo_key}"
+                )
+
+
 def merge(args, shard_records: list[dict]) -> dict:
+    common_inputs, shard_provenances = validate_merge_shards(
+        args,
+        shard_records,
+    )
+    collection_provenance = collection_experiment_provenance(
+        args, shard_provenances, common_inputs=common_inputs
+    )
+
     merged_path = args.output_dir / args.merged_name
+    merged_resolved = merged_path.resolve()
+    if any(
+        Path(record["shard"]).resolve() == merged_resolved
+        for record in shard_records
+    ):
+        raise ValueError(
+            f"merged output collides with a source shard: {merged_path}"
+        )
     if merged_path.exists():
         if not args.force_merge:
             raise FileExistsError(
                 f"{merged_path} exists. Pass --force-merge to overwrite it."
             )
-        merged_path.unlink()
 
     successes, failures, all_keys = [], [], []
     random_exploration_episodes, no_random_exploration_episodes = [], []
@@ -505,7 +1062,34 @@ def merge(args, shard_records: list[dict]) -> dict:
     total_random_selection_decisions = 0
     total_non_greedy_selection_decisions = 0
     env_args = None
-    with h5py.File(merged_path, "w") as output:
+
+    def validate_temporary_merge(path: Path) -> None:
+        expected_masks = {
+            "all_rollouts": all_keys,
+            "all": all_keys,
+            "success": successes,
+            "failure": failures,
+        }
+        if args.idql_checkpoint is not None:
+            expected_masks.update(
+                {
+                    "random_exploration": random_exploration_episodes,
+                    "no_random_exploration": no_random_exploration_episodes,
+                }
+            )
+        validate_merged_output(
+            path,
+            args=args,
+            shard_records=shard_records,
+            common_inputs=common_inputs,
+            shard_provenances=shard_provenances,
+            collection_provenance=collection_provenance,
+            expected_masks=expected_masks,
+            all_keys=all_keys,
+            total_samples=total_samples,
+        )
+
+    with atomic_hdf5_output(merged_path, validate_temporary_merge) as output:
         output_data = output.create_group("data")
         output_index = 0
         for record in shard_records:
@@ -523,6 +1107,9 @@ def merge(args, shard_records: list[dict]) -> dict:
                     group.attrs["policy_success"] = bool(is_success)
                     group.attrs["source_shard"] = Path(record["shard"]).name
                     group.attrs["source_demo"] = key
+                    group.attrs["source_shard_provenance_fingerprint"] = record[
+                        PROVENANCE_KEY
+                    ]["fingerprint"]
                     if record.get("env_seed") is not None:
                         group.attrs["env_seed"] = int(record["env_seed"])
                     if record.get("policy_seed") is not None:
@@ -609,6 +1196,14 @@ def merge(args, shard_records: list[dict]) -> dict:
                     )
                     output_index += 1
 
+        output_data.attrs[SHARD_PROVENANCE_ATTR] = json.dumps(
+            collection_provenance,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+
         output_data.attrs["env_args"] = env_args
         output_data.attrs["total"] = total_samples
         if args.idql_checkpoint is not None:
@@ -634,6 +1229,7 @@ def merge(args, shard_records: list[dict]) -> dict:
 
     horizons = np.asarray([ep["horizon"] for ep in episode_records], dtype=np.float64)
     summary = {
+        PROVENANCE_KEY: collection_provenance,
         "policy_backend": "chunk_idql" if args.idql_checkpoint is not None else "robomimic_agent",
         "agent": None if args.agent is None else str(args.agent),
         "idql_checkpoint": (
@@ -802,6 +1398,10 @@ def main() -> None:
     parser.add_argument("--min-success-rollouts", type=int, default=None)
     parser.add_argument("--min-failure-rollouts", type=int, default=None)
     args = parser.parse_args()
+    try:
+        validate_collector_seeds(args)
+    except ValueError as error:
+        parser.error(str(error))
     for key in ("agent", "idql_checkpoint", "dp_checkpoint"):
         value = getattr(args, key)
         if value is not None:

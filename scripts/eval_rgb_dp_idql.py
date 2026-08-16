@@ -13,7 +13,9 @@ import json
 import math
 import os
 import random
+import tempfile
 from collections import deque
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -56,6 +58,92 @@ SELECTION_CHOICES = (
     "advantage_softmax",
     "epsilon_greedy",
 )
+TASK_ENV_NAMES = {
+    "square": "NutAssemblySquare",
+    "can": "PickPlaceCan",
+    "transport": "TwoArmTransport",
+    "tool_hang": "ToolHang",
+}
+RUNTIME_ONLY_ENV_KWARGS = frozenset(
+    (
+        "has_renderer",
+        "has_offscreen_renderer",
+        "ignore_done",
+        "render_gpu_device_id",
+        "reward_shaping",
+    )
+)
+UINT32_SEED_MODULUS = 1 << 32
+SEED_NORMALIZATION_SCHEME = "nonnegative_integer_modulo_2**32"
+
+
+def normalize_evaluation_seed(seed, *, label: str) -> int:
+    """Map a non-negative integer seed into NumPy's legacy uint32 domain."""
+    if isinstance(seed, (bool, np.bool_)) or not isinstance(
+        seed,
+        (int, np.integer),
+    ):
+        raise ValueError(
+            f"{label} must be a non-negative integer, got {seed!r}"
+        )
+    seed = int(seed)
+    if seed < 0:
+        raise ValueError(
+            f"{label} must be a non-negative integer, got {seed}"
+        )
+    return seed % UINT32_SEED_MODULUS
+
+
+def evaluation_seed_metadata(args) -> dict[str, Any]:
+    """Return requested and effective seeds shared by every RNG backend."""
+    raw_seed = args.seed
+    raw_env_seed = (
+        raw_seed
+        if getattr(args, "env_seed", None) is None
+        else args.env_seed
+    )
+    raw_policy_seed = (
+        raw_seed
+        if getattr(args, "policy_seed", None) is None
+        else args.policy_seed
+    )
+    effective_seed = normalize_evaluation_seed(raw_seed, label="--seed")
+    effective_env_seed = normalize_evaluation_seed(
+        raw_env_seed,
+        label="--env-seed",
+    )
+    effective_policy_seed = normalize_evaluation_seed(
+        raw_policy_seed,
+        label="--policy-seed",
+    )
+    requested_seed = int(raw_seed)
+    requested_env_seed = int(raw_env_seed)
+    requested_policy_seed = int(raw_policy_seed)
+    return {
+        "seed": requested_seed,
+        "env_seed": requested_env_seed,
+        "policy_seed": requested_policy_seed,
+        "requested_seed": requested_seed,
+        "requested_env_seed": requested_env_seed,
+        "requested_policy_seed": requested_policy_seed,
+        "effective_seed": effective_seed,
+        "effective_env_seed": effective_env_seed,
+        "effective_policy_seed": effective_policy_seed,
+        "seed_was_normalized": effective_seed != requested_seed,
+        "env_seed_was_normalized": effective_env_seed != requested_env_seed,
+        "policy_seed_was_normalized": (
+            effective_policy_seed != requested_policy_seed
+        ),
+        "seed_normalization_scheme": SEED_NORMALIZATION_SCHEME,
+        "seed_normalization_modulus": UINT32_SEED_MODULUS,
+    }
+
+
+def effective_policy_seed(args) -> int:
+    return int(evaluation_seed_metadata(args)["effective_policy_seed"])
+
+
+
 
 
 def choose_candidate_index(
@@ -105,6 +193,43 @@ def atomic_write_json(path: Path, payload: dict) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def ensure_dataset_target_available(
+    path: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    if path.exists() and not overwrite:
+        raise FileExistsError(
+            f"trajectory dataset already exists: {path}; "
+            "pass --overwrite-dataset to replace it after a successful evaluation"
+        )
+
+
+def make_temporary_dataset_path(path: Path, *, overwrite: bool) -> Path:
+    """Allocate a unique sibling file without touching the final dataset."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dataset_target_available(path, overwrite=overwrite)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    os.close(descriptor)
+    return Path(temporary)
+
+
+def publish_dataset(
+    temporary: Path,
+    destination: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    """Atomically publish a completed HDF5 file."""
+    ensure_dataset_target_available(destination, overwrite=overwrite)
+    os.replace(temporary, destination)
+
 
 
 def raw_rollout_env(env):
@@ -367,6 +492,7 @@ class PretrainedDPFirstActionIDQLPolicy:
     def __init__(
         self,
         dp_policy,
+        dp_ckpt: dict,
         critic: ChunkIQLCritic,
         checkpoint: dict,
         *,
@@ -381,6 +507,7 @@ class PretrainedDPFirstActionIDQLPolicy:
         execution_horizon: int,
     ):
         self.dp_policy = dp_policy
+        self.dp_ckpt = dp_ckpt
         self.algo = dp_policy.policy
         self.critic = critic
         self.checkpoint = checkpoint
@@ -988,6 +1115,272 @@ class PlainDPPolicy:
         return np.asarray(self.dp_policy(ob), dtype=np.float64).copy()
 
 
+def resolve_base_dp_checkpoint(checkpoint: dict, args) -> Path:
+    """Choose the DP checkpoint used to construct proposal actors and the env."""
+    embedded = Path(checkpoint["pretrained_dp_checkpoint"])
+    if args.actor_source == "external_dp_chunk_critic":
+        return Path(args.dp_checkpoint)
+    if args.actor_source != "hybrid_dp_chunk_actor":
+        return embedded
+
+    override_is_explicit = bool(
+        getattr(args, "dp_checkpoint_explicit", True)
+    )
+    if not override_is_explicit:
+        return embedded
+    override = getattr(args, "dp_checkpoint", None)
+    if override is None:
+        raise ValueError("explicit hybrid DP checkpoint is missing")
+    override = Path(override)
+    if not override.is_file():
+        raise FileNotFoundError(
+            f"explicit hybrid DP checkpoint does not exist: {override}"
+        )
+    if not checkpoint.get("rise_style_rgb_idql", False):
+        if override.expanduser().resolve() != embedded.expanduser().resolve():
+            raise ValueError(
+                "legacy hybrid checkpoints do not support a DP checkpoint override"
+            )
+        return embedded
+    return override
+
+
+def observation_shape_contract(
+    shape_metadata,
+    *,
+    label: str,
+) -> tuple[tuple[str, tuple[int, ...]], ...] | None:
+    """Return the ordered observation key/shape contract when metadata has one."""
+    if isinstance(shape_metadata, list):
+        shape_metadata = shape_metadata[0] if shape_metadata else None
+    if not isinstance(shape_metadata, dict):
+        return None
+    all_shapes = shape_metadata.get("all_shapes")
+    if not isinstance(all_shapes, dict):
+        return None
+    all_obs_keys = shape_metadata.get("all_obs_keys")
+    keys = list(all_shapes) if all_obs_keys is None else list(all_obs_keys)
+    contract = []
+    for key in keys:
+        if key not in all_shapes:
+            raise ValueError(
+                f"{label} shape_metadata lists missing observation key {key!r}"
+            )
+        flat_shape = np.asarray(all_shapes[key]).reshape(-1)
+        contract.append(
+            (str(key), tuple(int(value) for value in flat_shape.tolist()))
+        )
+    return tuple(contract)
+
+
+def validate_rise_dp_metadata(
+    dp_ckpt: dict,
+    checkpoint: dict,
+    *,
+    composition: str,
+) -> None:
+    """Validate task, environment, and saved observation contracts when present."""
+    actor_env = dp_ckpt.get("env_metadata")
+    task = checkpoint.get("task")
+    expected_env_name = TASK_ENV_NAMES.get(str(task)) if task is not None else None
+    if expected_env_name is not None:
+        actor_env_name = (
+            actor_env.get("env_name")
+            if isinstance(actor_env, dict)
+            else None
+        )
+        if actor_env_name != expected_env_name:
+            raise ValueError(
+                f"{composition} task={task!r} requires DP env_name="
+                f"{expected_env_name!r}, found {actor_env_name!r}"
+            )
+
+    reference_env = checkpoint.get("env_metadata")
+    if isinstance(reference_env, dict):
+        if not isinstance(actor_env, dict):
+            raise ValueError(
+                f"{composition} DP checkpoint is missing env_metadata"
+            )
+        for key in ("env_name", "type", "env_version"):
+            if key not in reference_env:
+                continue
+            if actor_env.get(key) != reference_env[key]:
+                raise ValueError(
+                    f"{composition} environment contract differs at "
+                    f"env_metadata.{key}: actor={actor_env.get(key)!r}, "
+                    f"training={reference_env[key]!r}"
+                )
+        reference_kwargs = reference_env.get("env_kwargs")
+        actor_kwargs = actor_env.get("env_kwargs")
+        if isinstance(reference_kwargs, dict):
+            if not isinstance(actor_kwargs, dict):
+                raise ValueError(
+                    f"{composition} DP checkpoint is missing env_metadata.env_kwargs"
+                )
+            for key, reference_value in reference_kwargs.items():
+                if key in RUNTIME_ONLY_ENV_KWARGS:
+                    continue
+                if key not in actor_kwargs or actor_kwargs[key] != reference_value:
+                    raise ValueError(
+                        f"{composition} environment contract differs at "
+                        f"env_metadata.env_kwargs.{key}: "
+                        f"actor={actor_kwargs.get(key)!r}, "
+                        f"training={reference_value!r}"
+                    )
+
+    reference_shape = observation_shape_contract(
+        checkpoint.get("shape_metadata"),
+        label="IDQL training DP",
+    )
+    if reference_shape is not None:
+        actor_shape = observation_shape_contract(
+            dp_ckpt.get("shape_metadata"),
+            label="actor DP",
+        )
+        if actor_shape is None:
+            raise ValueError(
+                f"{composition} DP checkpoint is missing shape_metadata"
+            )
+        reference_keys = tuple(key for key, _ in reference_shape)
+        actor_keys = tuple(key for key, _ in actor_shape)
+        if actor_keys != reference_keys:
+            raise ValueError(
+                f"{composition} observation keys differ: "
+                f"actor={actor_keys}, training={reference_keys}"
+            )
+        for (key, actor_dims), (_, reference_dims) in zip(
+            actor_shape,
+            reference_shape,
+        ):
+            if actor_dims != reference_dims:
+                raise ValueError(
+                    f"{composition} observation shape differs for {key!r}: "
+                    f"actor={actor_dims}, training={reference_dims}"
+                )
+
+
+def validate_rise_dp_composition(
+    dp_policy,
+    dp_ckpt: dict,
+    checkpoint: dict,
+    *,
+    actor_source: str,
+) -> None:
+    """Validate the normalized action space shared by a DP actor and critic."""
+    composition = (
+        "external DP composition"
+        if actor_source == "external_dp_chunk_critic"
+        else "hybrid DP composition"
+    )
+    validate_rise_dp_metadata(
+        dp_ckpt,
+        checkpoint,
+        composition=composition,
+    )
+    actor_action_dim = int(dp_policy.policy.ac_dim)
+    critic_action_dim = int(checkpoint["action_dim"])
+    if actor_action_dim != critic_action_dim:
+        raise ValueError(
+            f"{composition} action dimensions differ: "
+            f"actor={actor_action_dim}, critic={critic_action_dim}"
+        )
+    actor_action_stats = dp_ckpt.get("action_normalization_stats")
+    critic_action_stats = checkpoint.get("action_normalization_stats")
+    if actor_action_stats is None or critic_action_stats is None:
+        raise ValueError(
+            f"{composition} requires action normalization statistics "
+            "in both checkpoints"
+        )
+    if not action_normalization_stats_match(
+        actor_action_stats,
+        critic_action_stats,
+    ):
+        raise ValueError(
+            f"{composition} uses different normalized action spaces"
+        )
+    if checkpoint.get("rise_style_rgb_chunk_idql", False):
+        actor_horizon = dp_policy.policy.algo_config.horizon
+        critic_chunk_horizon = int(checkpoint["critic_chunk_horizon"])
+        if int(actor_horizon.action_horizon) < critic_chunk_horizon:
+            raise ValueError(
+                f"{composition} actor action horizon is shorter than the "
+                f"chunk critic: actor={int(actor_horizon.action_horizon)}, "
+                f"critic={critic_chunk_horizon}"
+            )
+
+
+def configure_dp_inference(
+    actor_algo,
+    *,
+    num_inference_steps: int,
+    diffusion_clip_sample: bool,
+) -> dict[str, Any]:
+    """Apply and verify inference controls used by DP trajectory sampling."""
+    num_inference_steps = int(num_inference_steps)
+    if num_inference_steps <= 0:
+        raise ValueError(
+            f"num_inference_steps must be positive, got {num_inference_steps}"
+        )
+    algo_config = actor_algo.algo_config
+    ddpm = getattr(algo_config, "ddpm", None)
+    ddim = getattr(algo_config, "ddim", None)
+    enabled = [
+        config
+        for config in (ddpm, ddim)
+        if config is not None and bool(getattr(config, "enabled", False))
+    ]
+    if len(enabled) != 1:
+        raise RuntimeError(
+            "loaded DP actor must have exactly one enabled diffusion scheduler"
+        )
+    inference_config = enabled[0]
+    num_train_timesteps = int(inference_config.num_train_timesteps)
+    if num_inference_steps > num_train_timesteps:
+        raise ValueError(
+            f"num_inference_steps={num_inference_steps} exceeds loaded DP "
+            f"num_train_timesteps={num_train_timesteps}"
+        )
+
+    unlock = (
+        algo_config.values_unlocked()
+        if hasattr(algo_config, "values_unlocked")
+        else nullcontext()
+    )
+    try:
+        with unlock:
+            inference_config.num_inference_timesteps = num_inference_steps
+            inference_config.clip_sample = bool(diffusion_clip_sample)
+    except Exception as exc:
+        raise RuntimeError(
+            "loaded DP config does not support inference overrides"
+        ) from exc
+
+    scheduler = getattr(actor_algo, "noise_scheduler", None)
+    if scheduler is None or not hasattr(scheduler, "config"):
+        raise RuntimeError("loaded DP actor has no configurable noise scheduler")
+    register_to_config = getattr(scheduler, "register_to_config", None)
+    if callable(register_to_config):
+        register_to_config(clip_sample=bool(diffusion_clip_sample))
+    elif bool(getattr(scheduler.config, "clip_sample", False)) != bool(
+        diffusion_clip_sample
+    ):
+        raise RuntimeError(
+            "loaded DP scheduler does not support --diffusion-clip-sample"
+        )
+
+    if int(inference_config.num_inference_timesteps) != num_inference_steps:
+        raise RuntimeError("loaded DP actor ignored --num-inference-steps")
+    if bool(getattr(scheduler.config, "clip_sample", False)) != bool(
+        diffusion_clip_sample
+    ):
+        raise RuntimeError("loaded DP scheduler ignored --diffusion-clip-sample")
+    return {
+        "dp_num_inference_timesteps": num_inference_steps,
+        "dp_clip_sample": bool(diffusion_clip_sample),
+        "dp_inference_cli_applied": True,
+    }
+
+
 def load_policy(idql_checkpoint: Path, device: torch.device, args):
     if args.actor_source == "plain_dp":
         if int(args.num_candidates) != 1:
@@ -1016,14 +1409,16 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             f"found {checkpoint_task!r} in {idql_checkpoint}"
         )
     external_dp_chunk_critic = args.actor_source == "external_dp_chunk_critic"
-    dp_checkpoint = (
-        args.dp_checkpoint
-        if external_dp_chunk_critic
-        else Path(checkpoint["pretrained_dp_checkpoint"])
-    )
+    dp_checkpoint = resolve_base_dp_checkpoint(checkpoint, args)
     dp_policy, dp_ckpt = FileUtils.policy_from_checkpoint(
         ckpt_path=str(dp_checkpoint), device=device, verbose=False
     )
+    if args.actor_source in (
+        "hybrid_dp_chunk_actor",
+        "external_dp_chunk_critic",
+        "pretrained_dp_first_action",
+    ):
+        checkpoint["actor_dp_checkpoint"] = str(dp_checkpoint)
 
     rise_style_rgb_idql = bool(checkpoint.get("rise_style_rgb_idql", False))
     if rise_style_rgb_idql:
@@ -1041,39 +1436,16 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
                     "actor_source=external_dp_chunk_critic requires a RISE-style "
                     "chunk-IDQL critic checkpoint"
                 )
-            actor_action_dim = int(dp_policy.policy.ac_dim)
-            critic_action_dim = int(checkpoint["action_dim"])
-            if actor_action_dim != critic_action_dim:
-                raise ValueError(
-                    "external DP and chunk critic action dimensions differ: "
-                    f"actor={actor_action_dim}, critic={critic_action_dim}"
-                )
-            actor_action_stats = dp_ckpt.get("action_normalization_stats")
-            critic_action_stats = checkpoint.get("action_normalization_stats")
-            if actor_action_stats is None or critic_action_stats is None:
-                raise ValueError(
-                    "external DP composition requires action normalization statistics "
-                    "in both checkpoints"
-                )
-            if not action_normalization_stats_match(
-                actor_action_stats,
-                critic_action_stats,
-            ):
-                raise ValueError(
-                    "external DP and chunk critic use different normalized action spaces"
-                )
-            actor_horizon = dp_policy.policy.algo_config.horizon
-            critic_chunk_horizon = int(checkpoint["critic_chunk_horizon"])
-            if int(actor_horizon.action_horizon) < critic_chunk_horizon:
-                raise ValueError(
-                    "external DP action horizon is shorter than the chunk critic: "
-                    f"actor={int(actor_horizon.action_horizon)}, "
-                    f"critic={critic_chunk_horizon}"
-                )
-            checkpoint["critic_training_dp_checkpoint"] = str(
-                checkpoint["pretrained_dp_checkpoint"]
-            )
-            checkpoint["actor_dp_checkpoint"] = str(dp_checkpoint)
+        validate_rise_dp_composition(
+            dp_policy,
+            dp_ckpt,
+            checkpoint,
+            actor_source=args.actor_source,
+        )
+        checkpoint["critic_training_dp_checkpoint"] = str(
+            checkpoint["pretrained_dp_checkpoint"]
+        )
+        if external_dp_chunk_critic:
             checkpoint["external_dp_chunk_critic"] = True
             checkpoint["actor_loaded_from_idql_checkpoint"] = False
             checkpoint["eval_actor_key"] = (
@@ -1088,9 +1460,7 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             )
             checkpoint["external_dp_chunk_critic"] = False
             checkpoint["actor_loaded_from_idql_checkpoint"] = True
-            checkpoint["actor_dp_checkpoint"] = str(
-                checkpoint["pretrained_dp_checkpoint"]
-            )
+            checkpoint["actor_dp_checkpoint"] = str(dp_checkpoint)
             checkpoint["eval_actor_key"] = (
                 "actor_model.ema"
                 if dp_policy.policy.ema is not None
@@ -1114,6 +1484,13 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
         checkpoint["visual_critic_idql"] = True
         checkpoint["hybrid_dp_chunk_actor_iql"] = True
         checkpoint.update(dp_eval_metadata(dp_ckpt))
+        checkpoint.update(
+            configure_dp_inference(
+                dp_policy.policy,
+                num_inference_steps=args.num_inference_steps,
+                diffusion_clip_sample=args.diffusion_clip_sample,
+            )
+        )
 
         selected_critics = torch.nn.ModuleList()
         vf = None
@@ -1243,9 +1620,7 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             selection=args.selection,
             softmax_temperature=args.softmax_temperature,
             random_selection_probability=args.random_selection_probability,
-            selection_seed=(
-                args.policy_seed if args.policy_seed is not None else args.seed
-            ),
+            selection_seed=effective_policy_seed(args),
             clip_actions=args.clip_actions,
             execution_horizon=args.execution_horizon,
         )
@@ -1335,6 +1710,7 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
     if args.actor_source in ("pretrained_dp_first_action", "hybrid_dp_chunk_actor"):
         return PretrainedDPFirstActionIDQLPolicy(
             dp_policy,
+            dp_ckpt,
             critic,
             checkpoint,
             critic_obs_encoder=critic_obs_encoder,
@@ -1343,9 +1719,7 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             selection=args.selection,
             softmax_temperature=args.softmax_temperature,
             random_selection_probability=args.random_selection_probability,
-            selection_seed=(
-                args.policy_seed if args.policy_seed is not None else args.seed
-            ),
+            selection_seed=effective_policy_seed(args),
             clip_actions=args.clip_actions,
             execution_horizon=args.execution_horizon,
         )
@@ -1374,9 +1748,7 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
         selection=args.selection,
         softmax_temperature=args.softmax_temperature,
         random_selection_probability=args.random_selection_probability,
-        selection_seed=(
-            args.policy_seed if args.policy_seed is not None else args.seed
-        ),
+        selection_seed=effective_policy_seed(args),
         clip_actions=args.clip_actions,
         diffusion_clip_sample=args.diffusion_clip_sample,
     )
@@ -1559,6 +1931,7 @@ def wilson(successes: int, total: int, z: float = 1.959963984540054):
 def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
     avg = aggregate(stats)
     successes = int(round(avg["Num_Success"]))
+    seed_metadata = evaluation_seed_metadata(args)
     standard_idql_actor = args.actor_source in ("idql_one_step_mlp", "idql_target_one_step_mlp")
     pretrained_dp_actor = args.actor_source == "pretrained_dp_first_action"
     hybrid_dp_chunk_actor = args.actor_source == "hybrid_dp_chunk_actor"
@@ -1570,8 +1943,8 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         "task": policy.checkpoint.get("task"),
         "dp_checkpoint": (
             str(args.dp_checkpoint)
-            if plain_dp_actor or external_dp_chunk_critic
-            else None
+            if plain_dp_actor
+            else policy.checkpoint.get("actor_dp_checkpoint")
         ),
         "pretrained_dp_checkpoint": str(policy.checkpoint["pretrained_dp_checkpoint"]),
         "actor_dp_checkpoint": policy.checkpoint.get("actor_dp_checkpoint"),
@@ -1623,9 +1996,10 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
             None if plain_dp_actor else args.random_selection_probability
         ),
         "selection_seed": (
-            None
-            if plain_dp_actor
-            else (args.policy_seed if args.policy_seed is not None else args.seed)
+            None if plain_dp_actor else seed_metadata["effective_policy_seed"]
+        ),
+        "requested_selection_seed": (
+            None if plain_dp_actor else seed_metadata["requested_policy_seed"]
         ),
         "clip_actions": None if plain_dp_actor else args.clip_actions,
         "diffusion_clip_sample": bool(policy.checkpoint.get("dp_clip_sample", args.diffusion_clip_sample)),
@@ -1638,6 +2012,9 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         "dp_num_inference_timesteps": policy.checkpoint.get("dp_num_inference_timesteps"),
         "dp_beta_schedule": policy.checkpoint.get("dp_beta_schedule"),
         "dp_clip_sample": policy.checkpoint.get("dp_clip_sample"),
+        "dp_inference_cli_applied": bool(
+            policy.checkpoint.get("dp_inference_cli_applied", False)
+        ),
         "dp_prediction_type": policy.checkpoint.get("dp_prediction_type"),
         "dp_ema_enabled": policy.checkpoint.get("dp_ema_enabled"),
         "success_condition_adapter_in_nets": policy.checkpoint.get("success_condition_adapter_in_nets", False),
@@ -1666,9 +2043,7 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         "execution_horizon": int(policy.checkpoint.get("execution_horizon", 1)),
         "replan_every_env_step": bool(policy.checkpoint.get("replan_every_env_step", True)),
         "critic_used_for_action_selection": bool((not plain_dp_actor) and args.num_candidates > 1),
-        "seed": args.seed,
-        "env_seed": args.env_seed if args.env_seed is not None else args.seed,
-        "policy_seed": args.policy_seed if args.policy_seed is not None else args.seed,
+        **seed_metadata,
         "n_rollouts": args.n_rollouts,
         "completed_rollouts": len(stats),
         "complete": bool(complete),
@@ -1676,6 +2051,9 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         "env_hard_reset": bool(args.env_hard_reset),
         "reset_to_initial_state": bool(args.reset_to_initial_state),
         "trajectory_collection_enabled": args.dataset_path is not None,
+        "trajectory_dataset_overwrite": bool(
+            getattr(args, "overwrite_dataset", False)
+        ),
         "average_rollout_stats": avg,
         "wilson_95_interval": wilson(successes, len(stats)),
         "rollouts": stats,
@@ -1696,11 +2074,26 @@ def write_summary(args, policy, stats: list[dict], complete: bool, suffix: str =
 
 
 def evaluate(args) -> dict:
+    seed_metadata = evaluation_seed_metadata(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     env = None
     dataset_writer = None
+    dataset_temporary_path = None
+    overwrite_dataset = bool(getattr(args, "overwrite_dataset", False))
+    if args.dataset_path is not None:
+        ensure_dataset_target_available(
+            args.dataset_path,
+            overwrite=overwrite_dataset,
+        )
     try:
         device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
+        env_seed = int(seed_metadata["effective_env_seed"])
+        policy_seed = int(seed_metadata["effective_policy_seed"])
+        random.seed(env_seed)
+        np.random.seed(env_seed)
+        torch.manual_seed(policy_seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(policy_seed)
         policy = load_policy(args.idql_checkpoint, device, args)
         dp_ckpt = getattr(policy, "dp_ckpt", None)
         if dp_ckpt is None:
@@ -1723,14 +2116,6 @@ def evaluate(args) -> dict:
             f"record_trajectory={args.dataset_path is not None}",
             flush=True,
         )
-        env_seed = args.env_seed if args.env_seed is not None else args.seed
-        policy_seed = args.policy_seed if args.policy_seed is not None else args.seed
-        random.seed(env_seed)
-        np.random.seed(env_seed)
-        torch.manual_seed(policy_seed)
-        if device.type == "cuda":
-            torch.cuda.manual_seed_all(policy_seed)
-
         imageio = None
         if args.video_dir is not None:
             import imageio.v2 as imageio
@@ -1742,14 +2127,31 @@ def evaluate(args) -> dict:
         if args.dataset_path is not None:
             import h5py
 
-            args.dataset_path.parent.mkdir(parents=True, exist_ok=True)
-            dataset_writer = h5py.File(args.dataset_path, "w")
+            dataset_temporary_path = make_temporary_dataset_path(
+                args.dataset_path,
+                overwrite=overwrite_dataset,
+            )
+            dataset_writer = h5py.File(dataset_temporary_path, "w")
             data_group = dataset_writer.create_group("data")
             data_group.attrs["env_args"] = json.dumps(env.serialize(), indent=4)
             data_group.attrs["selection"] = args.selection
             data_group.attrs["random_selection_probability"] = float(
                 args.random_selection_probability
             )
+            data_group.attrs["seed_normalization_scheme"] = (
+                seed_metadata["seed_normalization_scheme"]
+            )
+            data_group.attrs["seed_normalization_modulus"] = int(
+                seed_metadata["seed_normalization_modulus"]
+            )
+            data_group.attrs["requested_env_seed"] = int(
+                seed_metadata["requested_env_seed"]
+            )
+            data_group.attrs["requested_policy_seed"] = int(
+                seed_metadata["requested_policy_seed"]
+            )
+            data_group.attrs["effective_env_seed"] = env_seed
+            data_group.attrs["effective_policy_seed"] = policy_seed
 
         stats = []
         for i in range(args.n_rollouts):
@@ -1809,8 +2211,12 @@ def evaluate(args) -> dict:
                 ep.attrs["num_samples"] = int(traj["actions"].shape[0])
                 ep.attrs["success"] = float(rollout_stats["Success_Rate"])
                 ep.attrs["episode_return"] = float(rollout_stats["Return"])
-                ep.attrs["env_seed"] = int(env_seed)
-                ep.attrs["policy_seed"] = int(policy_seed)
+                ep.attrs["env_seed"] = int(seed_metadata["requested_env_seed"])
+                ep.attrs["policy_seed"] = int(
+                    seed_metadata["requested_policy_seed"]
+                )
+                ep.attrs["effective_env_seed"] = env_seed
+                ep.attrs["effective_policy_seed"] = policy_seed
                 ep.attrs["selection"] = args.selection
                 ep.attrs["random_selection_probability"] = float(
                     args.random_selection_probability
@@ -1826,6 +2232,13 @@ def evaluate(args) -> dict:
 
         path = write_summary(args, policy, stats, complete=True, suffix="")
         summary = json.loads(path.read_text())
+        if dataset_temporary_path is not None:
+            publish_dataset(
+                dataset_temporary_path,
+                args.dataset_path,
+                overwrite=overwrite_dataset,
+            )
+            dataset_temporary_path = None
         print(json.dumps(summary, indent=2), flush=True)
         print(f"Wrote {path}", flush=True)
         return summary
@@ -1835,6 +2248,14 @@ def evaluate(args) -> dict:
                 dataset_writer.close()
             except Exception as exc:
                 print(f"WARNING: failed to close rollout dataset: {exc}", flush=True)
+        if dataset_temporary_path is not None:
+            try:
+                dataset_temporary_path.unlink(missing_ok=True)
+            except Exception as exc:
+                print(
+                    f"WARNING: failed to remove temporary dataset: {exc}",
+                    flush=True,
+                )
         if env is not None:
             try:
                 close_rollout_env(env)
@@ -1845,7 +2266,7 @@ def evaluate(args) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--idql-checkpoint", type=Path, default=DEFAULT_IDQL)
-    parser.add_argument("--dp-checkpoint", type=Path, default=DEFAULT_DP)
+    parser.add_argument("--dp-checkpoint", type=Path, default=None)
     parser.add_argument(
         "--expected-task",
         choices=("square", "can", "transport", "tool_hang"),
@@ -1935,11 +2356,28 @@ def main() -> None:
     parser.add_argument("--inference-success-condition", type=float, default=1.0)
     parser.add_argument("--inference-condition-mask", type=float, default=1.0)
     parser.add_argument("--dataset-path", type=Path, default=None)
+    parser.add_argument(
+        "--overwrite-dataset",
+        action="store_true",
+        help="Atomically replace an existing --dataset-path only after success.",
+    )
+
     parser.add_argument("--video-dir", type=Path, default=None)
     parser.add_argument("--num-videos", type=int, default=0)
     parser.add_argument("--video-skip", type=int, default=5)
     parser.add_argument("--camera-names", type=str, nargs="+", default=("agentview", "robot0_eye_in_hand"))
     args = parser.parse_args()
+    args.dp_checkpoint_explicit = args.dp_checkpoint is not None
+    if args.dp_checkpoint is None:
+        args.dp_checkpoint = DEFAULT_DP
+    if args.overwrite_dataset and args.dataset_path is None:
+        parser.error("--overwrite-dataset requires --dataset-path")
+    if args.num_inference_steps <= 0:
+        parser.error("--num-inference-steps must be positive")
+    try:
+        evaluation_seed_metadata(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.require_success_condition_adapter and args.forbid_success_condition_adapter:
         parser.error(
             "--require-success-condition-adapter and "

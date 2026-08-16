@@ -120,6 +120,45 @@ def _conversion_manifest(args):
     )
 
 
+def validate_conversion_output(output_path, expected_manifest):
+    """Verify that a completed output matches its source and conversion options."""
+    if not os.path.isfile(output_path):
+        raise FileNotFoundError(
+            "converted dataset does not exist at {}".format(output_path)
+        )
+    with h5py.File(output_path, "r") as output:
+        status = output.attrs.get(_CONVERSION_STATUS_ATTR, None)
+        manifest = output.attrs.get(_CONVERSION_MANIFEST_ATTR, None)
+    if isinstance(status, bytes):
+        status = status.decode("utf-8")
+    if isinstance(manifest, bytes):
+        manifest = manifest.decode("utf-8")
+    if status != "complete":
+        raise RuntimeError(
+            "converted dataset at {} has status {!r}, expected 'complete'".format(
+                output_path, status
+            )
+        )
+    if manifest != expected_manifest:
+        try:
+            actual = json.loads(manifest) if manifest is not None else {}
+            expected = json.loads(expected_manifest)
+            mismatches = sorted(
+                key
+                for key in set(actual).union(expected)
+                if actual.get(key) != expected.get(key)
+            )
+        except (TypeError, ValueError):
+            mismatches = ["unreadable_manifest"]
+        raise RuntimeError(
+            "converted dataset provenance does not match the requested "
+            "source/options at {}: mismatched fields={}".format(
+                output_path, mismatches
+            )
+        )
+    print("validated converted dataset provenance: {}".format(output_path))
+
+
 def _close_hdf5(file_handle):
     if file_handle is not None and file_handle.id.valid:
         file_handle.close()
@@ -296,6 +335,14 @@ def dataset_states_to_obs(args):
     partial_path = output_path + ".partial"
     if os.path.realpath(output_path) == os.path.realpath(args.dataset):
         raise ValueError("output dataset must differ from the input dataset")
+    manifest = _conversion_manifest(args)
+    if getattr(args, "validate_only", False):
+        if args.overwrite or args.restart:
+            raise ValueError(
+                "--validate-only cannot be combined with --overwrite or --restart"
+            )
+        validate_conversion_output(output_path, manifest)
+        return
     if os.path.exists(output_path) and not args.overwrite:
         raise FileExistsError(
             "output dataset already exists at {}. Refusing to overwrite it; "
@@ -310,8 +357,6 @@ def dataset_states_to_obs(args):
             "partial conversion already exists at {}. Re-run with --resume "
             "or --restart.".format(partial_path)
         )
-
-    manifest = _conversion_manifest(args)
 
     # create environment to use for data processing
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=args.dataset)
@@ -634,6 +679,15 @@ if __name__ == "__main__":
         "--overwrite",
         action="store_true",
         help="atomically replace an existing completed output dataset",
+    )
+
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help=(
+            "verify that an existing completed output matches the source "
+            "file and conversion options without opening it for writing"
+        ),
     )
 
     parser.add_argument(

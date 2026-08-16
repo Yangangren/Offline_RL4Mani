@@ -18,14 +18,14 @@ SUCCESS_RATES = np.array(
     [
         [90.0, 78.8, 87.6, 51.6],  # SUB
         [94.4, 82.4, 84.0, 72.4],  # SUB + condition (actor)
-        [98.4, 88.0, 89.6, 71.6],  # RAL (actor + critic)
+        [98.4, 88.0, 90.4, 71.6],  # RAL (actor + critic)
     ]
 )
 STANDARD_DEVIATIONS = np.array(
     [
         [2.8, 4.4, 2.6, 3.8],
         [4.3, 7.4, 5.1, 8.9],
-        [1.7, 3.1, 4.3, 5.0],
+        [1.7, 3.1, 4.6, 5.0],
     ]
 )
 

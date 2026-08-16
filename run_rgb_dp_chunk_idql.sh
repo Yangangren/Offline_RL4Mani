@@ -3,6 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+USER_ROLLOUT_DATASET_SET=${ROLLOUT_DATASET+x}
+USER_IDQL_DATASET_SET=${IDQL_DATASET+x}
+USER_CHUNK_IDQL_OUTPUT_DIR_SET=${CHUNK_IDQL_OUTPUT_DIR+x}
+USER_CHUNK_EVAL_OUTPUT_SET=${CHUNK_EVAL_OUTPUT+x}
+USER_CHUNK_IDQL_CHECKPOINT_SET=${CHUNK_IDQL_CHECKPOINT+x}
+USER_SUCCESS_MASK_SET=${SUCCESS_MASK+x}
+USER_SUCCESS_COUNT_SET=${SUCCESS_COUNT+x}
+USER_FAILURE_MASK_SET=${FAILURE_MASK+x}
+USER_FAILURE_COUNT_SET=${FAILURE_COUNT+x}
+
 first_arg=${1:-}
 first_arg=${first_arg,,}
 first_arg=${first_arg//-/_}
@@ -15,6 +25,7 @@ TASK=${TASK,,}
 STAGE=${1:-train_chunk_idql_resilient}
 ROUND2_CHUNK_TRAINING=0
 TASK_SOURCE_CHUNK_IDQL_CHECKPOINT=
+TASK_CHUNK_CONDITION_HIDDEN_DIM=256
 
 case "$TASK" in
   square)
@@ -91,7 +102,7 @@ case "$TASK" in
     ;;
   tool_hang)
     TASK_DP_CHECKPOINT=trained_models/tool_hang_rgb_dp/tool_hang_ph_rgb_dp_official_s1/models/model_epoch_200.pth
-    TASK_EXPERT_DATASET=datasets/tool_hang/ph/image_v15.hdf5
+    TASK_EXPERT_DATASET=datasets/tool_hang/ph/image_v15.rebuilt.hdf5
     TASK_ROLLOUT_DATASET=rollouts/tool_hang_rgb_dp/epoch200_collection/tool_hang_rgb_dp_rollouts_rgb2.hdf5
     TASK_IDQL_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_100success_50failure.hdf5
     TASK_IDQL_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/idql/200demo_100success_50failure
@@ -119,6 +130,26 @@ case "$TASK" in
     ;;
 esac
 
+# RGB observations materialized from state-only collection files must match
+# the camera contract used by each task's pretrained diffusion policy.
+case "$TASK" in
+  square|can)
+    TASK_COLLECTION_CAMERA_NAMES="agentview robot0_eye_in_hand"
+    TASK_COLLECTION_CAMERA_SIZE=84
+    TASK_COLLECTION_RGB_TAG=rgb2
+    ;;
+  transport)
+    TASK_COLLECTION_CAMERA_NAMES="shouldercamera0 shouldercamera1 robot0_eye_in_hand robot1_eye_in_hand"
+    TASK_COLLECTION_CAMERA_SIZE=84
+    TASK_COLLECTION_RGB_TAG=rgb4
+    ;;
+  tool_hang)
+    TASK_COLLECTION_CAMERA_NAMES="sideview robot0_eye_in_hand"
+    TASK_COLLECTION_CAMERA_SIZE=240
+    TASK_COLLECTION_RGB_TAG=rgb2
+    ;;
+esac
+
 case "$STAGE" in
   train_chunk_idql_round2|train_chunk_idql_round2_resilient)
     if [[ "$TASK" != "square" ]]; then
@@ -126,12 +157,9 @@ case "$STAGE" in
       exit 2
     fi
     ROUND2_CHUNK_TRAINING=1
-    TASK_ROLLOUT_DATASET=rollouts/square_rgb_dp/chunk_idql/round2_N4_collection/square_rgb_dp_chunk_idql_round2_N4_rollouts_rgb2.hdf5
-    TASK_IDQL_DATASET=datasets/square/idql/square_rgb_dp_chunk_idql_round2_N4_200demo_100success_50failure.hdf5
-    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/square_rgb_dp/chunk_idql/round2_N4_200demo_100success_50failure_h8_dynamics_human_condition
-    TASK_CHUNK_EVAL_OUTPUT=rollouts/square_rgb_dp/chunk_idql/round2_N4_200demo_100success_50failure_h8_dynamics_human_condition
     TASK_CHUNK_INITIALIZATION=source_chunk_idql_joint
     TASK_SOURCE_CHUNK_IDQL_CHECKPOINT=trained_models/square_rgb_dp/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition_task_reward/models/model_epoch_50.pt
+    TASK_CHUNK_CONDITION_HIDDEN_DIM=128
     ;;
 esac
 
@@ -245,8 +273,8 @@ FAILURE_COUNT=${FAILURE_COUNT:-$TASK_FAILURE_COUNT}
 # quotas are available for the next 100-success / 50-failure training split.
 COLLECTION_NUM_CANDIDATES=${COLLECTION_NUM_CANDIDATES:-4}
 # Collection deliberately explores outside the current critic's argmax support.
-# With N=4 and p=0.25, one quarter of replan decisions select uniformly among
-# the four actor proposals; all other decisions use argmax min(Q1, Q2).
+# With the defaults, half of replan decisions select uniformly among the four
+# actor proposals; all other decisions use argmax min(Q1, Q2).
 COLLECTION_SELECTION=${COLLECTION_SELECTION:-epsilon_greedy}
 if [[ "$COLLECTION_SELECTION" == "epsilon_greedy" ]]; then
   COLLECTION_RANDOM_SELECTION_PROBABILITY=${COLLECTION_RANDOM_SELECTION_PROBABILITY:-0.5}
@@ -260,7 +288,7 @@ else
   DEFAULT_COLLECTION_POLICY_TAG=$COLLECTION_SELECTION
 fi
 COLLECTION_POLICY_TAG=${COLLECTION_POLICY_TAG:-$DEFAULT_COLLECTION_POLICY_TAG}
-COLLECTION_ROUND_LABEL=${COLLECTION_ROUND_LABEL:-round2}
+COLLECTION_ROUND_LABEL=${COLLECTION_ROUND_LABEL:-round2_new}
 COLLECTION_TOTAL_ROLLOUTS=${COLLECTION_TOTAL_ROLLOUTS:-700}
 COLLECTION_SEED_BASE=${COLLECTION_SEED_BASE:-1000}
 # Training-data collection uses several rollouts from each seeded subprocess.
@@ -280,6 +308,130 @@ COLLECTION_MIN_SUCCESS_ROLLOUTS=${COLLECTION_MIN_SUCCESS_ROLLOUTS:-100}
 COLLECTION_MIN_FAILURE_ROLLOUTS=${COLLECTION_MIN_FAILURE_ROLLOUTS:-50}
 COLLECTION_OUTPUT_DIR=${COLLECTION_OUTPUT_DIR:-rollouts/${TASK}_rgb_dp/chunk_idql/${COLLECTION_ROUND_LABEL}_N${COLLECTION_NUM_CANDIDATES}_${COLLECTION_POLICY_TAG}_${COLLECTION_SEED_LAYOUT_TAG}_collection}
 COLLECTION_RAW_NAME=${COLLECTION_RAW_NAME:-${TASK}_rgb_dp_chunk_idql_${COLLECTION_ROUND_LABEL}_N${COLLECTION_NUM_CANDIDATES}_${COLLECTION_POLICY_TAG}_${COLLECTION_SEED_LAYOUT_TAG}_rollouts_raw.hdf5}
+COLLECTION_RGB_NAME=${COLLECTION_RGB_NAME:-${TASK}_rgb_dp_chunk_idql_${COLLECTION_ROUND_LABEL}_N${COLLECTION_NUM_CANDIDATES}_${COLLECTION_POLICY_TAG}_${COLLECTION_SEED_LAYOUT_TAG}_rollouts_${TASK_COLLECTION_RGB_TAG}.hdf5}
+COLLECTION_CAMERA_NAMES=${COLLECTION_CAMERA_NAMES:-$TASK_COLLECTION_CAMERA_NAMES}
+COLLECTION_CAMERA_SIZE=${COLLECTION_CAMERA_SIZE:-$TASK_COLLECTION_CAMERA_SIZE}
+read -r -a COLLECTION_CAMERA_NAME_ARRAY <<< "$COLLECTION_CAMERA_NAMES"
+# Existing RGB outputs are accepted only when their conversion manifest matches.
+# Set COLLECTION_RGB_OVERWRITE=1 to replace one atomically, and additionally
+# COLLECTION_RGB_RESTART=1 to discard an incompatible partial conversion.
+# Round-2 training consumes the exact collection lineage produced by the
+# collection stage, unless the user explicitly overrides an individual path.
+if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
+  round2_lineage=${COLLECTION_ROUND_LABEL}_N${COLLECTION_NUM_CANDIDATES}_${COLLECTION_POLICY_TAG}_${COLLECTION_SEED_LAYOUT_TAG}
+  round2_dataset_base=datasets/square/idql/square_rgb_dp_chunk_idql_${round2_lineage}_200demo_100success_50failure
+  round2_output_base=trained_models/square_rgb_dp/chunk_idql/${round2_lineage}_200demo_100success_50failure_h8_dynamics_human_condition
+  round2_eval_base=rollouts/square_rgb_dp/chunk_idql/${round2_lineage}_200demo_100success_50failure_h8_dynamics_human_condition
+  if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "human_success" ]]; then
+    round2_dataset_base=${round2_dataset_base}_human_success_condition
+    round2_output_base=${round2_output_base/human_condition/human_success_condition}
+    round2_eval_base=${round2_eval_base/human_condition/human_success_condition}
+  fi
+  if [[ "$IDQL_REWARD_MODE" == "task" ]]; then
+    round2_dataset_default=${round2_dataset_base}_task_reward.hdf5
+    round2_output_default=${round2_output_base}_task_reward
+    round2_eval_default=${round2_eval_base}_task_reward
+  else
+    round2_dataset_default=${round2_dataset_base}.hdf5
+    round2_output_default=$round2_output_base
+    round2_eval_default=$round2_eval_base
+  fi
+  if [[ -z "$USER_ROLLOUT_DATASET_SET" ]]; then
+    ROLLOUT_DATASET=$COLLECTION_OUTPUT_DIR/$COLLECTION_RGB_NAME
+  fi
+  if [[ -z "$USER_SUCCESS_MASK_SET" ]]; then
+    SUCCESS_MASK=success
+  fi
+  if [[ -z "$USER_SUCCESS_COUNT_SET" ]]; then
+    SUCCESS_COUNT=100
+  fi
+  if [[ -z "$USER_FAILURE_MASK_SET" ]]; then
+    FAILURE_MASK=failure
+  fi
+  if [[ -z "$USER_FAILURE_COUNT_SET" ]]; then
+    FAILURE_COUNT=50
+  fi
+  if [[ -z "$USER_IDQL_DATASET_SET" ]]; then
+    IDQL_DATASET=$round2_dataset_default
+  fi
+  if [[ -z "$USER_CHUNK_IDQL_OUTPUT_DIR_SET" ]]; then
+    CHUNK_IDQL_OUTPUT_DIR=$round2_output_default
+  fi
+  if [[ -z "$USER_CHUNK_EVAL_OUTPUT_SET" ]]; then
+    CHUNK_EVAL_OUTPUT=$round2_eval_default
+  fi
+fi
+
+resolve_existing_chunk_checkpoint() {
+  local output_dir=$1
+  local requested_epoch=${CHUNK_EPOCHS:-$TASK_CHUNK_EPOCHS}
+  local candidate="$output_dir/models/model_epoch_${requested_epoch}.pt"
+  local best=
+  local best_epoch=-1
+  if [[ -f "$candidate" && -s "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  for candidate in "$output_dir/latest.pt" "$output_dir/last.pt"; do
+    if [[ -f "$candidate" && -s "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  for candidate in "$output_dir"/models/model_epoch_*.pt; do
+    if [[ -f "$candidate" && -s "$candidate" && "${candidate##*/}" =~ ^model_epoch_([0-9]+)\.pt$ ]]; then
+      if (( 10#${BASH_REMATCH[1]} > best_epoch )); then
+        best_epoch=$((10#${BASH_REMATCH[1]}))
+        best=$candidate
+      fi
+    fi
+  done
+  if [[ -n "$best" ]]; then
+    printf '%s\n' "$best"
+  fi
+}
+
+if [[ -z "$USER_CHUNK_IDQL_CHECKPOINT_SET" ]]; then
+  CHUNK_IDQL_CHECKPOINT=$(resolve_existing_chunk_checkpoint "$CHUNK_IDQL_OUTPUT_DIR")
+  CHUNK_IDQL_CHECKPOINT=${CHUNK_IDQL_CHECKPOINT:-$CHUNK_IDQL_OUTPUT_DIR/last.pt}
+fi
+chunk_training_is_complete() {
+  local summary=$CHUNK_IDQL_OUTPUT_DIR/summary.json
+  local requested_epochs=${CHUNK_EPOCHS:-$TASK_CHUNK_EPOCHS}
+  local completed_epoch
+  if [[ ! -f "$summary" ]]; then
+    return 1
+  fi
+  if ! completed_epoch=$("$PYTHON" -c 'import json, sys; print(int(json.load(open(sys.argv[1], encoding="utf-8"))["last_completed_epoch"]))' "$summary"); then
+    return 1
+  fi
+  if (( completed_epoch < requested_epochs )); then
+    return 1
+  fi
+  if [[ ! -f "$CHUNK_IDQL_CHECKPOINT" || ! -s "$CHUNK_IDQL_CHECKPOINT" ]]; then
+    echo "[rgb_dp_chunk_idql] summary reports completed epoch=$completed_epoch, but no usable checkpoint resolved: $CHUNK_IDQL_CHECKPOINT" >&2
+    echo "[rgb_dp_chunk_idql] refusing to no-op or overwrite a completed output without a recoverable checkpoint." >&2
+    exit 1
+  fi
+  echo "[rgb_dp_chunk_idql] validating completed checkpoint recipe: $CHUNK_IDQL_CHECKPOINT" >&2
+  if ! CHUNK_VALIDATE_RESUME_ONLY=1 run_chunk_train "$CHUNK_IDQL_CHECKPOINT"; then
+    echo "[rgb_dp_chunk_idql] completed checkpoint does not match the requested recipe" >&2
+    exit 1
+  fi
+
+  echo "[rgb_dp_chunk_idql] output already completed epoch=$completed_epoch (requested=$requested_epochs): $CHUNK_IDQL_OUTPUT_DIR" >&2
+  echo "[rgb_dp_chunk_idql] leaving completed artifacts untouched; use a new CHUNK_IDQL_OUTPUT_DIR for a different recipe." >&2
+  return 0
+}
+
+require_chunk_checkpoint() {
+  if [[ ! -f "$CHUNK_IDQL_CHECKPOINT" || ! -s "$CHUNK_IDQL_CHECKPOINT" ]]; then
+    echo "[rgb_dp_chunk_idql] chunk checkpoint does not exist: $CHUNK_IDQL_CHECKPOINT" >&2
+    exit 1
+  fi
+  echo "[rgb_dp_chunk_idql] resolved chunk checkpoint: $CHUNK_IDQL_CHECKPOINT" >&2
+}
+
 
 CHUNK_STEPS_PER_EPOCH=${CHUNK_STEPS_PER_EPOCH:-}
 CHUNK_STEPS_PER_EPOCH_ARGS=()
@@ -338,6 +490,54 @@ if [[ "${COMPOSED_CONDITIONED_ACTOR:-0}" == "1" ]]; then
   )
 fi
 
+ensure_collection_rgb_dataset() {
+  local raw_path=$COLLECTION_OUTPUT_DIR/$COLLECTION_RAW_NAME
+  local rgb_path=$COLLECTION_OUTPUT_DIR/$COLLECTION_RGB_NAME
+  local conversion_mode_args=(--resume)
+  local conversion_args=(
+    --dataset "$raw_path"
+    --output_name "$COLLECTION_RGB_NAME"
+    --done_mode 2
+    --copy_rewards
+    --camera_names "${COLLECTION_CAMERA_NAME_ARRAY[@]}"
+    --camera_height "$COLLECTION_CAMERA_SIZE"
+    --camera_width "$COLLECTION_CAMERA_SIZE"
+    --compress
+    --exclude-next-obs
+    --reuse-identical-models
+  )
+  if [[ ! -f "$raw_path" || ! -s "$raw_path" ]]; then
+    echo "[rgb_dp_chunk_idql] collection raw dataset does not exist or is empty: $raw_path" >&2
+    exit 1
+  fi
+  if (( ${#COLLECTION_CAMERA_NAME_ARRAY[@]} == 0 )); then
+    echo "COLLECTION_CAMERA_NAMES must contain at least one camera name." >&2
+    exit 2
+  fi
+  if [[ ! "$COLLECTION_CAMERA_SIZE" =~ ^[0-9]+$ ]] || (( COLLECTION_CAMERA_SIZE <= 0 )); then
+    echo "COLLECTION_CAMERA_SIZE must be a positive integer." >&2
+    exit 2
+  fi
+  if [[ -f "$rgb_path" && "${COLLECTION_RGB_OVERWRITE:-0}" != "1" ]]; then
+    echo "[rgb_dp_chunk_idql] validating collection RGB provenance: $rgb_path" >&2
+    "$PYTHON" -B robomimic/scripts/dataset_states_to_obs.py \
+      "${conversion_args[@]}" \
+      --validate-only
+    return
+  fi
+  if [[ "${COLLECTION_RGB_RESTART:-0}" == "1" ]]; then
+    conversion_mode_args+=(--restart)
+  fi
+  if [[ "${COLLECTION_RGB_OVERWRITE:-0}" == "1" ]]; then
+    conversion_mode_args+=(--overwrite)
+  fi
+  echo "[rgb_dp_chunk_idql] materializing collection RGB observations: $rgb_path" >&2
+  "$PYTHON" -B robomimic/scripts/dataset_states_to_obs.py \
+    "${conversion_args[@]}" \
+    "${conversion_mode_args[@]}"
+}
+
+
 build_dataset() {
   local overwrite_args=()
   if [[ ! -f "$EXPERT_DATASET" ]]; then
@@ -370,12 +570,32 @@ build_dataset() {
 }
 
 ensure_dataset() {
+  if [[ "$ROUND2_CHUNK_TRAINING" == "1" && -z "$USER_ROLLOUT_DATASET_SET" ]]; then
+    ensure_collection_rgb_dataset
+  fi
   if [[ "${OVERWRITE_DATASET:-0}" == "1" ]]; then
     echo "[rgb_dp_chunk_idql] rebuilding mixed dataset: $IDQL_DATASET" >&2
     build_dataset
   elif [[ ! -f "$IDQL_DATASET" ]]; then
     echo "[rgb_dp_chunk_idql] building missing mixed dataset: $IDQL_DATASET" >&2
     build_dataset
+  else
+    echo "[rgb_dp_chunk_idql] validating mixed dataset provenance: $IDQL_DATASET" >&2
+    "$PYTHON" -B scripts/build_rgb_dp_idql_dataset.py \
+      --task "$TASK" \
+      --expert-dataset "$EXPERT_DATASET" \
+      --rollout-dataset "$ROLLOUT_DATASET" \
+      --output "$IDQL_DATASET" \
+      --expert-mask "$EXPERT_MASK" \
+      --expert-count "$EXPERT_COUNT" \
+      --success-mask "$SUCCESS_MASK" \
+      --success-count "$SUCCESS_COUNT" \
+      --failure-mask "$FAILURE_MASK" \
+      --failure-count "$FAILURE_COUNT" \
+      --reward-mode "$IDQL_REWARD_MODE" \
+      --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+      --seed "${DATASET_SEED:-0}" \
+      --validate-only
   fi
 }
 
@@ -384,6 +604,10 @@ run_chunk_train() {
   local resume_args=()
   local initialization_args=()
   local distributed_args=()
+  local validation_args=()
+  if [[ "${CHUNK_VALIDATE_RESUME_ONLY:-0}" == "1" ]]; then
+    validation_args=(--validate-resume-only)
+  fi
   local train_launcher=("$PYTHON" -B)
   if [[ -n "$resume_path" ]]; then
     resume_args=(--resume-checkpoint "$resume_path")
@@ -418,7 +642,7 @@ run_chunk_train() {
       return 2
       ;;
   esac
-  if (( CHUNK_NUM_GPUS > 1 )); then
+  if (( CHUNK_NUM_GPUS > 1 )) && [[ "${CHUNK_VALIDATE_RESUME_ONLY:-0}" != "1" ]]; then
     train_launcher=(
       "$PYTHON" -B -m torch.distributed.run
       --standalone
@@ -440,6 +664,7 @@ run_chunk_train() {
     --dataset "$IDQL_DATASET" \
     --output-dir "$CHUNK_IDQL_OUTPUT_DIR" \
     "${resume_args[@]}" \
+    "${validation_args[@]}" \
     --device "${DEVICE:-cuda}" \
     --seed "${CHUNK_SEED:-${SEED:-0}}" \
     --epochs "${CHUNK_EPOCHS:-$TASK_CHUNK_EPOCHS}" \
@@ -469,7 +694,7 @@ run_chunk_train() {
     --actor-lr-num-cycles "${CHUNK_ACTOR_LR_NUM_CYCLES:-0.5}" \
     "${CHUNK_CONDITION_ARGS[@]}" \
     --condition-dropout "${CHUNK_CONDITION_DROPOUT:-${CONDITION_DROPOUT:-0.0}}" \
-    --condition-hidden-dim "${CHUNK_CONDITION_HIDDEN_DIM:-${CONDITION_HIDDEN_DIM:-256}}" \
+    --condition-hidden-dim "${CHUNK_CONDITION_HIDDEN_DIM:-${CONDITION_HIDDEN_DIM:-$TASK_CHUNK_CONDITION_HIDDEN_DIM}}" \
     --critic-lr "${CHUNK_CRITIC_LR:-${CRITIC_LR:-1e-4}}" \
     --encoder-lr "${CHUNK_ENCODER_LR:-1e-5}" \
     --vf-lr "${CHUNK_VF_LR:-${VF_LR:-1e-4}}" \
@@ -504,16 +729,22 @@ case "$STAGE" in
 
   train_chunk_idql|train_chunk_idql_round2)
     ensure_dataset
+    if chunk_training_is_complete; then
+      exit 0
+    fi
     run_chunk_train "${CHUNK_RESUME_CHECKPOINT:-}"
     ;;
 
   train_chunk_idql_resilient|train_chunk_idql_round2_resilient)
     ensure_dataset
     max_restarts=${MAX_RESTARTS:-20}
+    if chunk_training_is_complete; then
+      exit 0
+    fi
     retry_sleep=${RETRY_SLEEP:-5}
     resume_path=${CHUNK_RESUME_CHECKPOINT:-}
-    if [[ -z "$resume_path" && -f "$CHUNK_IDQL_OUTPUT_DIR/latest.pt" ]]; then
-      resume_path="$CHUNK_IDQL_OUTPUT_DIR/latest.pt"
+    if [[ -z "$resume_path" ]]; then
+      resume_path=$(resolve_existing_chunk_checkpoint "$CHUNK_IDQL_OUTPUT_DIR")
     fi
     attempt=1
     while (( attempt <= max_restarts )); do
@@ -532,13 +763,16 @@ case "$STAGE" in
       fi
       resume_path="$CHUNK_IDQL_OUTPUT_DIR/latest.pt"
       attempt=$((attempt + 1))
-      sleep "$retry_sleep"
+      if (( attempt <= max_restarts )); then
+        sleep "$retry_sleep"
+      fi
     done
     echo "[rgb_dp_chunk_idql] exhausted $max_restarts attempts" >&2
     exit 1
     ;;
 
   eval_chunk_grid_resilient)
+    require_chunk_checkpoint
     read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-1 8 16}"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
     "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
@@ -565,6 +799,7 @@ case "$STAGE" in
     ;;
 
   collect_chunk_idql_rollouts_resilient)
+    require_chunk_checkpoint
     echo "[rgb_dp_chunk_idql collection] task=$TASK N=$COLLECTION_NUM_CANDIDATES selection=$COLLECTION_SELECTION random_probability=$COLLECTION_RANDOM_SELECTION_PROBABILITY total_rollouts=$COLLECTION_TOTAL_ROLLOUTS rollouts_per_shard=$COLLECTION_ROLLOUTS_PER_SHARD seed_layout=$COLLECTION_SEED_LAYOUT_TAG policy_seeds=${COLLECTION_POLICY_SEEDS:-none} output=$COLLECTION_OUTPUT_DIR" >&2
     if (( COLLECTION_TOTAL_ROLLOUTS <= 0 || COLLECTION_ROLLOUTS_PER_SHARD <= 0 )); then
       echo "COLLECTION_TOTAL_ROLLOUTS and COLLECTION_ROLLOUTS_PER_SHARD must be positive." >&2
@@ -633,9 +868,15 @@ case "$STAGE" in
       --min-success-rollouts "$COLLECTION_MIN_SUCCESS_ROLLOUTS" \
       --min-failure-rollouts "$COLLECTION_MIN_FAILURE_ROLLOUTS" \
       --force-merge
+    if [[ "${COLLECTION_CONVERT_RGB:-1}" == "1" ]]; then
+      ensure_collection_rgb_dataset
+    else
+      echo "[rgb_dp_chunk_idql] skipping collection RGB conversion because COLLECTION_CONVERT_RGB=0" >&2
+    fi
     ;;
 
   eval_composed_chunk_grid_resilient)
+    require_chunk_checkpoint
     read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-1 8 16}"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
     "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \

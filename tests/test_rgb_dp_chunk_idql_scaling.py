@@ -1,10 +1,12 @@
 import argparse
 import copy
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import h5py
 import numpy as np
@@ -240,6 +242,10 @@ class DistributedOptimizationSemanticsTest(unittest.TestCase):
         )
         targets = copy.deepcopy(critics)
         vf = torch.nn.Linear(3, 1)
+        target_parameters_before = [
+            [parameter.detach().clone() for parameter in target.parameters()]
+            for target in targets
+        ]
         critic_optimizers = [
             torch.optim.SGD(critic.parameters(), lr=0.1)
             for critic in critics
@@ -273,6 +279,17 @@ class DistributedOptimizationSemanticsTest(unittest.TestCase):
             1 for module in [*critics, vf] for _ in module.parameters()
         )
         self.assertEqual(len(sync_calls[0]), expected_count)
+        for critic, target, parameters_before in zip(
+            critics, targets, target_parameters_before
+        ):
+            for online_parameter, target_parameter, target_before in zip(
+                critic.parameters(), target.parameters(), parameters_before
+            ):
+                torch.testing.assert_close(
+                    target_parameter,
+                    0.99 * target_before + 0.01 * online_parameter,
+                )
+
         for module in [*critics, vf]:
             self.assertTrue(
                 all(parameter.grad is not None for parameter in module.parameters())
@@ -436,6 +453,25 @@ class ConditionalActorRecipeTest(unittest.TestCase):
             0,
         )
 
+    def test_configure_conditioned_actor_retains_legacy_adapter(self):
+        actor = self._minimal_actor()
+        actor._install_legacy_success_condition_adapter(hidden_dim=8)
+        adapter = actor.nets["policy"]["condition_adapter"]
+
+        CHUNK.configure_conditioned_actor(
+            actor,
+            argparse.Namespace(
+                conditioned_actor=True,
+                condition_hidden_dim=8,
+                condition_dropout=0.0,
+            ),
+        )
+
+        self.assertIs(actor.nets["policy"]["condition_adapter"], adapter)
+        self.assertIsInstance(adapter, SuccessConditionResidual)
+        self.assertEqual(actor.inference_success_condition, 1.0)
+        self.assertEqual(actor.inference_success_condition_mask, 1.0)
+
     def test_chunk_defaults_use_human_only_and_default_dp_learning_rates(self):
         defaults = {
             action.dest: action.default
@@ -449,6 +485,278 @@ class ConditionalActorRecipeTest(unittest.TestCase):
         self.assertEqual(defaults["condition_hidden_dim"], 256)
 
 
+
+class FreshOutputRecoveryTest(unittest.TestCase):
+    def test_stale_latest_temporary_is_cleaned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "training"
+            output_dir.mkdir()
+            temporary = output_dir / ".latest.pt.tmp-12345"
+            temporary.write_bytes(b"interrupted")
+
+            with mock.patch.object(
+                CHUNK,
+                "process_is_running",
+                return_value=False,
+            ) as running:
+                cleaned = CHUNK.prepare_fresh_output_directory(output_dir)
+
+            self.assertEqual(cleaned, [temporary])
+            self.assertFalse(temporary.exists())
+            running.assert_called_once_with(12345)
+
+    def test_unexpected_entry_prevents_any_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "training"
+            output_dir.mkdir()
+            temporary = output_dir / ".latest.pt.tmp-12345"
+            temporary.write_bytes(b"interrupted")
+            unexpected = output_dir / "training_config.json"
+            unexpected.write_text("{}")
+
+            with self.assertRaisesRegex(FileExistsError, "unexpected entries"):
+                CHUNK.prepare_fresh_output_directory(output_dir)
+
+            self.assertTrue(temporary.exists())
+            self.assertTrue(unexpected.exists())
+
+    def test_live_latest_temporary_is_not_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "training"
+            output_dir.mkdir()
+            temporary = output_dir / ".latest.pt.tmp-12345"
+            temporary.write_bytes(b"in progress")
+
+            with (
+                mock.patch.object(CHUNK, "process_is_running", return_value=True),
+                self.assertRaisesRegex(FileExistsError, "active checkpoint"),
+            ):
+                CHUNK.prepare_fresh_output_directory(output_dir)
+
+            self.assertTrue(temporary.exists())
+
+
+class ResumeSemanticValidationTest(unittest.TestCase):
+    @staticmethod
+    def _args():
+        return argparse.Namespace(
+            task="square",
+            dataset=Path("/tmp/chunk_idql_mixed.hdf5"),
+            dataset_identity={"dataset": {"size": 123}, "external_sources": {}},
+            epochs=50,
+            seed=0,
+            batch_size=100,
+            effective_global_batch_size=100,
+            schedule_reference_batch_size=100,
+            steps_per_epoch=None,
+            validate_resume_only=False,
+            chunk_horizon=8,
+            discount=0.99,
+            expectile=0.9,
+            target_tau=0.01,
+            critic_hidden_dims=(300, 400, 300),
+            latent_dim=300,
+            action_hidden_dim=128,
+            num_attention_heads=4,
+            num_action_conv_layers=2,
+            dropout=0.0,
+            num_critics=2,
+            critic_group_norm=False,
+            critic_late_fusion_key="robot0_gripper_qpos",
+            dynamics_weight=0.5,
+            dynamics_cosine_weight=0.5,
+            dynamics_warmup_steps=1000,
+            encoder_freeze_steps=0,
+            vf_encoder_freeze_steps=1000,
+            use_huber=True,
+            max_gradient_norm=10.0,
+            critic_vf_lr_scheduler="cosine",
+            critic_vf_lr_warmup_steps=1000,
+            critic_vf_lr_num_cycles=0.5,
+            sparse_chunk_loader=True,
+        )
+
+    @staticmethod
+    def _state(args):
+        fields = (
+            "epochs",
+            "seed",
+            "batch_size",
+            "effective_global_batch_size",
+            "schedule_reference_batch_size",
+            "chunk_horizon",
+            "discount",
+            "expectile",
+            "target_tau",
+            "critic_hidden_dims",
+            "latent_dim",
+            "action_hidden_dim",
+            "num_attention_heads",
+            "num_action_conv_layers",
+            "dropout",
+            "num_critics",
+            "critic_group_norm",
+            "critic_late_fusion_key",
+            "dynamics_weight",
+            "dynamics_cosine_weight",
+            "dynamics_warmup_steps",
+            "encoder_freeze_steps",
+            "vf_encoder_freeze_steps",
+            "use_huber",
+            "max_gradient_norm",
+            "critic_vf_lr_scheduler",
+            "critic_vf_lr_warmup_steps",
+            "critic_vf_lr_num_cycles",
+            "sparse_chunk_loader",
+        )
+        return {
+            "task": args.task,
+            "dataset": str(args.dataset),
+            "dataset_identity": copy.deepcopy(args.dataset_identity),
+            "args": {
+                field: copy.deepcopy(getattr(args, field))
+                for field in fields
+            },
+        }
+
+    def test_resume_rejects_objective_change(self):
+        args = self._args()
+        state = self._state(args)
+        CHUNK.validate_resume_semantics(state, args)
+
+        state["args"]["expectile"] = 0.8
+        with self.assertRaisesRegex(ValueError, "resume expectile"):
+            CHUNK.validate_resume_semantics(state, args)
+
+
+    def test_resume_rejects_dataset_identity_change(self):
+        args = self._args()
+        state = self._state(args)
+        state["dataset_identity"]["dataset"]["size"] += 1
+
+        with self.assertRaisesRegex(ValueError, "dataset identity"):
+            CHUNK.validate_resume_semantics(state, args)
+
+
+    def test_json_summary_publication_is_atomic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "summary.json"
+            path.write_text("old")
+            CHUNK.atomic_write_json(path, {"epoch": 3})
+            self.assertEqual(json.loads(path.read_text()), {"epoch": 3})
+            self.assertFalse(any(path.parent.glob(".summary.json.tmp-*")))
+
+
+class ChunkObjectiveSemanticsTest(unittest.TestCase):
+    class ConstantCritic(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.q = torch.nn.Parameter(torch.tensor(float(value)))
+
+        def forward(
+            self,
+            *,
+            obs_dict,
+            acts,
+            action_mask,
+            goal_dict,
+            return_aux=False,
+        ):
+            del obs_dict, action_mask, goal_dict
+            batch_size = acts.shape[0]
+            q = self.q.expand(batch_size, 1)
+            if return_aux:
+                return {
+                    "q": q,
+                    "predicted_next_encoder": torch.ones(
+                        batch_size, 3, device=acts.device
+                    ),
+                }
+            return q
+
+    class MarkerValue(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, *, obs_dict, goal_dict):
+            del goal_dict
+            return obs_dict["marker"] * self.scale
+
+    class ConstantDynamicsTarget(torch.nn.Module):
+        def forward(self, *, obs):
+            return torch.ones(obs["marker"].shape[0], 3)
+
+    def test_terminal_mask_and_gamma_power_define_q_backup(self):
+        critics = torch.nn.ModuleList(
+            [self.ConstantCritic(0.0), self.ConstantCritic(0.0)]
+        )
+        targets = torch.nn.ModuleList(
+            [self.ConstantCritic(3.0), self.ConstantCritic(4.0)]
+        )
+        vf = self.MarkerValue()
+        batch = {
+            "obs": {"marker": torch.tensor([[1.0], [4.0]])},
+            "next_obs": {"marker": torch.tensor([[10.0], [20.0]])},
+            "actions": torch.zeros(2, 2, 1),
+            "action_mask": torch.ones(2, 2),
+            "reward": torch.tensor([[1.0], [2.0]]),
+            "terminal": torch.tensor([[0.0], [1.0]]),
+            "valid_length": torch.tensor([[2.0], [1.0]]),
+            "exact_next": torch.tensor([[1.0], [0.0]]),
+            "goal_obs": None,
+        }
+
+        critic_losses, vf_loss, info = CHUNK.compute_chunk_losses(
+            critics,
+            targets,
+            self.ConstantDynamicsTarget(),
+            vf,
+            batch,
+            discount=0.5,
+            expectile=0.8,
+            use_huber=False,
+            dynamics_weight=0.5,
+            dynamics_cosine_weight=0.5,
+        )
+
+        # Nonterminal row: 1 + 0.5**2 * 10 = 3.5.
+        # Terminal row: reward 2 with no bootstrap.
+        self.assertAlmostEqual(info["critic/q_target_mean"].item(), 2.75)
+        for loss in critic_losses:
+            self.assertAlmostEqual(loss.item(), 8.125)
+        # min(target Q)=3; errors are -2 and +1 with expectile weights .8/.2.
+        self.assertAlmostEqual(vf_loss.item(), 1.7)
+        self.assertAlmostEqual(info["dynamics/weighted_loss"].item(), 0.0, places=6)
+
+        critic_losses[0].backward()
+        self.assertIsNone(vf.scale.grad)
+
+    def test_dynamics_teacher_hard_sync_copies_actor_encoder(self):
+        source = torch.nn.Linear(3, 2)
+        target = torch.nn.Linear(3, 2)
+        with torch.no_grad():
+            source.weight.fill_(0.25)
+            source.bias.fill_(-0.5)
+            target.weight.zero_()
+            target.bias.zero_()
+        actor = argparse.Namespace(
+            nets=torch.nn.ModuleDict(
+                {
+                    "policy": torch.nn.ModuleDict(
+                        {"obs_encoder": source}
+                    )
+                }
+            ),
+            ema=None,
+        )
+
+        audit = CHUNK.sync_actor_dynamics_target_encoder(target, actor)
+
+        self.assertEqual(audit["tensor_count"], 2)
+        torch.testing.assert_close(target.weight, source.weight)
+        torch.testing.assert_close(target.bias, source.bias)
+        self.assertIsNot(target.weight, source.weight)
 
 class BatchScaledSemanticsTest(unittest.TestCase):
     def test_only_data_exposure_schedules_are_sample_scaled(self):

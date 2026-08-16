@@ -10,6 +10,7 @@ logged and retried, and successful chunks are aggregated into a normal summary.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -57,6 +58,37 @@ COMMON_ENV = {
     "TORCH_COMPILE_DISABLE": "1",
     "TORCHDYNAMO_DISABLE": "1",
 }
+
+PROVENANCE_KEY = "experiment_provenance"
+PROVENANCE_SCHEMA_VERSION = 2
+UINT32_SEED_MODULUS = 1 << 32
+CHUNK_SEED_STRIDE = 100000
+CHUNK_SEED_SCHEME = (
+    "identity_if_uint32_else_sha256_v2(pair_seed*100000+chunk_index)"
+)
+
+
+def derive_chunk_seed(pair_seed: int, chunk_index: int) -> int:
+    """Derive a deterministic NumPy-compatible seed for one rollout chunk."""
+    raw_seed = int(pair_seed) * CHUNK_SEED_STRIDE + int(chunk_index)
+    if 0 <= raw_seed < UINT32_SEED_MODULUS:
+        return raw_seed
+    encoded = f"rgb_dp_idql_eval_grid_chunk_seed_v2:{raw_seed}".encode("ascii")
+    digest = hashlib.sha256(encoded).digest()
+    return int.from_bytes(digest[:4], byteorder="big", signed=False)
+
+
+def validate_grid_seeds(seeds: list[int]) -> None:
+    """Reject invalid or aliased logical seeds before launching subprocesses."""
+    logical_seeds = [int(seed) for seed in seeds]
+    if any(seed < 0 for seed in logical_seeds):
+        raise ValueError("--seeds must be non-negative")
+    effective_seeds = [derive_chunk_seed(seed, 0) for seed in logical_seeds]
+    if len(set(effective_seeds)) != len(effective_seeds):
+        raise ValueError(
+            "--seeds produce duplicate effective uint32 chunk seeds under "
+            f"{CHUNK_SEED_SCHEME}"
+        )
 
 
 def process_env(cache_suffix: str, gpu_id: int | None = None) -> dict[str, str]:
@@ -155,6 +187,191 @@ def atomic_write_json(path: Path, payload: dict) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def file_identity(path: Path) -> dict[str, object]:
+    """Return a stable, JSON-serializable identity for an experiment input."""
+    resolved = path.expanduser().resolve()
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return {
+            "path": str(resolved),
+            "exists": False,
+            "size": None,
+            "mtime_ns": None,
+        }
+    return {
+        "path": str(resolved),
+        "exists": True,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def artifact_signature(path: Path) -> tuple[int, int, int, int, int] | None:
+    """Detect whether a subprocess replaced or updated a cached result file."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
+
+
+def common_experiment_inputs(args: argparse.Namespace) -> dict[str, object]:
+    """Inputs shared by every pair and chunk in one evaluation grid."""
+    return {
+        "checkpoints": {
+            "idql": file_identity(args.idql_checkpoint),
+            "dp": file_identity(args.dp_checkpoint),
+        },
+        "expected_task": args.expected_task,
+        "device": args.device,
+        "actor_source": args.actor_source,
+        "critic_source": args.critic_source,
+        "candidate_batch_size": int(args.candidate_batch_size),
+        "num_inference_steps": int(args.num_inference_steps),
+        "execution_horizon": int(args.execution_horizon),
+        "selection": args.selection,
+        "softmax_temperature": float(args.softmax_temperature),
+        "random_selection_probability": float(args.random_selection_probability),
+        "clip_actions": bool(args.clip_actions),
+        "diffusion_clip_sample": bool(args.diffusion_clip_sample),
+        "require_success_condition_adapter": bool(
+            args.require_success_condition_adapter
+        ),
+        "forbid_success_condition_adapter": bool(
+            args.forbid_success_condition_adapter
+        ),
+        "inference_success_condition": float(args.inference_success_condition),
+        "inference_condition_mask": float(args.inference_condition_mask),
+        "env_hard_reset": bool(args.env_hard_reset),
+        "reset_to_initial_state": bool(args.reset_to_initial_state),
+    }
+
+
+def make_experiment_provenance(inputs: dict[str, object]) -> dict[str, object]:
+    """Wrap canonical experiment inputs with a human-checkable SHA-256 digest."""
+    canonical = json.dumps(
+        inputs,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    return {
+        "schema_version": PROVENANCE_SCHEMA_VERSION,
+        "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "inputs": inputs,
+    }
+
+
+def pair_experiment_provenance(
+    args: argparse.Namespace,
+    num_candidates: int,
+    seed: int,
+    *,
+    common_inputs: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if common_inputs is None:
+        common_inputs = common_experiment_inputs(args)
+    return make_experiment_provenance(
+        {
+            "scope": "pair",
+            "common": common_inputs,
+            "num_candidates": int(num_candidates),
+            "seed": int(seed),
+            "n_rollouts": int(args.n_rollouts),
+            "horizon": int(args.horizon),
+            "rollouts_per_chunk": int(args.rollouts_per_chunk),
+            "accept_partial": bool(args.accept_partial),
+            "chunk_seed_scheme": CHUNK_SEED_SCHEME,
+        }
+    )
+
+
+def chunk_experiment_provenance(
+    args: argparse.Namespace,
+    num_candidates: int,
+    seed: int,
+    chunk_index: int,
+    chunk_seed: int,
+    n_rollouts: int,
+    *,
+    common_inputs: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if common_inputs is None:
+        common_inputs = common_experiment_inputs(args)
+    return make_experiment_provenance(
+        {
+            "scope": "chunk",
+            "common": common_inputs,
+            "num_candidates": int(num_candidates),
+            "pair_seed": int(seed),
+            "chunk_index": int(chunk_index),
+            "evaluator_seed": int(chunk_seed),
+            "requested_rollouts": int(n_rollouts),
+            "horizon": int(args.horizon),
+        }
+    )
+
+
+def grid_experiment_provenance(
+    args: argparse.Namespace,
+    *,
+    common_inputs: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if common_inputs is None:
+        common_inputs = common_experiment_inputs(args)
+    return make_experiment_provenance(
+        {
+            "scope": "grid",
+            "common": common_inputs,
+            "num_candidates": [int(value) for value in args.num_candidates],
+            "seeds": [int(value) for value in args.seeds],
+            "n_rollouts_per_seed": int(args.n_rollouts),
+            "horizon": int(args.horizon),
+            "rollouts_per_chunk": int(args.rollouts_per_chunk),
+            "accept_partial": bool(args.accept_partial),
+            "chunk_seed_scheme": CHUNK_SEED_SCHEME,
+        }
+    )
+
+
+def provenance_matches(payload: dict, expected: dict[str, object]) -> bool:
+    return payload.get(PROVENANCE_KEY) == expected
+
+
+def provenance_mismatch_description(
+    payload: dict,
+    expected: dict[str, object],
+) -> str:
+    actual = payload.get(PROVENANCE_KEY)
+    if not isinstance(actual, dict):
+        return "missing experiment provenance"
+    return (
+        "experiment provenance mismatch "
+        f"(cached={actual.get('fingerprint')}, "
+        f"requested={expected.get('fingerprint')})"
+    )
+
+
+def stamp_provenance(
+    path: Path,
+    payload: dict,
+    provenance: dict[str, object],
+) -> dict:
+    stamped = dict(payload)
+    stamped[PROVENANCE_KEY] = provenance
+    atomic_write_json(path, stamped)
+    return stamped
+
 
 
 def completed_partial(path: Path) -> dict | None:
@@ -299,28 +516,57 @@ def run_chunk(
     n_rollouts: int,
     logger: TeeLogger,
     gpu_id: int | None = None,
+    expected_provenance: dict[str, object] | None = None,
 ) -> dict:
     chunk_dir = args.output_dir / "chunks" / f"N{num_candidates}_seed{seed}_chunk{chunk_index:03d}"
     chunk_json = chunk_dir / f"one_step_idql_N{num_candidates}_seed{chunk_seed}.json"
+    partial_json = chunk_dir / f"one_step_idql_N{num_candidates}_seed{chunk_seed}_partial.json"
+    if expected_provenance is None:
+        expected_provenance = chunk_experiment_provenance(
+            args,
+            num_candidates,
+            seed,
+            chunk_index,
+            chunk_seed,
+            n_rollouts,
+        )
+    expected_common = expected_provenance["inputs"]["common"]
+
     if chunk_json.exists() and not args.force:
         completed = load_json_object(chunk_json)
-        if completed is not None and completed.get("rollouts"):
-            logger.line(f"[resume chunk] {chunk_json}")
-            return completed
-        logger.line(f"[ignore invalid chunk json] {chunk_json}")
+        rollouts = None if completed is None else completed.get("rollouts")
+        if isinstance(rollouts, list) and len(rollouts) == n_rollouts:
+            if provenance_matches(completed, expected_provenance):
+                logger.line(f"[resume chunk] {chunk_json}")
+                return completed
+            logger.line(
+                f"[ignore stale chunk json] {chunk_json}: "
+                + provenance_mismatch_description(completed, expected_provenance)
+            )
+        else:
+            logger.line(f"[ignore invalid chunk json] {chunk_json}")
 
-    partial_json = chunk_dir / f"one_step_idql_N{num_candidates}_seed{chunk_seed}_partial.json"
     if args.accept_partial and partial_json.exists() and not args.force:
         partial = completed_partial(partial_json)
         if partial is not None:
-            completed = len(partial["rollouts"])
+            if provenance_matches(partial, expected_provenance):
+                completed = len(partial["rollouts"])
+                logger.line(
+                    f"[resume chunk partial] {partial_json} "
+                    f"completed={completed}/{n_rollouts}"
+                )
+                return partial
             logger.line(
-                f"[resume chunk partial] {partial_json} completed={completed}/{n_rollouts}"
+                f"[ignore stale chunk partial] {partial_json}: "
+                + provenance_mismatch_description(partial, expected_provenance)
             )
-            return partial
+        else:
+            logger.line(f"[ignore invalid chunk partial] {partial_json}")
 
     last_stdout = ""
     for attempt in range(1, args.max_retries + 1):
+        chunk_signature_before = artifact_signature(chunk_json)
+        partial_signature_before = artifact_signature(partial_json)
         cache_suffix = f"N{num_candidates}_s{seed}_c{chunk_index}_a{attempt}_{os.getpid()}"
         shutil.rmtree(f"/tmp/robomimic_one_step_idql_eval_pycache_{cache_suffix}", ignore_errors=True)
         command = eval_command(
@@ -353,20 +599,69 @@ def run_chunk(
         proc.stdout.close()
         proc.stdout = None
         last_stdout = "".join(output_parts)
+
+        if common_experiment_inputs(args) != expected_common:
+            raise RuntimeError(
+                "checkpoint identity or another evaluation input changed while "
+                f"running chunk N={num_candidates} seed={seed} chunk={chunk_index}"
+            )
+
+        chunk_changed = artifact_signature(chunk_json) != chunk_signature_before
         if proc.returncode == 0 and chunk_json.exists():
             completed = load_json_object(chunk_json)
-            if completed is not None and completed.get("rollouts"):
-                logger.line(f"[chunk ok] {chunk_json}")
-                return completed
-            logger.line(f"[ignore invalid chunk json] {chunk_json}")
+            rollouts = None if completed is None else completed.get("rollouts")
+            if (
+                chunk_changed
+                and isinstance(rollouts, list)
+                and len(rollouts) == n_rollouts
+            ):
+                if PROVENANCE_KEY not in completed:
+                    completed = stamp_provenance(
+                        chunk_json,
+                        completed,
+                        expected_provenance,
+                    )
+                if provenance_matches(completed, expected_provenance):
+                    logger.line(f"[chunk ok] {chunk_json}")
+                    return completed
+                logger.line(
+                    f"[ignore mismatched new chunk json] {chunk_json}: "
+                    + provenance_mismatch_description(
+                        completed,
+                        expected_provenance,
+                    )
+                )
+            elif not chunk_changed:
+                logger.line(f"[ignore unchanged chunk json] {chunk_json}")
+            else:
+                logger.line(f"[ignore invalid chunk json] {chunk_json}")
+
+        partial_changed = artifact_signature(partial_json) != partial_signature_before
         if args.accept_partial and partial_json.exists():
             partial = completed_partial(partial_json)
-            if partial is not None:
-                completed = len(partial["rollouts"])
+            if partial is not None and partial_changed:
+                if PROVENANCE_KEY not in partial:
+                    partial = stamp_provenance(
+                        partial_json,
+                        partial,
+                        expected_provenance,
+                    )
+                if provenance_matches(partial, expected_provenance):
+                    completed = len(partial["rollouts"])
+                    logger.line(
+                        f"[chunk partial accepted] {partial_json} "
+                        f"completed={completed}/{n_rollouts}"
+                    )
+                    return partial
                 logger.line(
-                    f"[chunk partial accepted] {partial_json} completed={completed}/{n_rollouts}"
+                    f"[ignore mismatched new chunk partial] {partial_json}: "
+                    + provenance_mismatch_description(
+                        partial,
+                        expected_provenance,
+                    )
                 )
-                return partial
+            elif partial is not None:
+                logger.line(f"[ignore unchanged chunk partial] {partial_json}")
         logger.line(
             f"[chunk failed] returncode={proc.returncode}; expected={chunk_json}\n"
             + "\n".join(last_stdout.splitlines()[-80:])
@@ -382,23 +677,55 @@ def run_pair(
     num_candidates: int,
     seed: int,
     gpu_id: int | None = None,
+    *,
+    common_inputs: dict[str, object] | None = None,
 ) -> dict:
+    if common_inputs is None:
+        common_inputs = common_experiment_inputs(args)
+    elif common_experiment_inputs(args) != common_inputs:
+        raise RuntimeError(
+            "checkpoint identity or another evaluation input changed before "
+            f"pair N={num_candidates} seed={seed}"
+        )
+    pair_provenance = pair_experiment_provenance(
+        args,
+        num_candidates,
+        seed,
+        common_inputs=common_inputs,
+    )
     final_json = args.output_dir / f"one_step_idql_N{num_candidates}_seed{seed}.json"
     if final_json.exists() and not args.force:
-        try:
-            existing = json.loads(final_json.read_text())
+        existing = load_json_object(final_json)
+        if existing is None:
+            print(f"[ignore invalid pair json] {final_json}", flush=True)
+        elif not provenance_matches(existing, pair_provenance):
+            print(
+                f"[ignore stale pair json] {final_json}: "
+                + provenance_mismatch_description(existing, pair_provenance),
+                flush=True,
+            )
+        else:
             stats = existing.get("average_rollout_stats", {})
-            if int(stats.get("Num_Rollouts", -1)) >= args.n_rollouts:
+            rollouts = existing.get("rollouts")
+            try:
+                completed = int(stats.get("Num_Rollouts", -1))
+            except (AttributeError, TypeError, ValueError):
+                completed = -1
+            if (
+                isinstance(rollouts, list)
+                and len(rollouts) == args.n_rollouts
+                and completed == args.n_rollouts
+            ):
                 print(f"[resume pair] {final_json}", flush=True)
                 return existing
-        except Exception:
-            pass
+            print(f"[ignore incomplete pair json] {final_json}", flush=True)
 
     log_path = args.output_dir / "logs" / f"one_step_idql_N{num_candidates}_seed{seed}.log"
     logger = TeeLogger(log_path, mode="w")
     logger.line(
         f"[pair] N={num_candidates} seed={seed} n_rollouts={args.n_rollouts} "
-        f"rollouts_per_chunk={args.rollouts_per_chunk} gpu_id={gpu_id}"
+        f"rollouts_per_chunk={args.rollouts_per_chunk} gpu_id={gpu_id} "
+        f"provenance={pair_provenance['fingerprint']}"
     )
     all_rollouts: list[dict] = []
     chunk_records: list[dict] = []
@@ -410,7 +737,16 @@ def run_pair(
             # Independent chunk seeds make the evaluation resumable after a
             # native crash without replaying earlier rollouts in the same
             # long-lived process.
-            chunk_seed = seed * 100000 + chunk_index
+            chunk_seed = derive_chunk_seed(seed, chunk_index)
+            chunk_provenance = chunk_experiment_provenance(
+                args,
+                num_candidates,
+                seed,
+                chunk_index,
+                chunk_seed,
+                count,
+                common_inputs=common_inputs,
+            )
             chunk = run_chunk(
                 args=args,
                 num_candidates=num_candidates,
@@ -420,6 +756,7 @@ def run_pair(
                 n_rollouts=count,
                 logger=logger,
                 gpu_id=gpu_id,
+                expected_provenance=chunk_provenance,
             )
             rollouts = chunk.get("rollouts", [])
             if len(rollouts) == 0:
@@ -440,6 +777,7 @@ def run_pair(
                         / f"one_step_idql_N{num_candidates}_seed{chunk_seed}.json"
                     ),
                     "average_rollout_stats": chunk.get("average_rollout_stats", {}),
+                    PROVENANCE_KEY: chunk[PROVENANCE_KEY],
                 }
             )
             remaining -= len(rollouts)
@@ -462,19 +800,27 @@ def run_pair(
     total = int(stats["Num_Rollouts"])
     ci_low, ci_high = wilson_interval(successes, total)
     result = {
+        PROVENANCE_KEY: pair_provenance,
         "idql_checkpoint": None if args.actor_source == "plain_dp" else str(args.idql_checkpoint),
         "dp_checkpoint": (
             str(args.dp_checkpoint)
-            if args.actor_source in ("plain_dp", "external_dp_chunk_critic")
+            if args.actor_source in (
+                "plain_dp",
+                "external_dp_chunk_critic",
+                "hybrid_dp_chunk_actor",
+            )
             else None
         ),
         "actor_source": args.actor_source,
         "expected_task": args.expected_task,
         "critic_source": None if args.actor_source == "plain_dp" else args.critic_source,
+        "device": args.device,
         "num_candidates": num_candidates,
+        "candidate_batch_size": args.candidate_batch_size,
         "num_inference_steps": args.num_inference_steps,
         "execution_horizon": args.execution_horizon,
         "diffusion_clip_sample": bool(args.diffusion_clip_sample),
+        "clip_actions": bool(args.clip_actions),
         "success_condition_adapter_required": bool(args.require_success_condition_adapter),
         "success_condition_adapter_forbidden": bool(args.forbid_success_condition_adapter),
         "inference_success_condition": (
@@ -488,10 +834,14 @@ def run_pair(
             else float(args.inference_condition_mask)
         ),
         "selection": None if args.actor_source == "plain_dp" else args.selection,
+        "softmax_temperature": float(args.softmax_temperature),
+        "random_selection_probability": float(args.random_selection_probability),
         "seed": seed,
         "n_rollouts": args.n_rollouts,
         "completed_rollouts": total,
         "horizon": args.horizon,
+        "rollouts_per_chunk": args.rollouts_per_chunk,
+        "accept_partial": bool(args.accept_partial),
         "env_hard_reset": bool(args.env_hard_reset),
         "reset_to_initial_state": bool(args.reset_to_initial_state),
         "average_rollout_stats": stats,
@@ -505,7 +855,51 @@ def run_pair(
     return result
 
 
+def validate_grid_results(
+    results: list[dict],
+    args: argparse.Namespace,
+    common_inputs: dict[str, object],
+) -> None:
+    """Reject mixed pair provenance and inputs that changed during a grid."""
+    if common_experiment_inputs(args) != common_inputs:
+        raise RuntimeError(
+            "checkpoint identity or another evaluation input changed while "
+            "running the evaluation grid"
+        )
+
+    configured_pairs = {
+        (int(num_candidates), int(seed))
+        for num_candidates in args.num_candidates
+        for seed in args.seeds
+    }
+    seen_pairs: set[tuple[int, int]] = set()
+    for result in results:
+        try:
+            pair = (int(result["num_candidates"]), int(result["seed"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "each grid result must contain integer num_candidates and seed"
+            ) from error
+        if pair not in configured_pairs:
+            raise ValueError(f"grid result is outside the configured pairs: {pair}")
+        if pair in seen_pairs:
+            raise ValueError(f"duplicate grid result pair: {pair}")
+        seen_pairs.add(pair)
+        expected = pair_experiment_provenance(
+            args,
+            pair[0],
+            pair[1],
+            common_inputs=common_inputs,
+        )
+        if not provenance_matches(result, expected):
+            raise ValueError(
+                f"grid result provenance does not match pair {pair}: "
+                + provenance_mismatch_description(result, expected)
+            )
+
+
 def run_grid(args: argparse.Namespace) -> list[dict]:
+    common_inputs = common_experiment_inputs(args)
     pairs = [
         (int(num_candidates), int(seed))
         for num_candidates in args.num_candidates
@@ -518,8 +912,17 @@ def run_grid(args: argparse.Namespace) -> list[dict]:
         results = []
         gpu_id = worker_gpu_ids[0]
         for num_candidates, seed in pairs:
-            results.append(run_pair(args, num_candidates, seed, gpu_id=gpu_id))
-            summarize(results, args)
+            results.append(
+                run_pair(
+                    args,
+                    num_candidates,
+                    seed,
+                    gpu_id=gpu_id,
+                    common_inputs=common_inputs,
+                )
+            )
+        validate_grid_results(results, args, common_inputs)
+        summarize(results, args, common_inputs=common_inputs)
         return results
 
     print(
@@ -553,6 +956,7 @@ def run_grid(args: argparse.Namespace) -> list[dict]:
                     num_candidates,
                     seed,
                     gpu_id=gpu_id,
+                    common_inputs=common_inputs,
                 )
             except Exception:
                 stop_event.set()
@@ -603,7 +1007,6 @@ def run_grid(args: argparse.Namespace) -> list[dict]:
                 f"completed={len(results)}/{len(pairs)}",
                 flush=True,
             )
-            summarize(results, args)
         else:
             failure = (
                 f"gpu_id={gpu_id} N={num_candidates} seed={seed} failed:\n{payload}"
@@ -617,7 +1020,8 @@ def run_grid(args: argparse.Namespace) -> list[dict]:
 
     if failures:
         if results:
-            summarize(results, args)
+            validate_grid_results(results, args, common_inputs)
+            summarize(results, args, common_inputs=common_inputs)
         raise RuntimeError(
             "multi-GPU evaluation stopped after a worker failure:\n"
             + "\n".join(failures)
@@ -626,10 +1030,20 @@ def run_grid(args: argparse.Namespace) -> list[dict]:
         raise RuntimeError(
             f"multi-GPU evaluation completed {len(results)}/{len(pairs)} pairs"
         )
+    validate_grid_results(results, args, common_inputs)
+    summarize(results, args, common_inputs=common_inputs)
     return results
 
 
-def summarize(results: list[dict], args: argparse.Namespace) -> dict:
+def summarize(
+    results: list[dict],
+    args: argparse.Namespace,
+    *,
+    common_inputs: dict[str, object] | None = None,
+) -> dict:
+    if common_inputs is None:
+        common_inputs = common_experiment_inputs(args)
+    validate_grid_results(results, args, common_inputs)
     by_n = []
     for n in args.num_candidates:
         subset = [r for r in results if int(r["num_candidates"]) == int(n)]
@@ -708,10 +1122,18 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
             }
         )
     summary = {
+        PROVENANCE_KEY: grid_experiment_provenance(
+            args,
+            common_inputs=common_inputs,
+        ),
         "idql_checkpoint": None if args.actor_source == "plain_dp" else str(args.idql_checkpoint),
         "dp_checkpoint": (
             str(args.dp_checkpoint)
-            if args.actor_source in ("plain_dp", "external_dp_chunk_critic")
+            if args.actor_source in (
+                "plain_dp",
+                "external_dp_chunk_critic",
+                "hybrid_dp_chunk_actor",
+            )
             else None
         ),
         "actor_source": args.actor_source,
@@ -896,13 +1318,14 @@ def main() -> None:
         parser.error("actor_source=plain_dp evaluates the standard DP queue; use --num-candidates 1")
     if len(set(args.num_candidates)) != len(args.num_candidates):
         parser.error("--num-candidates must not contain duplicates")
-    if len(set(args.seeds)) != len(args.seeds):
-        parser.error("--seeds must not contain duplicates")
+    try:
+        validate_grid_seeds(args.seeds)
+    except ValueError as error:
+        parser.error(str(error))
     if args.rollouts_per_chunk <= 0:
         args.rollouts_per_chunk = args.n_rollouts
 
-    results = run_grid(args)
-    summarize(results, args)
+    run_grid(args)
 
 
 if __name__ == "__main__":

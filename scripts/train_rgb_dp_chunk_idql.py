@@ -56,7 +56,6 @@ from train_rgb_dp_idql import (
     replace_with_hardlink,
     restore_rng_state,
     rng_state,
-    write_json,
 )
 
 
@@ -84,6 +83,8 @@ ACTOR_WEIGHT_DECAY = 1e-6
 JOINT_ACTOR_INITIALIZATIONS = frozenset(
     ("pretrained_dp_joint", "source_chunk_idql_joint")
 )
+LATEST_CHECKPOINT_NAME = "latest.pt"
+LATEST_CHECKPOINT_TEMP_PREFIX = f".{LATEST_CHECKPOINT_NAME}.tmp-"
 
 
 def actor_condition_definition(mode: str) -> str:
@@ -726,13 +727,14 @@ def configure_conditioned_actor(actor_algo, args: argparse.Namespace) -> None:
                 "already contains a condition adapter"
             )
         return
-    if not hasattr(actor_algo, "install_success_condition_adapter"):
-        raise RuntimeError(
-            "loaded DiffusionPolicy does not support a condition adapter"
+    if not has_condition_adapter(actor_algo):
+        if not hasattr(actor_algo, "install_success_condition_adapter"):
+            raise RuntimeError(
+                "loaded DiffusionPolicy does not support a condition adapter"
+            )
+        actor_algo.install_success_condition_adapter(
+            hidden_dim=int(args.condition_hidden_dim)
         )
-    actor_algo.install_success_condition_adapter(
-        hidden_dim=int(args.condition_hidden_dim)
-    )
     adapter = actor_algo.nets["policy"]["condition_adapter"]
     if int(adapter.hidden_dim) != int(args.condition_hidden_dim):
         raise ValueError(
@@ -746,6 +748,225 @@ def configure_conditioned_actor(actor_algo, args: argparse.Namespace) -> None:
         condition_mask=1.0,
     )
     actor_algo.success_condition_dropout = float(args.condition_dropout)
+
+
+def file_stat_identity(path: Path) -> dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return {
+            "path": str(resolved),
+            "exists": False,
+            "size": None,
+            "mtime_ns": None,
+        }
+    return {
+        "path": str(resolved),
+        "exists": True,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def mixed_dataset_identity(path: Path) -> dict[str, Any]:
+    """Identify the mixed HDF5 and the external source files it reads."""
+    resolved = path.expanduser().resolve()
+    identity: dict[str, Any] = {"dataset": file_stat_identity(resolved)}
+    source_paths: dict[str, Any] = {}
+    try:
+        with h5py.File(resolved, "r") as dataset:
+            for attribute in ("expert_source", "non_expert_source"):
+                stored = dataset.attrs.get(attribute)
+                if isinstance(stored, bytes):
+                    stored = stored.decode("utf-8")
+                if stored is None:
+                    source_paths[attribute] = None
+                    continue
+                source = Path(str(stored)).expanduser()
+                if not source.is_absolute():
+                    source = resolved.parent / source
+                source_paths[attribute] = file_stat_identity(source)
+    except OSError:
+        source_paths = {
+            "expert_source": None,
+            "non_expert_source": None,
+        }
+    identity["external_sources"] = source_paths
+    return identity
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(jsonable(payload), handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def checkpoint_temporary_pid(path: Path) -> int | None:
+    """Return the writer PID for a valid atomic ``latest.pt`` temporary."""
+    if path.is_symlink() or not path.is_file():
+        return None
+    if not path.name.startswith(LATEST_CHECKPOINT_TEMP_PREFIX):
+        return None
+    suffix = path.name[len(LATEST_CHECKPOINT_TEMP_PREFIX) :]
+    if not suffix.isdecimal():
+        return None
+    writer_pid = int(suffix)
+    if writer_pid <= 0 or writer_pid > 2_147_483_647:
+        return None
+    return writer_pid
+
+
+def process_is_running(pid: int) -> bool:
+    """Conservatively report whether a temporary's writer may still exist."""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def prepare_fresh_output_directory(output_dir: Path) -> list[Path]:
+    """Create an empty fresh-run directory, cleaning only stale save temps."""
+    if output_dir.exists() and not output_dir.is_dir():
+        raise FileExistsError(
+            f"fresh training output is not a directory: {output_dir}"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    entries = sorted(output_dir.iterdir(), key=lambda path: path.name)
+    temporary_entries: list[tuple[Path, int]] = []
+    unexpected_entries: list[Path] = []
+    for entry in entries:
+        writer_pid = checkpoint_temporary_pid(entry)
+        if writer_pid is None:
+            unexpected_entries.append(entry)
+        else:
+            temporary_entries.append((entry, writer_pid))
+    if unexpected_entries:
+        names = [entry.name for entry in unexpected_entries]
+        raise FileExistsError(
+            f"refusing fresh training in non-empty output dir: {output_dir}; "
+            f"unexpected entries={names}"
+        )
+    active_temporaries = [
+        entry.name
+        for entry, writer_pid in temporary_entries
+        if process_is_running(writer_pid)
+    ]
+    if active_temporaries:
+        raise FileExistsError(
+            f"refusing to remove active checkpoint temporaries in {output_dir}: "
+            f"{active_temporaries}"
+        )
+    cleaned = [entry for entry, _ in temporary_entries]
+    for entry in cleaned:
+        entry.unlink()
+    return cleaned
+
+
+def validate_resume_semantics(
+    resume_state: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    """Reject resumes that would silently change the task or objective."""
+    saved_args = resume_state.get("args", {})
+    if str(resume_state.get("task", "")) != str(args.task):
+        raise ValueError(
+            f"resume task={resume_state.get('task')!r} does not match "
+            f"requested task={args.task!r}"
+        )
+    saved_dataset = resume_state.get("dataset", saved_args.get("dataset"))
+    if saved_dataset is None:
+        raise ValueError("resume checkpoint has no dataset provenance")
+    if Path(saved_dataset).expanduser().resolve() != args.dataset:
+        raise ValueError(
+            f"resume dataset={saved_dataset!r} does not match requested "
+            f"dataset={str(args.dataset)!r}"
+        )
+    saved_identity = resume_state.get("dataset_identity")
+    if saved_identity is None:
+        if not bool(getattr(args, "validate_resume_only", False)):
+            raise ValueError(
+                "resume checkpoint has no immutable dataset identity; use it as a "
+                "source warm start for a fresh output instead"
+            )
+        print(
+            "WARNING: legacy checkpoint has no immutable dataset identity; "
+            "completion validation is limited to its saved dataset path",
+            flush=True,
+        )
+    elif saved_identity != args.dataset_identity:
+        raise ValueError(
+            "resume dataset identity does not match the current mixed HDF5 "
+            "and external source files"
+        )
+
+    exact_fields: dict[str, Any] = {
+        "epochs": int(args.epochs),
+        "seed": int(args.seed),
+        "batch_size": int(args.batch_size),
+        "effective_global_batch_size": int(args.effective_global_batch_size),
+        "schedule_reference_batch_size": int(args.schedule_reference_batch_size),
+        "chunk_horizon": int(args.chunk_horizon),
+        "discount": float(args.discount),
+        "expectile": float(args.expectile),
+        "target_tau": float(args.target_tau),
+        "critic_hidden_dims": tuple(int(x) for x in args.critic_hidden_dims),
+        "latent_dim": int(args.latent_dim),
+        "action_hidden_dim": int(args.action_hidden_dim),
+        "num_attention_heads": int(args.num_attention_heads),
+        "num_action_conv_layers": int(args.num_action_conv_layers),
+        "dropout": float(args.dropout),
+        "num_critics": int(args.num_critics),
+        "critic_group_norm": bool(args.critic_group_norm),
+        "critic_late_fusion_key": args.critic_late_fusion_key,
+        "dynamics_weight": float(args.dynamics_weight),
+        "dynamics_cosine_weight": float(args.dynamics_cosine_weight),
+        "dynamics_warmup_steps": int(args.dynamics_warmup_steps),
+        "encoder_freeze_steps": int(args.encoder_freeze_steps),
+        "vf_encoder_freeze_steps": int(args.vf_encoder_freeze_steps),
+        "use_huber": bool(args.use_huber),
+        "max_gradient_norm": float(args.max_gradient_norm),
+        "critic_vf_lr_scheduler": str(args.critic_vf_lr_scheduler),
+        "critic_vf_lr_warmup_steps": int(args.critic_vf_lr_warmup_steps),
+        "critic_vf_lr_num_cycles": float(args.critic_vf_lr_num_cycles),
+    }
+    if args.steps_per_epoch is not None:
+        exact_fields["steps_per_epoch"] = int(args.steps_per_epoch)
+    for field, requested in exact_fields.items():
+        if field not in saved_args:
+            if bool(args.validate_resume_only) and field == "effective_global_batch_size":
+                saved = int(saved_args["batch_size"])
+            elif (
+                bool(args.validate_resume_only)
+                and field == "schedule_reference_batch_size"
+            ):
+                saved = 100
+            else:
+                raise ValueError(
+                    f"resume checkpoint has no immutable {field} configuration; "
+                    "use it as a source warm start for a fresh output instead"
+                )
+        else:
+            saved = saved_args[field]
+        if field == "critic_hidden_dims":
+            saved = tuple(int(x) for x in saved)
+        if saved != requested:
+            raise ValueError(
+                f"resume {field}={saved!r} does not match requested "
+                f"{field}={requested!r}; use a source warm start for an "
+                "intentional objective change"
+            )
 
 
 def install_pretrained_actor_reference(
@@ -1739,8 +1960,10 @@ def checkpoint_payload(
             else None
         ),
         "pretrained_dp_checkpoint": str(pretrained_dp_checkpoint),
+        "pretrained_dp_identity": copy.deepcopy(args.pretrained_dp_identity),
         "task": str(args.task),
         "dataset": str(args.dataset),
+        "dataset_identity": copy.deepcopy(args.dataset_identity),
         "single_dataloader": distributed_world_size == 1,
         "sampling": (
             "distributed_shuffled_SequenceDataset_indices"
@@ -1808,6 +2031,10 @@ def checkpoint_payload(
         ),
         "actor_condition_hidden_dim": (
             int(args.condition_hidden_dim) if args.conditioned_actor else None
+        ),
+        "actor_condition_adapter": (
+            str(args.actor_condition_adapter_type)
+            if args.conditioned_actor else None
         ),
         "actor_source_mask": (
             "none_all_shared_batch_rows"
@@ -1922,8 +2149,20 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     args.distributed_local_rank = int(distributed.local_rank)
     args.distributed_world_size = int(distributed.world_size)
     configure_batch_semantics(args, distributed)
+    args.dataset_identity = mixed_dataset_identity(args.dataset)
     if distributed.is_main_process:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+        if args.resume_checkpoint is None:
+            cleaned_temporaries = prepare_fresh_output_directory(
+                args.output_dir
+            )
+            if cleaned_temporaries:
+                print(
+                    f"Removed stale checkpoint temporaries: "
+                    f"{[path.name for path in cleaned_temporaries]}",
+                    flush=True,
+                )
+        else:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
     if distributed.enabled:
         dist.barrier()
     device = distributed.device
@@ -1941,6 +2180,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         )
         if not resume_state.get("rise_style_rgb_chunk_idql", False):
             raise ValueError("resume checkpoint is not a chunk IDQL checkpoint")
+        validate_resume_semantics(resume_state, args)
         saved_distributed = resume_state.get("distributed_training", {})
         if bool(saved_distributed.get("enabled", False)) and (
             not distributed.enabled
@@ -2006,8 +2246,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "encoder_lr": float(args.encoder_lr),
             "vf_lr": float(args.vf_lr),
         }
+        legacy_float_defaults: dict[str, float] = {}
+        if bool(args.validate_resume_only):
+            legacy_actor_lr = saved_args.get("actor_lr")
+            if legacy_actor_lr is not None:
+                for field in (
+                    "actor_adapter_lr",
+                    "actor_unet_lr",
+                    "actor_obs_encoder_lr",
+                ):
+                    legacy_float_defaults[field] = float(legacy_actor_lr)
+            legacy_float_defaults["actor_reference_weight"] = 0.0
+            legacy_float_defaults["actor_reference_batch_fraction"] = 0.25
+
         for field, requested_value in resume_float_fields.items():
-            saved_value = float(saved_args.get(field, 0.0))
+            saved_value = float(saved_args.get(field, legacy_float_defaults.get(field, 0.0)))
             if saved_value != requested_value:
                 raise ValueError(
                     f"resume {field}={saved_value} does not match requested "
@@ -2125,6 +2378,56 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     else:
         pretrained_dp_checkpoint = str(args.checkpoint)
 
+    current_dp_identity = file_stat_identity(Path(pretrained_dp_checkpoint))
+    if not current_dp_identity["exists"]:
+        raise FileNotFoundError(
+            f"pretrained DP checkpoint does not exist: {pretrained_dp_checkpoint}"
+        )
+    if resume_state is not None:
+        saved_dp_identity = resume_state.get("pretrained_dp_identity")
+        if saved_dp_identity is None:
+            if not bool(args.validate_resume_only):
+                raise ValueError(
+                    "resume checkpoint has no immutable pretrained DP identity"
+                )
+            print(
+                "WARNING: legacy checkpoint has no immutable pretrained DP identity",
+                flush=True,
+            )
+        elif saved_dp_identity != current_dp_identity:
+            raise ValueError(
+                "resume pretrained DP checkpoint identity has changed"
+            )
+    elif source_for_warm_start is not None:
+        source_dp_identity = source_for_warm_start.get("pretrained_dp_identity")
+        if (
+            source_dp_identity is not None
+            and source_dp_identity != current_dp_identity
+        ):
+            raise ValueError(
+                "source checkpoint pretrained DP identity has changed"
+            )
+    args.pretrained_dp_identity = current_dp_identity
+
+    if bool(args.validate_resume_only):
+        if resume_state is None:
+            raise ValueError("--validate-resume-only requires --resume-checkpoint")
+        validate_chunk_source(resume_state, args)
+        saved_epoch = int(resume_state.get("epoch", -1))
+        if saved_epoch != int(args.epochs):
+            raise ValueError(
+                f"completion checkpoint epoch={saved_epoch} does not match "
+                f"requested epochs={args.epochs}"
+            )
+        result = {
+            "validated": True,
+            "checkpoint": str(args.resume_checkpoint),
+            "epoch": saved_epoch,
+            "task": str(args.task),
+        }
+        print(json.dumps(result, indent=2), flush=True)
+        return result
+
     actor_policy, dp_checkpoint = FileUtils.policy_from_checkpoint(
         ckpt_path=pretrained_dp_checkpoint, device=device, verbose=False
     )
@@ -2164,6 +2467,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             ),
         }
     if trains_joint_actor(args):
+        if resume_state is not None:
+            # Install the exact saved adapter architecture before constructing
+            # optimizer groups. This retains legacy residual-conditioned actors
+            # while new runs continue to use the FiLM adapter.
+            actor_algo.deserialize(
+                resume_state["actor_model"],
+                load_optimizers=False,
+            )
+            if actor_algo.ema is not None:
+                actor_algo.ema.optimization_step = int(
+                    resume_state.get("actor_ema_optimization_step", 0)
+                )
         if resume_state is None:
             if args.initialization == "source_chunk_idql_joint":
                 actor_algo.deserialize(
@@ -2209,6 +2524,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             )
         configure_conditioned_actor(actor_algo, args)
         actor_audit = freeze_actor(actor_algo)
+    args.actor_condition_adapter_type = (
+        type(actor_algo.nets["policy"]["condition_adapter"]).__name__
+        if args.conditioned_actor
+        else None
+    )
+
     args.checkpoint = Path(pretrained_dp_checkpoint)
 
     actor_horizon = int(actor_algo.algo_config.horizon.action_horizon)
@@ -2626,15 +2947,32 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             source_for_warm_start["dynamics_target_encoder"],
             strict=True,
         )
+        dynamics_sync_audit = sync_actor_dynamics_target_encoder(
+            dynamics_target_encoder,
+            actor_algo,
+        )
+        warm_start_audit["dynamics_target_resync"] = {
+            **dynamics_sync_audit,
+            "source_last_sync_step": int(
+                source_for_warm_start["dynamics_target_last_sync_step"]
+            ),
+            "fresh_round_sync_step": 0,
+        }
         vf.load_state_dict(source_for_warm_start["vf"], strict=True)
         if distributed.is_main_process:
             print(
                 "Warm-started actor, actor EMA, twin critics, target critics, "
-                "VF, and dynamics target from "
+                "VF, and a dynamics target resynced from the loaded actor EMA at "
                 f"{args.source_chunk_idql_checkpoint}; starting fresh "
                 "optimizers, LR schedules, epoch=0, and global_step=0",
                 flush=True,
             )
+    if resume_state is not None and start_epoch > int(args.epochs):
+        raise ValueError(
+            f"resume checkpoint passed epoch={start_epoch}; requested "
+            f"epochs={args.epochs}. Use that checkpoint for evaluation or "
+            "increase epochs with a fresh source warm start and schedule."
+        )
     configure_target_random_crops(targets)
     configure_encoder_target_random_crops(dynamics_target_encoder)
 
@@ -2673,6 +3011,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         actor_algo.gradient_sync_fn = gradient_sync_fn
     if distributed.enabled and resume_state is None:
         seed_process(int(args.seed) + distributed.rank, device)
+    repair_completed_resume = (
+        resume_state is not None
+        and start_epoch == int(args.epochs)
+    )
+    publish_epoch_zero = resume_state is None
     del resume_state, source_for_warm_start
 
     if not trains_joint_actor(args):
@@ -2682,14 +3025,63 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def current_checkpoint_payload(
+        checkpoint_epoch: int,
+        rank_runtime_states: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        return checkpoint_payload(
+            args=args,
+            actor_model=actor_algo.serialize(),
+            actor_ema_optimization_step=int(
+                actor_algo.ema.optimization_step
+                if actor_algo.ema is not None
+                else 0
+            ),
+            pretrained_dp_checkpoint=pretrained_dp_checkpoint,
+            critics=critics,
+            targets=targets,
+            dynamics_target_encoder=dynamics_target_encoder,
+            dynamics_target_last_sync_step=(
+                dynamics_target_last_sync_step
+            ),
+            vf=vf,
+            critic_optimizers=critic_optimizers,
+            vf_optimizer=vf_optimizer,
+            critic_lr_schedulers=critic_lr_schedulers,
+            vf_lr_scheduler=vf_lr_scheduler,
+            action_stats=action_stats,
+            epoch=checkpoint_epoch,
+            global_step=global_step,
+            global_samples_seen=global_samples_seen,
+            history=history,
+            loader_generator=loader_generator,
+            rank_runtime_states=rank_runtime_states,
+            distributed_context=distributed,
+        )
+
+    if publish_epoch_zero:
+        rank_runtime_states = gather_rank_runtime_states(
+            loader_generator,
+            distributed,
+        )
+        if distributed.is_main_process:
+            latest = args.output_dir / LATEST_CHECKPOINT_NAME
+            payload = current_checkpoint_payload(
+                0,
+                rank_runtime_states,
+            )
+            atomic_torch_save(payload, latest)
+            print(
+                f"Saved recovery checkpoint {latest} at epoch=0 step=0",
+                flush=True,
+            )
+        if distributed.enabled:
+            dist.barrier()
+
     architecture = {
         "actor": actor_audit,
         "conditional_diffusion_actor": bool(args.conditioned_actor),
-        "actor_condition_adapter": (
-            "SuccessConditionFiLM"
-            if args.conditioned_actor
-            else None
-        ),
+        "actor_condition_adapter": args.actor_condition_adapter_type,
         "critic_parameter_counts": [parameter_count(x) for x in critics],
         "target_critic_parameter_counts": [parameter_count(x) for x in targets],
         "dynamics_target_encoder_parameter_count": parameter_count(
@@ -2711,7 +3103,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "dynamics_prediction_output": "raw_actor_encoder_features",
         "dynamics_prediction_output_dim": target_encoder_output_dim,
         "dynamics_prediction_residual": False,
-        "dynamics_target_encoder": "shared_deployed_actor_ema_obs_encoder",
+        "dynamics_target_encoder": (
+            "frozen_copy_periodically_hard_synced_from_deployed_actor_ema_"
+            "obs_encoder"
+            if trains_joint_actor(args)
+            else "frozen_copy_of_deployed_actor_ema_obs_encoder"
+        ),
         "dynamics_target_update": (
             "periodic_hard_sync"
             if trains_joint_actor(args)
@@ -2746,6 +3143,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             else None
         ),
         "pretrained_dp_checkpoint": pretrained_dp_checkpoint,
+        "pretrained_dp_identity": copy.deepcopy(args.pretrained_dp_identity),
         "actor_initialization_audit": {
             "loaded_with_policy_from_checkpoint": True,
             "trainable_actor_initialized_from_deployed_ema": bool(
@@ -2760,6 +3158,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         },
         "dataset": {
             **audit,
+            "provenance_identity": copy.deepcopy(args.dataset_identity),
             "actor_conditioning": condition_audit,
         },
         "loader": {
@@ -2921,8 +3320,49 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "rank_zero_writes_only": True,
         },
     }
+    if repair_completed_resume:
+        last_epoch_metrics = (
+            history[-1].get("metrics", {})
+            if history
+            else {}
+        )
+        final = {
+            **startup,
+            "last_completed_epoch": int(start_epoch),
+            "global_step": int(global_step),
+            "global_samples_seen": int(global_samples_seen),
+            "last_epoch_metrics": last_epoch_metrics,
+            "history": history,
+            "checkpoints": {
+                "latest": str(args.output_dir / "latest.pt"),
+                "last": str(args.output_dir / "last.pt"),
+            },
+        }
+        if distributed.is_main_process:
+            latest = args.output_dir / "latest.pt"
+            replace_with_hardlink(args.resume_checkpoint, latest)
+            replace_with_hardlink(latest, args.output_dir / "last.pt")
+            if (
+                int(args.snapshot_every_epochs) > 0
+                and start_epoch % int(args.snapshot_every_epochs) == 0
+            ):
+                replace_with_hardlink(
+                    latest,
+                    args.output_dir / "models" / f"model_epoch_{start_epoch}.pt",
+                )
+            atomic_write_json(args.output_dir / "training_config.json", startup)
+            atomic_write_json(args.output_dir / "partial_summary.json", final)
+            atomic_write_json(args.output_dir / "summary.json", final)
+            print(
+                f"Repaired completed checkpoint links and summary at epoch={start_epoch}",
+                flush=True,
+            )
+        if distributed.enabled:
+            dist.barrier()
+        return final if distributed.is_main_process else {}
+
     if distributed.is_main_process:
-        write_json(args.output_dir / "training_config.json", startup)
+        atomic_write_json(args.output_dir / "training_config.json", startup)
         print(json.dumps(jsonable(startup), indent=2), flush=True)
         writer = make_tensorboard_writer(args.output_dir)
     else:
@@ -3158,7 +3598,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             },
         }
         if distributed.is_main_process:
-            write_json(args.output_dir / "partial_summary.json", partial)
+            atomic_write_json(args.output_dir / "partial_summary.json", partial)
 
         if (
             epoch % int(args.save_every_epochs) == 0
@@ -3170,36 +3610,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 else None
             )
             if distributed.is_main_process:
-                payload = checkpoint_payload(
-                    args=args,
-                    actor_model=actor_algo.serialize(),
-                    actor_ema_optimization_step=int(
-                        actor_algo.ema.optimization_step
-                        if actor_algo.ema is not None
-                        else 0
-                    ),
-                    pretrained_dp_checkpoint=pretrained_dp_checkpoint,
-                    critics=critics,
-                    targets=targets,
-                    dynamics_target_encoder=dynamics_target_encoder,
-                    dynamics_target_last_sync_step=(
-                        dynamics_target_last_sync_step
-                    ),
-                    vf=vf,
-                    critic_optimizers=critic_optimizers,
-                    vf_optimizer=vf_optimizer,
-                    critic_lr_schedulers=critic_lr_schedulers,
-                    vf_lr_scheduler=vf_lr_scheduler,
-                    action_stats=action_stats,
-                    epoch=epoch,
-                    global_step=global_step,
-                    global_samples_seen=global_samples_seen,
-                    history=history,
-                    loader_generator=loader_generator,
-                    rank_runtime_states=rank_runtime_states,
-                    distributed_context=distributed,
+                payload = current_checkpoint_payload(
+                    epoch,
+                    rank_runtime_states,
                 )
-                latest = args.output_dir / "latest.pt"
+                latest = args.output_dir / LATEST_CHECKPOINT_NAME
                 atomic_torch_save(payload, latest)
                 if epoch == int(args.epochs):
                     replace_with_hardlink(latest, args.output_dir / "last.pt")
@@ -3223,7 +3638,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         writer.close()
     if distributed.is_main_process:
         final = json.loads((args.output_dir / "partial_summary.json").read_text())
-        write_json(args.output_dir / "summary.json", final)
+        atomic_write_json(args.output_dir / "summary.json", final)
     else:
         final = {}
     if distributed.enabled:
@@ -3262,6 +3677,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
+    parser.add_argument("--validate-resume-only", action="store_true")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument(
         "--distributed",
@@ -3487,8 +3903,52 @@ def main() -> None:
         parser.error(
             f"resume checkpoint does not exist: {args.resume_checkpoint}"
         )
+    if args.epochs is None or args.epochs <= 0:
+        parser.error("epochs must be positive")
     if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
         parser.error("steps-per-epoch must be positive when specified")
+    if args.num_workers < 0:
+        parser.error("num-workers must be non-negative")
+    if args.num_workers > 0 and args.prefetch_factor <= 0:
+        parser.error("prefetch-factor must be positive when workers are enabled")
+    if args.chunk_horizon <= 0:
+        parser.error("chunk-horizon must be positive")
+    if not 0.0 <= args.discount <= 1.0:
+        parser.error("discount must be in [0, 1]")
+    if not 0.5 <= args.expectile < 1.0:
+        parser.error("expectile must be in [0.5, 1)")
+    if not 0.0 < args.target_tau <= 1.0:
+        parser.error("target-tau must be in (0, 1]")
+    if not 0.0 <= args.dropout < 1.0:
+        parser.error("dropout must be in [0, 1)")
+    if args.condition_hidden_dim <= 0:
+        parser.error("condition-hidden-dim must be positive")
+    if args.latent_dim <= 0 or args.action_hidden_dim <= 0:
+        parser.error("latent and action hidden dimensions must be positive")
+    if args.num_attention_heads <= 0:
+        parser.error("num-attention-heads must be positive")
+    if args.action_hidden_dim % args.num_attention_heads != 0:
+        parser.error("action-hidden-dim must be divisible by num-attention-heads")
+    if args.num_action_conv_layers < 0:
+        parser.error("num-action-conv-layers must be non-negative")
+    if any(int(value) <= 0 for value in args.critic_hidden_dims):
+        parser.error("critic-hidden-dims must all be positive")
+    for name in (
+        "actor_lr_warmup_steps",
+        "critic_vf_lr_warmup_steps",
+        "dynamics_warmup_steps",
+        "encoder_freeze_steps",
+        "vf_encoder_freeze_steps",
+    ):
+        if int(getattr(args, name)) < 0:
+            parser.error(f"{name.replace('_', '-')} must be non-negative")
+    for name in ("dynamics_weight", "dynamics_cosine_weight"):
+        if float(getattr(args, name)) < 0.0:
+            parser.error(f"{name.replace('_', '-')} must be non-negative")
+    if args.log_every <= 0 or args.save_every_epochs <= 0:
+        parser.error("log-every and save-every-epochs must be positive")
+    if args.snapshot_every_epochs < 0:
+        parser.error("snapshot-every-epochs must be non-negative")
     if args.batch_size <= 0:
         parser.error("batch-size must be positive")
     if args.schedule_reference_batch_size <= 0:
