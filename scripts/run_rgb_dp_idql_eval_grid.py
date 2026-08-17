@@ -912,17 +912,19 @@ def run_grid(args: argparse.Namespace) -> list[dict]:
         results = []
         gpu_id = worker_gpu_ids[0]
         for num_candidates, seed in pairs:
-            results.append(
-                run_pair(
-                    args,
-                    num_candidates,
-                    seed,
-                    gpu_id=gpu_id,
-                    common_inputs=common_inputs,
-                )
+            result = run_pair(
+                args,
+                num_candidates,
+                seed,
+                gpu_id=gpu_id,
+                common_inputs=common_inputs,
             )
+            results.append(result)
+            # Publish usable aggregate results as soon as each pair finishes.
+            # summarize validates the frozen provenance and writes atomically,
+            # so an interrupted grid leaves a truthful partial summary.
+            summarize(results, args, common_inputs=common_inputs)
         validate_grid_results(results, args, common_inputs)
-        summarize(results, args, common_inputs=common_inputs)
         return results
 
     print(
@@ -1002,6 +1004,19 @@ def run_grid(args: argparse.Namespace) -> list[dict]:
                     (int(result["num_candidates"]), int(result["seed"]))
                 ]
             )
+            try:
+                # Only the parent thread publishes the aggregate. This keeps
+                # multi-GPU completion order safe while making every finished
+                # pair immediately visible in the summary file.
+                summarize(results, args, common_inputs=common_inputs)
+            except Exception:
+                stop_event.set()
+                failure = (
+                    f"failed to publish progress after gpu_id={gpu_id} "
+                    f"N={num_candidates} seed={seed}:\n{traceback.format_exc()}"
+                )
+                failures.append(failure)
+                print(f"[grid progress failed] {failure}", flush=True)
             print(
                 f"[gpu pair complete] gpu_id={gpu_id} N={num_candidates} seed={seed} "
                 f"completed={len(results)}/{len(pairs)}",
@@ -1021,7 +1036,6 @@ def run_grid(args: argparse.Namespace) -> list[dict]:
     if failures:
         if results:
             validate_grid_results(results, args, common_inputs)
-            summarize(results, args, common_inputs=common_inputs)
         raise RuntimeError(
             "multi-GPU evaluation stopped after a worker failure:\n"
             + "\n".join(failures)
@@ -1031,7 +1045,6 @@ def run_grid(args: argparse.Namespace) -> list[dict]:
             f"multi-GPU evaluation completed {len(results)}/{len(pairs)} pairs"
         )
     validate_grid_results(results, args, common_inputs)
-    summarize(results, args, common_inputs=common_inputs)
     return results
 
 
@@ -1121,11 +1134,29 @@ def summarize(
                 "seeds": seed_runs,
             }
         )
+    configured_pairs = [
+        (int(num_candidates), int(seed))
+        for num_candidates in args.num_candidates
+        for seed in args.seeds
+    ]
+    completed_pairs = {
+        (int(result["num_candidates"]), int(result["seed"]))
+        for result in results
+    }
+    pending_pairs = [
+        {"num_candidates": num_candidates, "seed": seed}
+        for num_candidates, seed in configured_pairs
+        if (num_candidates, seed) not in completed_pairs
+    ]
     summary = {
         PROVENANCE_KEY: grid_experiment_provenance(
             args,
             common_inputs=common_inputs,
         ),
+        "status": "complete" if not pending_pairs else "partial",
+        "completed_pairs": len(completed_pairs),
+        "total_pairs": len(configured_pairs),
+        "pending_pairs": pending_pairs,
         "idql_checkpoint": None if args.actor_source == "plain_dp" else str(args.idql_checkpoint),
         "dp_checkpoint": (
             str(args.dp_checkpoint)
@@ -1186,8 +1217,13 @@ def summarize(
     }
     path = args.output_dir / "one_step_idql_eval_grid_summary.json"
     atomic_write_json(path, summary)
-    print(json.dumps(summary, indent=2), flush=True)
-    print(f"Wrote {path}", flush=True)
+    if summary["status"] == "complete":
+        print(json.dumps(summary, indent=2), flush=True)
+    print(
+        f"[grid summary wrote] {path} status={summary['status']} "
+        f"completed={summary['completed_pairs']}/{summary['total_pairs']}",
+        flush=True,
+    )
     return summary
 
 

@@ -198,7 +198,10 @@ bash run_rgb_dp_chunk_idql.sh tool_hang eval_chunk_grid_resilient
 ```
 
 The parent process dynamically schedules pairs across GPUs and alone writes
-the aggregate summary. Each worker binds both PyTorch and MuJoCo EGL to its
+the aggregate summary, atomically refreshing it after every completed
+`(candidate count, seed)` pair. Partial summaries report completed and pending
+pairs, so results remain usable if a later pair is slow or fails. Each worker
+binds both PyTorch and MuJoCo EGL to its
 assigned physical GPU. `EVAL_NUM_GPUS` defaults to one; use a space-separated
 list such as `EVAL_GPU_IDS="2 4 6 7"` to select specific physical devices (all
 listed devices are used when `EVAL_NUM_GPUS` is omitted). The same controls

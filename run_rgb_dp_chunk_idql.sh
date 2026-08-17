@@ -710,8 +710,8 @@ run_chunk_train() {
     --num-critics "${NUM_CRITICS:-2}" \
     "$CRITIC_GROUP_NORM_ARG" \
     --critic-late-fusion-key "$CRITIC_LATE_FUSION_KEY" \
-    --dynamics-weight "${DYNAMICS_WEIGHT:-0.5}" \
-    --dynamics-cosine-weight "${DYNAMICS_COSINE_WEIGHT:-0.5}" \
+    --dynamics-weight "${DYNAMICS_WEIGHT:-0.0}" \
+    --dynamics-cosine-weight "${DYNAMICS_COSINE_WEIGHT:-0.1}" \
     --dynamics-warmup-steps "${DYNAMICS_WARMUP_STEPS:-1000}" \
     --encoder-freeze-steps "$ENCODER_FREEZE_STEPS" \
     --vf-encoder-freeze-steps "$VF_ENCODER_FREEZE_STEPS" \
