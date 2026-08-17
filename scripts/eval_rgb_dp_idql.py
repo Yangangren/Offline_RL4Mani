@@ -33,6 +33,8 @@ from robomimic.envs.wrappers import EnvWrapper
 
 from train_square_rgb_dp_one_step_idql import ChunkIQLCritic, OneStepDiffusionActor, make_scheduler
 from train_rgb_dp_chunk_idql import (
+    PREDICTED_NEXT_Q_NORMALIZATION,
+    critic_q_head_inputs,
     make_rise_chunk_value_networks,
     match_encoder_normalization_to_checkpoint,
 )
@@ -805,7 +807,14 @@ class RiseStyleRGBIDQLPolicy:
         self.last_selection_is_random: bool | None = None
 
         horizon = self.algo.algo_config.horizon
-        self.checkpoint["observation_horizon"] = int(horizon.observation_horizon)
+        actor_observation_horizon = int(horizon.observation_horizon)
+        if not 1 <= self.critic_observation_horizon <= actor_observation_horizon:
+            raise ValueError(
+                "critic observation horizon must be in [1, actor observation "
+                f"horizon={actor_observation_horizon}], got "
+                f"{self.critic_observation_horizon}"
+            )
+        self.checkpoint["observation_horizon"] = actor_observation_horizon
         self.checkpoint["prediction_horizon"] = int(horizon.prediction_horizon)
         self.checkpoint["action_horizon"] = int(horizon.action_horizon)
         self.checkpoint["actor_proposal_horizon"] = int(horizon.action_horizon)
@@ -886,9 +895,7 @@ class RiseStyleRGBIDQLPolicy:
             self.last_selected_index = 0
             self.last_selection_is_random = None
         else:
-            if bool(
-                self.checkpoint.get("stacked_pretrained_dql_critic", False)
-            ):
+            if self.critic_observation_horizon > 1:
                 current_obs = stacked_obs_for_value_network(
                     self.algo,
                     prepared_obs,
@@ -1496,6 +1503,37 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
         vf = None
         if int(args.num_candidates) > 1:
             if checkpoint.get("rise_style_rgb_chunk_idql", False):
+                q_uses_predicted_next = bool(
+                    checkpoint.get(
+                        "critic_q_use_predicted_next_latent",
+                        False,
+                    )
+                )
+                expected_q_inputs = critic_q_head_inputs(
+                    q_uses_predicted_next
+                )
+                saved_q_inputs = tuple(
+                    checkpoint.get(
+                        "critic_q_head_inputs",
+                        expected_q_inputs,
+                    )
+                )
+                if saved_q_inputs != expected_q_inputs:
+                    raise ValueError(
+                        "chunk checkpoint Q-head metadata is inconsistent: "
+                        f"{saved_q_inputs!r} != {expected_q_inputs!r}"
+                    )
+                if (
+                    q_uses_predicted_next
+                    and checkpoint.get(
+                        "critic_q_predicted_next_normalization"
+                    )
+                    != PREDICTED_NEXT_Q_NORMALIZATION
+                ):
+                    raise ValueError(
+                        "chunk checkpoint uses an unsupported predicted-next "
+                        "Q normalization"
+                    )
                 critics, critic_targets, vf = make_rise_chunk_value_networks(
                     dp_policy.policy,
                     chunk_horizon=int(checkpoint["critic_chunk_horizon"]),
@@ -1519,6 +1557,12 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
                     ),
                     late_fusion_key=checkpoint.get(
                         "critic_late_fusion_key", "robot0_gripper_qpos"
+                    ),
+                    observation_horizon=int(
+                        checkpoint.get("critic_observation_horizon", 1)
+                    ),
+                    q_use_predicted_next_latent=(
+                        q_uses_predicted_next
                     ),
                 )
             elif bool(checkpoint.get("stacked_pretrained_dql_critic", False)):
@@ -1964,6 +2008,24 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
             policy.checkpoint.get("rise_style_rgb_chunk_idql", False)
         ),
         "critic_chunk_horizon": int(policy.checkpoint.get("critic_chunk_horizon", 1)),
+        "critic_observation_horizon": int(
+            policy.checkpoint.get("critic_observation_horizon", 1)
+        ),
+        "critic_q_head_inputs": list(
+            policy.checkpoint.get(
+                "critic_q_head_inputs",
+                ("context", "action_repr"),
+            )
+        ),
+        "critic_q_use_predicted_next_latent": bool(
+            policy.checkpoint.get(
+                "critic_q_use_predicted_next_latent",
+                False,
+            )
+        ),
+        "critic_q_predicted_next_normalization": policy.checkpoint.get(
+            "critic_q_predicted_next_normalization"
+        ),
         "critic_input_mode": policy.checkpoint.get("critic_input_mode"),
         "critic_action_space": policy.checkpoint.get("critic_action_space"),
         "critic_late_fusion_key": policy.checkpoint.get("critic_late_fusion_key"),

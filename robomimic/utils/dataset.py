@@ -737,18 +737,37 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
 
     The wrapped ``SequenceDataset`` still supplies the full action, reward,
     done, and conditioning sequence. Images are restricted to the actor's
-    observation history plus one terminal-aware next observation.
+    observation history plus a terminal-aware next observation history.
     """
 
-    def __init__(self, dataset, chunk_horizon, observation_horizon):
+    def __init__(
+        self,
+        dataset,
+        chunk_horizon,
+        observation_horizon,
+        next_observation_horizon=1,
+    ):
         super().__init__()
         if dataset.__class__.__name__ != "SequenceDataset":
             raise TypeError("sparse chunk loading requires a SequenceDataset")
         self.dataset = dataset
         self.chunk_horizon = int(chunk_horizon)
         self.observation_horizon = int(observation_horizon)
-        if self.chunk_horizon < 1 or self.observation_horizon < 1:
-            raise ValueError("chunk and observation horizons must be positive")
+        self.next_observation_horizon = int(next_observation_horizon)
+        if (
+            self.chunk_horizon < 1
+            or self.observation_horizon < 1
+            or self.next_observation_horizon < 1
+        ):
+            raise ValueError(
+                "chunk and observation horizons must be positive"
+            )
+        if self.next_observation_horizon > self.observation_horizon:
+            raise ValueError(
+                "next_observation_horizon cannot exceed the actor observation "
+                f"horizon: {self.next_observation_horizon} > "
+                f"{self.observation_horizon}"
+            )
         if int(dataset.n_frame_stack) != self.observation_horizon:
             raise ValueError(
                 "SequenceDataset frame_stack must equal observation_horizon: "
@@ -778,18 +797,38 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
         demo_length,
         valid_length,
     ):
+        requested_next_index = index_in_demo + valid_length - 1
         next_index_in_demo = min(
             demo_length - 1,
-            index_in_demo + valid_length - 1,
+            requested_next_index,
         )
-        return self.dataset.get_obs_sequence_from_demo(
+        next_obs = self.dataset.get_obs_sequence_from_demo(
             demo_id,
             index_in_demo=next_index_in_demo,
             keys=self.dataset.obs_keys,
-            num_frames_to_stack=0,
+            num_frames_to_stack=self.next_observation_horizon - 1,
             seq_length=1,
             prefix="next_obs",
         )
+        right_padding = max(0, requested_next_index - next_index_in_demo)
+        if right_padding > 0:
+            for key, value in next_obs.items():
+                shift = min(int(right_padding), int(value.shape[0]))
+                if shift == 0:
+                    continue
+                padding_value = (
+                    np.zeros_like(value[-1:])
+                    if key == "pad_mask"
+                    else value[-1:]
+                )
+                next_obs[key] = np.concatenate(
+                    (
+                        value[shift:],
+                        np.repeat(padding_value, shift, axis=0),
+                    ),
+                    axis=0,
+                )
+        return next_obs
 
     def __getitem__(self, index):
         base = self.dataset

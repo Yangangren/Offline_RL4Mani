@@ -239,6 +239,8 @@ SOURCE_CHUNK_IDQL_CHECKPOINT=${SOURCE_CHUNK_IDQL_CHECKPOINT:-$TASK_SOURCE_CHUNK_
 CHUNK_IDQL_OUTPUT_DIR=${CHUNK_IDQL_OUTPUT_DIR:-$DEFAULT_CHUNK_IDQL_OUTPUT_DIR}
 CHUNK_INITIALIZATION=${CHUNK_INITIALIZATION:-$TASK_CHUNK_INITIALIZATION}
 CHUNK_CONDITIONED_ACTOR=${CHUNK_CONDITIONED_ACTOR:-1}
+CHUNK_CRITIC_OBSERVATION_HORIZON=${CHUNK_CRITIC_OBSERVATION_HORIZON:-1}
+CHUNK_CRITIC_Q_USE_PREDICTED_NEXT_LATENT=${CHUNK_CRITIC_Q_USE_PREDICTED_NEXT_LATENT:-0}
 if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
   if [[ "$CHUNK_INITIALIZATION" != "source_chunk_idql_joint" ]]; then
     echo "Square round-2 chunk IDQL requires CHUNK_INITIALIZATION=source_chunk_idql_joint." >&2
@@ -456,6 +458,18 @@ CRITIC_GROUP_NORM_ARG=--no-critic-group-norm
 if [[ "$CRITIC_GROUP_NORM" == "1" ]]; then
   CRITIC_GROUP_NORM_ARG=--critic-group-norm
 fi
+CRITIC_Q_PREDICTED_NEXT_ARG=--no-critic-q-use-predicted-next-latent
+case "$CHUNK_CRITIC_Q_USE_PREDICTED_NEXT_LATENT" in
+  0)
+    ;;
+  1)
+    CRITIC_Q_PREDICTED_NEXT_ARG=--critic-q-use-predicted-next-latent
+    ;;
+  *)
+    echo "CHUNK_CRITIC_Q_USE_PREDICTED_NEXT_LATENT must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
 USE_HUBER_ARG=--use-huber
 if [[ "${USE_HUBER:-1}" == "0" ]]; then
   USE_HUBER_ARG=--no-use-huber
@@ -680,6 +694,7 @@ run_chunk_train() {
     --reward-mode "$IDQL_REWARD_MODE" \
     --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
     --chunk-horizon "${CHUNK_HORIZON:-8}" \
+    --critic-observation-horizon "$CHUNK_CRITIC_OBSERVATION_HORIZON" \
     --discount "${DISCOUNT:-0.99}" \
     --expectile "${EXPECTILE:-0.9}" \
     --target-tau "${TARGET_TAU:-0.01}" \
@@ -710,6 +725,7 @@ run_chunk_train() {
     --num-critics "${NUM_CRITICS:-2}" \
     "$CRITIC_GROUP_NORM_ARG" \
     --critic-late-fusion-key "$CRITIC_LATE_FUSION_KEY" \
+    "$CRITIC_Q_PREDICTED_NEXT_ARG" \
     --dynamics-weight "${DYNAMICS_WEIGHT:-0.0}" \
     --dynamics-cosine-weight "${DYNAMICS_COSINE_WEIGHT:-0.1}" \
     --dynamics-warmup-steps "${DYNAMICS_WARMUP_STEPS:-1000}" \

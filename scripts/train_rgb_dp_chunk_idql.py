@@ -78,6 +78,7 @@ ACTOR_CONDITION_DEFINITIONS = {
     "human_success": "human_demo=1; success_rollout=1; failure_rollout=0",
 }
 DYNAMICS_PREDICTION_MODE = "actor_encoder_direct"
+PREDICTED_NEXT_Q_NORMALIZATION = "layer_norm"
 ACTOR_OPTIMIZER_TYPE = "adamw"
 ACTOR_WEIGHT_DECAY = 1e-6
 JOINT_ACTOR_INITIALIZATIONS = frozenset(
@@ -85,6 +86,39 @@ JOINT_ACTOR_INITIALIZATIONS = frozenset(
 )
 LATEST_CHECKPOINT_NAME = "latest.pt"
 LATEST_CHECKPOINT_TEMP_PREFIX = f".{LATEST_CHECKPOINT_NAME}.tmp-"
+
+
+def critic_q_head_inputs(
+    use_predicted_next_latent: bool,
+) -> tuple[str, ...]:
+    inputs = ("context", "action_repr")
+    if bool(use_predicted_next_latent):
+        inputs += ("predicted_next_encoder",)
+    return inputs
+
+
+def checkpoint_critic_observation_horizon(checkpoint: dict) -> int:
+    return int(
+        checkpoint.get(
+            "critic_observation_horizon",
+            checkpoint.get("args", {}).get(
+                "critic_observation_horizon",
+                1,
+            ),
+        )
+    )
+
+
+def checkpoint_q_uses_predicted_next_latent(checkpoint: dict) -> bool:
+    return bool(
+        checkpoint.get(
+            "critic_q_use_predicted_next_latent",
+            checkpoint.get("args", {}).get(
+                "critic_q_use_predicted_next_latent",
+                False,
+            ),
+        )
+    )
 
 
 def actor_condition_definition(mode: str) -> str:
@@ -373,6 +407,86 @@ def trains_joint_actor(args: argparse.Namespace) -> bool:
     return str(args.initialization) in JOINT_ACTOR_INITIALIZATIONS
 
 
+def observation_history_frames(
+    obs_dict: dict[str, torch.Tensor],
+    obs_shapes: OrderedDict,
+    observation_horizon: int,
+) -> list[dict[str, torch.Tensor]]:
+    """Validate and split a critic observation history in chronological order."""
+    horizon = int(observation_horizon)
+    frames = [dict() for _ in range(horizon)]
+    batch_size: int | None = None
+    for key, shape in obs_shapes.items():
+        if key not in obs_dict:
+            raise KeyError(f"critic observation is missing key {key!r}")
+        value = obs_dict[key]
+        unstacked_ndim = len(shape) + 1
+        if horizon == 1 and value.ndim == unstacked_ndim:
+            history = value.unsqueeze(1)
+        elif (
+            value.ndim == unstacked_ndim + 1
+            and int(value.shape[1]) == horizon
+        ):
+            history = value
+        else:
+            raise ValueError(
+                f"critic observation {key!r} expected [B,{horizon},"
+                f"{','.join(str(x) for x in shape)}] (or no time axis when "
+                f"horizon=1), got {tuple(value.shape)}"
+            )
+        if tuple(history.shape[2:]) != tuple(shape):
+            raise ValueError(
+                f"critic observation {key!r} has trailing shape "
+                f"{tuple(history.shape[2:])}, expected {tuple(shape)}"
+            )
+        if batch_size is None:
+            batch_size = int(history.shape[0])
+        elif int(history.shape[0]) != batch_size:
+            raise ValueError("critic observation keys have different batch sizes")
+        for frame_index in range(horizon):
+            frames[frame_index][key] = history[:, frame_index]
+    return frames
+
+
+def encode_observation_history(
+    encoder: nn.Module,
+    frames: list[dict[str, torch.Tensor]],
+    *,
+    has_goal: bool,
+    goal_dict: dict[str, torch.Tensor] | None,
+) -> torch.Tensor:
+    """Encode newest first for paired crops, then concatenate old-to-new."""
+    encoded_by_time: list[torch.Tensor | None] = [None] * len(frames)
+    encode_order = (len(frames) - 1, *range(len(frames) - 1))
+    for frame_index in encode_order:
+        inputs = {"obs": frames[frame_index]}
+        if has_goal:
+            if goal_dict is None:
+                raise ValueError(
+                    "goal-conditioned chunk critic is missing goal observations"
+                )
+            inputs["goal"] = goal_dict
+        encoded_by_time[frame_index] = encoder(**inputs)
+    if any(feature is None for feature in encoded_by_time):
+        raise RuntimeError("failed to encode every critic observation frame")
+    return torch.cat(
+        [feature for feature in encoded_by_time if feature is not None],
+        dim=-1,
+    )
+
+
+def history_late_fusion(
+    frames: list[dict[str, torch.Tensor]],
+    late_fusion_keys: tuple[str, ...],
+) -> torch.Tensor | None:
+    parts = [
+        frames[frame_index][key].flatten(start_dim=1)
+        for frame_index in range(len(frames))
+        for key in late_fusion_keys
+    ]
+    return torch.cat(parts, dim=-1) if parts else None
+
+
 class RiseChunkActionValueNetwork(nn.Module):
     """Independent raw-observation Q network over an executable action chunk."""
 
@@ -391,6 +505,8 @@ class RiseChunkActionValueNetwork(nn.Module):
         num_action_conv_layers: int,
         dropout: float,
         late_fusion_key: str | None,
+        observation_horizon: int = 1,
+        q_use_predicted_next_latent: bool = False,
     ):
         super().__init__()
         observation_group_shapes = OrderedDict(obs=OrderedDict(obs_shapes))
@@ -403,8 +519,15 @@ class RiseChunkActionValueNetwork(nn.Module):
             encoder_kwargs=encoder_kwargs,
         )
         self.has_goal = "goal" in observation_group_shapes
+        self.obs_shapes = OrderedDict(obs_shapes)
         self.action_dim = int(action_dim)
         self.chunk_horizon = int(chunk_horizon)
+        self.observation_horizon = int(observation_horizon)
+        self.q_use_predicted_next_latent = bool(
+            q_use_predicted_next_latent
+        )
+        if self.observation_horizon < 1:
+            raise ValueError("critic observation horizon must be positive")
         self.latent_dim = int(latent_dim)
         self.encoder_output_dim = int(self.nets["encoder"].output_shape()[0])
         self.late_fusion_keys = tuple(
@@ -417,12 +540,13 @@ class RiseChunkActionValueNetwork(nn.Module):
             if key not in obs_shapes:
                 raise KeyError(f"late_fusion_key={key} is absent from obs_shapes")
             late_fusion_dim += int(np.prod(obs_shapes[key]))
+        late_fusion_dim *= self.observation_horizon
 
         context_dims = tuple(int(value) for value in hidden_dims[:-1]) + (
             self.latent_dim,
         )
         self.nets["context"] = RiseLateFusionMLP(
-            input_dim=int(self.nets["encoder"].output_shape()[0]),
+            input_dim=self.encoder_output_dim * self.observation_horizon,
             hidden_dims=context_dims,
             late_fusion_dim=late_fusion_dim,
         )
@@ -450,24 +574,35 @@ class RiseChunkActionValueNetwork(nn.Module):
             self.encoder_output_dim,
             dropout=float(dropout),
         )
+        q_input_dim = 2 * self.latent_dim
+        if self.q_use_predicted_next_latent:
+            self.nets["predicted_next_q_norm"] = nn.LayerNorm(
+                self.encoder_output_dim
+            )
+            q_input_dim += self.encoder_output_dim
         self.nets["q_head"] = make_mlp(
-            2 * self.latent_dim,
+            q_input_dim,
             hidden_dims,
             1,
             dropout=float(dropout),
         )
 
     def encode_context(self, obs_dict, goal_dict=None) -> torch.Tensor:
-        inputs = {"obs": obs_dict}
-        if self.has_goal:
-            if goal_dict is None:
-                raise ValueError("goal-conditioned chunk critic is missing goal observations")
-            inputs["goal"] = goal_dict
-        encoded = self.nets["encoder"](**inputs)
-        late_parts = [
-            obs_dict[key].flatten(start_dim=1) for key in self.late_fusion_keys
-        ]
-        late_fusion = torch.cat(late_parts, dim=-1) if late_parts else None
+        frames = observation_history_frames(
+            obs_dict,
+            self.obs_shapes,
+            self.observation_horizon,
+        )
+        encoded = encode_observation_history(
+            self.nets["encoder"],
+            frames,
+            has_goal=self.has_goal,
+            goal_dict=goal_dict,
+        )
+        late_fusion = history_late_fusion(
+            frames,
+            self.late_fusion_keys,
+        )
         return self.nets["context_norm"](
             self.nets["context"](encoded, late_fusion)
         )
@@ -500,16 +635,83 @@ class RiseChunkActionValueNetwork(nn.Module):
         action_repr = self.nets["action_encoder"](
             context, acts, action_mask
         )
-        q = self.nets["q_head"](torch.cat((context, action_repr), dim=-1))
+        predicted_next = None
+        if self.q_use_predicted_next_latent or return_aux:
+            predicted_next = self.predict_successor(context, action_repr)
+        q_inputs = [context, action_repr]
+        if self.q_use_predicted_next_latent:
+            q_inputs.append(
+                self.nets["predicted_next_q_norm"](predicted_next)
+            )
+        q = self.nets["q_head"](torch.cat(q_inputs, dim=-1))
         if not return_aux:
             return q
-        predicted_next = self.predict_successor(context, action_repr)
         return {
             "q": q,
             "context": context,
             "action_repr": action_repr,
             "predicted_next_encoder": predicted_next,
         }
+
+
+class RiseChunkValueNetwork(RiseValueNetwork):
+    """History-aware V network with legacy-compatible one-frame state keys."""
+
+    def __init__(
+        self,
+        *,
+        obs_shapes: OrderedDict,
+        hidden_dims: tuple[int, ...],
+        goal_shapes: OrderedDict,
+        encoder_kwargs: dict,
+        late_fusion_key: str | None,
+        observation_horizon: int = 1,
+    ):
+        super().__init__(
+            obs_shapes=obs_shapes,
+            hidden_dims=hidden_dims,
+            goal_shapes=goal_shapes,
+            encoder_kwargs=encoder_kwargs,
+            late_fusion_key=late_fusion_key,
+        )
+        self.obs_shapes = OrderedDict(obs_shapes)
+        self.observation_horizon = int(observation_horizon)
+        if self.observation_horizon < 1:
+            raise ValueError("critic observation horizon must be positive")
+        if self.observation_horizon > 1:
+            late_fusion_dim = sum(
+                int(np.prod(obs_shapes[key]))
+                for key in self.late_fusion_keys
+            )
+            self.nets["mlp"] = RiseLateFusionMLP(
+                input_dim=(
+                    int(self.nets["encoder"].output_shape()[0])
+                    * self.observation_horizon
+                ),
+                hidden_dims=hidden_dims,
+                late_fusion_dim=(
+                    late_fusion_dim * self.observation_horizon
+                ),
+            )
+
+    def forward(self, obs_dict, goal_dict=None):
+        frames = observation_history_frames(
+            obs_dict,
+            self.obs_shapes,
+            self.observation_horizon,
+        )
+        encoded = encode_observation_history(
+            self.nets["encoder"],
+            frames,
+            has_goal=self.has_goal,
+            goal_dict=goal_dict,
+        )
+        late_fusion = history_late_fusion(
+            frames,
+            self.late_fusion_keys,
+        )
+        features = self.nets["mlp"](encoded, late_fusion)
+        return self.nets["decoder"](features)
 
 
 def make_rise_chunk_value_networks(
@@ -525,7 +727,9 @@ def make_rise_chunk_value_networks(
     num_critics: int = 2,
     critic_group_norm: bool = False,
     late_fusion_key: str | None = "robot0_gripper_qpos",
-) -> tuple[nn.ModuleList, nn.ModuleList, RiseValueNetwork]:
+    observation_horizon: int = 1,
+    q_use_predicted_next_latent: bool = False,
+) -> tuple[nn.ModuleList, nn.ModuleList, RiseChunkValueNetwork]:
     encoder_kwargs = ObsUtils.obs_encoder_kwargs_from_config(
         actor_algo.obs_config.encoder
     )
@@ -544,17 +748,22 @@ def make_rise_chunk_value_networks(
             num_action_conv_layers=int(num_action_conv_layers),
             dropout=float(dropout),
             late_fusion_key=late_fusion_key,
+            observation_horizon=int(observation_horizon),
+            q_use_predicted_next_latent=bool(
+                q_use_predicted_next_latent
+            ),
         )
         if critic_group_norm:
             critic = replace_bn_with_gn(critic)
         critics.append(critic)
     targets = copy.deepcopy(critics)
-    vf = RiseValueNetwork(
+    vf = RiseChunkValueNetwork(
         obs_shapes=actor_algo.obs_shapes,
         hidden_dims=hidden_dims,
         goal_shapes=actor_algo.goal_shapes,
         encoder_kwargs=copy.deepcopy(encoder_kwargs),
         late_fusion_key=late_fusion_key,
+        observation_horizon=int(observation_horizon),
     )
     if critic_group_norm:
         vf = replace_bn_with_gn(vf)
@@ -598,6 +807,34 @@ def copy_matching_encoder_state(
         "encoder_tensor_count": int(matched_groups["encoder"]),
         "context_tensor_count": int(matched_groups["context"]),
     }
+
+
+def copy_matching_vf_encoder_state(
+    vf: RiseChunkValueNetwork,
+    source_state: dict[str, torch.Tensor],
+) -> dict[str, int]:
+    """Warm-start only V's encoder when its history-dependent head changed."""
+    destination = vf.state_dict()
+    matched = {
+        key: value
+        for key, value in source_state.items()
+        if (
+            key.startswith("nets.encoder.")
+            and key in destination
+            and destination[key].shape == value.shape
+        )
+    }
+    if not matched:
+        raise RuntimeError("no one-step VF observation-encoder weights matched")
+    vf.load_state_dict(matched, strict=False)
+    return {
+        "mode": "encoder_only_history_head_fresh",
+        "tensor_count": int(len(matched)),
+        "parameter_count": int(
+            sum(value.numel() for value in matched.values())
+        ),
+    }
+
 
 
 def deployed_actor_obs_encoder(actor_algo) -> nn.Module:
@@ -880,6 +1117,12 @@ def validate_resume_semantics(
 ) -> None:
     """Reject resumes that would silently change the task or objective."""
     saved_args = resume_state.get("args", {})
+    requested_critic_observation_horizon = int(
+        getattr(args, "critic_observation_horizon", 1)
+    )
+    requested_q_uses_predicted_next = bool(
+        getattr(args, "critic_q_use_predicted_next_latent", False)
+    )
     if str(resume_state.get("task", "")) != str(args.task):
         raise ValueError(
             f"resume task={resume_state.get('task')!r} does not match "
@@ -918,6 +1161,12 @@ def validate_resume_semantics(
         "effective_global_batch_size": int(args.effective_global_batch_size),
         "schedule_reference_batch_size": int(args.schedule_reference_batch_size),
         "chunk_horizon": int(args.chunk_horizon),
+        "critic_observation_horizon": (
+            requested_critic_observation_horizon
+        ),
+        "critic_q_use_predicted_next_latent": (
+            requested_q_uses_predicted_next
+        ),
         "discount": float(args.discount),
         "expectile": float(args.expectile),
         "target_tau": float(args.target_tau),
@@ -952,6 +1201,12 @@ def validate_resume_semantics(
                 and field == "schedule_reference_batch_size"
             ):
                 saved = 100
+            elif field == "critic_observation_horizon":
+                saved = checkpoint_critic_observation_horizon(resume_state)
+            elif field == "critic_q_use_predicted_next_latent":
+                saved = checkpoint_q_uses_predicted_next_latent(
+                    resume_state
+                )
             else:
                 raise ValueError(
                     f"resume checkpoint has no immutable {field} configuration; "
@@ -967,6 +1222,31 @@ def validate_resume_semantics(
                 f"{field}={requested!r}; use a source warm start for an "
                 "intentional objective change"
             )
+    expected_q_inputs = critic_q_head_inputs(
+        requested_q_uses_predicted_next
+    )
+    saved_q_inputs = tuple(
+        resume_state.get(
+            "critic_q_head_inputs",
+            critic_q_head_inputs(
+                checkpoint_q_uses_predicted_next_latent(resume_state)
+            ),
+        )
+    )
+    if saved_q_inputs != expected_q_inputs:
+        raise ValueError(
+            f"resume critic_q_head_inputs={saved_q_inputs!r} does not match "
+            f"requested {expected_q_inputs!r}"
+        )
+    if (
+        requested_q_uses_predicted_next
+        and resume_state.get("critic_q_predicted_next_normalization")
+        != PREDICTED_NEXT_Q_NORMALIZATION
+    ):
+        raise ValueError(
+            "resume checkpoint has an incompatible predicted-next Q "
+            "normalization"
+        )
 
 
 def install_pretrained_actor_reference(
@@ -1081,6 +1361,28 @@ def configure_chunk_actor_optimizer(
 
 def gather_time(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     rows = torch.arange(values.shape[0], device=values.device)
+    return values[rows, indices]
+
+
+def gather_time_history(
+    values: torch.Tensor,
+    end_indices: torch.Tensor,
+    observation_horizon: int,
+) -> torch.Tensor:
+    """Gather chronological histories ending at one index per batch row."""
+    horizon = int(observation_horizon)
+    offsets = torch.arange(
+        1 - horizon,
+        1,
+        device=end_indices.device,
+        dtype=end_indices.dtype,
+    )
+    indices = end_indices[:, None] + offsets[None]
+    if torch.any(indices < 0) or torch.any(indices >= values.shape[1]):
+        raise IndexError(
+            "successor observation history is outside the loaded sequence"
+        )
+    rows = torch.arange(values.shape[0], device=values.device)[:, None]
     return values[rows, indices]
 
 
@@ -1262,9 +1564,17 @@ def process_chunk_batch(
     chunk_horizon: int,
     discount: float,
     reward_mode: str = "task",
+    critic_observation_horizon: int = 1,
 ) -> dict[str, Any]:
     """Extract a semi-MDP transition at the first executable DP action."""
     current_index = int(actor_algo.algo_config.horizon.observation_horizon) - 1
+    critic_observation_horizon = int(critic_observation_horizon)
+    if not 1 <= critic_observation_horizon <= current_index + 1:
+        raise ValueError(
+            "critic_observation_horizon must be in [1, actor observation "
+            f"horizon={current_index + 1}], got "
+            f"{critic_observation_horizon}"
+        )
     end_index = current_index + int(chunk_horizon)
     if raw_batch["actions"].shape[1] < end_index:
         raise ValueError(
@@ -1323,17 +1633,39 @@ def process_chunk_batch(
 
     batch = {
         "obs": {
-            key: raw_batch["obs"][key][:, current_index]
+            key: (
+                raw_batch["obs"][key][:, current_index]
+                if critic_observation_horizon == 1
+                else raw_batch["obs"][key][
+                    :,
+                    current_index - critic_observation_horizon + 1
+                    : current_index + 1,
+                ]
+            )
             for key in actor_algo.obs_shapes
         },
         "next_obs": (
             {
-                key: raw_batch["next_obs"][key][:, 0]
+                key: (
+                    raw_batch["next_obs"][key][:, -1]
+                    if critic_observation_horizon == 1
+                    else raw_batch["next_obs"][key][
+                        :, -critic_observation_horizon:
+                    ]
+                )
                 for key in actor_algo.obs_shapes
             }
             if "chunk_sparse_next_obs" in raw_batch
             else {
-                key: gather_time(raw_batch["next_obs"][key], next_indices)
+                key: (
+                    gather_time(raw_batch["next_obs"][key], next_indices)
+                    if critic_observation_horizon == 1
+                    else gather_time_history(
+                        raw_batch["next_obs"][key],
+                        next_indices,
+                        critic_observation_horizon,
+                    )
+                )
                 for key in actor_algo.obs_shapes
             }
         ),
@@ -1487,6 +1819,23 @@ def compute_chunk_losses(
     distributed_context: DistributedContext | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
     device = batch["actions"].device
+    critic_horizons = {
+        int(getattr(critic, "observation_horizon", 1))
+        for critic in critics
+    }
+    if len(critic_horizons) != 1:
+        raise ValueError("all chunk critics must use the same observation history")
+    critic_observation_horizon = next(iter(critic_horizons))
+    if int(getattr(vf, "observation_horizon", 1)) != critic_observation_horizon:
+        raise ValueError("Q and V observation histories must match")
+    dynamics_next_obs = {
+        key: (
+            value[:, -1]
+            if critic_observation_horizon > 1
+            else value
+        )
+        for key, value in batch["next_obs"].items()
+    }
     crop_seeds = torch.randint(
         0,
         torch.iinfo(torch.int32).max,
@@ -1542,7 +1891,7 @@ def compute_chunk_losses(
             with fork_rng_with_seed(crop_seed, device):
                 target_next_encoder_features.append(
                     dynamics_target_encoder(
-                        obs=batch["next_obs"],
+                        obs=dynamics_next_obs,
                     )
                 )
 
@@ -1800,6 +2149,12 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
         )
 
     source_args = source.get("args", {})
+    requested_critic_observation_horizon = int(
+        getattr(args, "critic_observation_horizon", 1)
+    )
+    requested_q_uses_predicted_next = bool(
+        getattr(args, "critic_q_use_predicted_next_latent", False)
+    )
     source_condition_hidden_dim = int(
         source_args.get(
             "condition_hidden_dim",
@@ -1815,6 +2170,12 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
 
     expected_fields = {
         "critic_chunk_horizon": int(args.chunk_horizon),
+        "critic_observation_horizon": (
+            requested_critic_observation_horizon
+        ),
+        "critic_q_use_predicted_next_latent": (
+            requested_q_uses_predicted_next
+        ),
         "critic_hidden_dims": tuple(int(x) for x in args.critic_hidden_dims),
         "critic_latent_dim": int(args.latent_dim),
         "critic_action_hidden_dim": int(args.action_hidden_dim),
@@ -1827,6 +2188,7 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
     }
     integer_fields = {
         "critic_chunk_horizon",
+        "critic_observation_horizon",
         "critic_latent_dim",
         "critic_action_hidden_dim",
         "critic_num_attention_heads",
@@ -1837,6 +2199,10 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
         value = source.get(field)
         if field == "critic_hidden_dims":
             value = tuple(value or ())
+        elif field == "critic_observation_horizon":
+            value = checkpoint_critic_observation_horizon(source)
+        elif field == "critic_q_use_predicted_next_latent":
+            value = checkpoint_q_uses_predicted_next_latent(source)
         elif field in integer_fields:
             value = int(value if value is not None else -1)
         elif field == "critic_dropout":
@@ -1853,11 +2219,31 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
             "source dynamics prediction mode does not match the current "
             f"{DYNAMICS_PREDICTION_MODE!r} architecture"
         )
-    if tuple(source.get("critic_q_head_inputs", ())) != (
-        "context",
-        "action_repr",
+    expected_q_inputs = critic_q_head_inputs(
+        requested_q_uses_predicted_next
+    )
+    source_q_inputs = tuple(
+        source.get(
+            "critic_q_head_inputs",
+            critic_q_head_inputs(
+                checkpoint_q_uses_predicted_next_latent(source)
+            ),
+        )
+    )
+    if source_q_inputs != expected_q_inputs:
+        raise ValueError(
+            "source chunk checkpoint uses an incompatible Q head: "
+            f"{source_q_inputs!r} != {expected_q_inputs!r}"
+        )
+    if (
+        requested_q_uses_predicted_next
+        and source.get("critic_q_predicted_next_normalization")
+        != PREDICTED_NEXT_Q_NORMALIZATION
     ):
-        raise ValueError("source chunk checkpoint uses an incompatible Q head")
+        raise ValueError(
+            "source chunk checkpoint has an incompatible predicted-next Q "
+            "normalization"
+        )
     required_keys = (
         "actor_model",
         "critics",
@@ -1915,7 +2301,17 @@ def checkpoint_payload(
         "rise_style_rgb_chunk_idql": True,
         "hybrid_dp_chunk_actor_iql": True,
         "visual_critic_idql": True,
-        "critic_q_head_inputs": ("context", "action_repr"),
+        "critic_q_head_inputs": critic_q_head_inputs(
+            args.critic_q_use_predicted_next_latent
+        ),
+        "critic_q_use_predicted_next_latent": bool(
+            args.critic_q_use_predicted_next_latent
+        ),
+        "critic_q_predicted_next_normalization": (
+            PREDICTED_NEXT_Q_NORMALIZATION
+            if args.critic_q_use_predicted_next_latent
+            else None
+        ),
         "critic_representation_modules": (
             "encoder",
             "context",
@@ -2047,10 +2443,15 @@ def checkpoint_payload(
             if args.reward_mode == "task"
             else "rise_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
         ),
-        "critic_input_mode": "independent_raw_observation_chunk_encoders",
+        "critic_input_mode": (
+            "independent_raw_observation_history_chunk_encoders"
+        ),
         "critic_action_space": "pretrained_dp_normalized_action_chunk",
         "critic_hidden_dims": tuple(int(x) for x in args.critic_hidden_dims),
         "critic_chunk_horizon": int(args.chunk_horizon),
+        "critic_observation_horizon": int(
+            args.critic_observation_horizon
+        ),
         "critic_latent_dim": int(args.latent_dim),
         "critic_action_hidden_dim": int(args.action_hidden_dim),
         "critic_num_attention_heads": int(args.num_attention_heads),
@@ -2542,6 +2943,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     args.observation_horizon = int(
         actor_algo.algo_config.horizon.observation_horizon
     )
+    if int(args.critic_observation_horizon) > args.observation_horizon:
+        raise ValueError(
+            "critic_observation_horizon cannot exceed the pretrained actor "
+            f"observation horizon: {args.critic_observation_horizon} > "
+            f"{args.observation_horizon}"
+        )
     args.actor_prediction_horizon = int(
         actor_algo.algo_config.horizon.prediction_horizon
     )
@@ -2705,6 +3112,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         num_critics=args.num_critics,
         critic_group_norm=args.critic_group_norm,
         late_fusion_key=args.critic_late_fusion_key,
+        observation_horizon=args.critic_observation_horizon,
+        q_use_predicted_next_latent=(
+            args.critic_q_use_predicted_next_latent
+        ),
     )
     warm_start_audit: dict[str, Any] = {"mode": "resume_checkpoint"}
     if resume_state is not None:
@@ -2746,6 +3157,17 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         }
         targets = copy.deepcopy(critics)
     elif source_for_warm_start is not None:
+        if int(args.critic_observation_horizon) == 1:
+            vf.load_state_dict(source_for_warm_start["vf"], strict=True)
+            vf_warm_start_audit = {
+                "mode": "complete_one_frame_value_network",
+                "tensor_count": int(len(source_for_warm_start["vf"])),
+            }
+        else:
+            vf_warm_start_audit = copy_matching_vf_encoder_state(
+                vf,
+                source_for_warm_start["vf"],
+            )
         warm_start_audit = {
             "mode": "source_one_step_idql_representations",
             "critics": [
@@ -2755,8 +3177,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     source_for_warm_start["critics"],
                 )
             ],
+            "vf": vf_warm_start_audit,
         }
-        vf.load_state_dict(source_for_warm_start["vf"])
         targets = copy.deepcopy(critics)
     elif resume_state is None:
         warm_start_audit = {
@@ -3091,7 +3513,22 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "vf_parameter_count": parameter_count(vf),
         "independent_raw_obs_encoders": True,
         "critic_chunk_horizon": int(args.chunk_horizon),
-        "critic_q_head_inputs": ["context", "action_repr"],
+        "critic_observation_horizon": int(
+            args.critic_observation_horizon
+        ),
+        "critic_q_head_inputs": list(
+            critic_q_head_inputs(
+                args.critic_q_use_predicted_next_latent
+            )
+        ),
+        "critic_q_use_predicted_next_latent": bool(
+            args.critic_q_use_predicted_next_latent
+        ),
+        "critic_q_predicted_next_normalization": (
+            PREDICTED_NEXT_Q_NORMALIZATION
+            if args.critic_q_use_predicted_next_latent
+            else None
+        ),
         "critic_representation_modules": [
             "encoder",
             "context",
@@ -3103,6 +3540,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "dynamics_prediction_output": "raw_actor_encoder_features",
         "dynamics_prediction_output_dim": target_encoder_output_dim,
         "dynamics_prediction_residual": False,
+        "dynamics_prediction_consumed_by_q": bool(
+            args.critic_q_use_predicted_next_latent
+        ),
         "dynamics_target_encoder": (
             "frozen_copy_periodically_hard_synced_from_deployed_actor_ema_"
             "obs_encoder"
@@ -3177,7 +3617,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "sequence_length": int(sequence_length),
             "sparse_chunk_loader": bool(args.sparse_chunk_loader),
             "observation_frames_per_sample": (
-                int(args.observation_horizon) + 1
+                int(args.observation_horizon)
+                + int(args.critic_observation_horizon)
                 if args.sparse_chunk_loader
                 else 2 * (
                     int(args.observation_horizon) - 1 + int(sequence_length)
@@ -3290,6 +3731,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 args.critic_vf_lr_total_steps
             ),
             "critic_vf_lr_scheduler_step_unit": "optimizer_update",
+            "critic_observation_horizon": int(
+                args.critic_observation_horizon
+            ),
+            "critic_q_use_predicted_next_latent": bool(
+                args.critic_q_use_predicted_next_latent
+            ),
             "dynamics_weight": float(args.dynamics_weight),
             "dynamics_cosine_weight": float(args.dynamics_cosine_weight),
             "dynamics_warmup_steps": int(args.dynamics_warmup_steps),
@@ -3397,6 +3844,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 chunk_horizon=args.chunk_horizon,
                 discount=args.discount,
                 reward_mode=args.reward_mode,
+                critic_observation_horizon=(
+                    args.critic_observation_horizon
+                ),
             )
             encoder_trainable = global_step >= int(
                 args.resolved_encoder_freeze_steps
@@ -3741,6 +4191,15 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--chunk-horizon", type=int, default=8)
     parser.add_argument(
+        "--critic-observation-horizon",
+        type=int,
+        default=1,
+        help=(
+            "Number of most recent actor observation frames consumed by Q "
+            "and V. Use 2 for the full RGB-DP history."
+        ),
+    )
+    parser.add_argument(
         "--reward-mode",
         choices=tuple(REWARD_DEFINITIONS),
         default="task",
@@ -3818,6 +4277,15 @@ def make_parser() -> argparse.ArgumentParser:
         "--critic-late-fusion-key",
         type=str,
         default="robot0_gripper_qpos",
+    )
+    parser.add_argument(
+        "--critic-q-use-predicted-next-latent",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Concatenate the layer-normalized dynamics-predicted next "
+            "actor-encoder feature into the Q head."
+        ),
     )
     parser.add_argument("--dynamics-weight", type=float, default=0.05)
     parser.add_argument("--dynamics-cosine-weight", type=float, default=0.05)
@@ -3913,6 +4381,8 @@ def main() -> None:
         parser.error("prefetch-factor must be positive when workers are enabled")
     if args.chunk_horizon <= 0:
         parser.error("chunk-horizon must be positive")
+    if args.critic_observation_horizon <= 0:
+        parser.error("critic-observation-horizon must be positive")
     if not 0.0 <= args.discount <= 1.0:
         parser.error("discount must be in [0, 1]")
     if not 0.5 <= args.expectile < 1.0:

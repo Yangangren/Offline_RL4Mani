@@ -505,6 +505,9 @@ def build_single_loader(
                 dataset,
                 chunk_horizon=int(args.chunk_horizon),
                 observation_horizon=observation_horizon,
+                next_observation_horizon=int(
+                    getattr(args, "critic_observation_horizon", 1)
+                ),
             )
         elif sparse_one_step_loader:
             dataset = SparseOneStepSequenceDataset(
