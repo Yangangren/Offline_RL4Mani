@@ -739,7 +739,12 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None, obs_nor
         t = time.time()
         info = model.train_on_batch(input_batch, epoch, validate=validate)
         timing_stats["Train_Batch"].append(time.time() - t)
-        model.on_gradient_step()
+        # Batch schedulers advance only after an optimizer update. Validation
+        # calls train_on_batch with validate=True and performs no gradient step,
+        # so advancing here would shorten (and eventually restart) schedules
+        # according to the number of validation batches.
+        if not validate:
+            model.on_gradient_step()
 
         # tensorboard logging
         t = time.time()

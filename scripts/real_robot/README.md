@@ -19,8 +19,8 @@ Run these commands from the repository root with the robomimic environment:
   scripts/real_robot/run_pick_cup_rgb_dp_baseline.py --stages prepare train
 ```
 
-To exercise the full model and checkpoint path without starting a production
-run:
+To exercise the original 20 Hz model and checkpoint path without starting a
+production run:
 
 ```bash
 /home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
@@ -28,10 +28,52 @@ run:
   --stages prepare train --smoke
 ```
 
-The converted dataset already lives in `datasets/real_robot/pick_cup`. To build
-it again from the source package, use `--stages dataset prepare`; existing valid
-shards are reused only when their conversion settings match the request. Add
-`--force-dataset` only when intentionally replacing both shards.
+The converted 20 Hz dataset already lives in `datasets/real_robot/pick_cup`. To
+build it again from the source package, use `--stages dataset prepare`; existing
+valid shards are reused only when their conversion settings match the request.
+Add `--force-dataset` only when intentionally replacing both shards.
+
+## Round-1 5 Hz baseline
+
+The deployment-oriented 5 Hz variant is separate from the original 20 Hz,
+two-round baseline. It uses the 49 QA-eligible demonstrations from collection
+round 1 (source episodes 002--050), a fixed four-source-command grid, and one
+fresh policy action per 5 Hz observation. The production dataset is
+`datasets/real_robot/pick_cup_5hz_round1/round1_5hz_rgb.hdf5`.
+
+Validate the published dataset, regenerate its fingerprinted config, and train:
+
+```bash
+/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
+  scripts/real_robot/run_pick_cup_rgb_dp_5hz_round1.py \
+  --stages validate prepare train
+```
+
+To rebuild the 5 Hz shard from the raw package before training, include the
+`dataset` stage. A matching existing shard is validated and reused; pass
+`--force-dataset` only when intentionally replacing it.
+
+```bash
+/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
+  scripts/real_robot/run_pick_cup_rgb_dp_5hz_round1.py \
+  --stages dataset validate prepare train
+```
+
+The 5 Hz observation/action/prediction horizons are `2/1/4`. Each normalized
+motion target is the componentwise mean of four 20 Hz source commands and is
+decoded over 0.2 seconds with scales 0.048 m and 0.144 rad. The gripper target
+is the dense logical state after the fourth source command. A robot adapter must
+interpolate and rate-limit this macro target; it must not apply the maximum
+translation or rotation as an instantaneous jump.
+
+To exercise the 5 Hz model and checkpoint path without starting a production
+run:
+
+```bash
+/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
+  scripts/real_robot/run_pick_cup_rgb_dp_5hz_round1.py \
+  --stages validate prepare train --smoke --name-suffix preflight
+```
 
 ## Data contract
 
@@ -71,7 +113,9 @@ steps, EMA, and the full `[256, 512, 1024]` temporal U-Net.
 ```bash
 /home/ryan/miniconda3/envs/robomimic_stable/bin/python -m unittest \
   tests.real_robot.test_build_pick_cup_dataset \
-  tests.real_robot.test_pick_cup_rgb_dp_baseline -v
+  tests.real_robot.test_pick_cup_rgb_dp_baseline \
+  tests.real_robot.test_pick_cup_5hz_pipeline \
+  tests.test_train_utils_validation_scheduler -v
 ```
 
 The converter also writes `datasets/real_robot/pick_cup/conversion_summary.json`
