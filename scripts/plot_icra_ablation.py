@@ -16,9 +16,9 @@ METHODS = ("SUB", "SUB + actor", "SUB + actor + critic")
 # Values are reported as mean +/- standard deviation in the result table.
 SUCCESS_RATES = np.array(
     [
-        [90.0, 78.8, 87.6, 51.6],  # SUB
-        [94.4, 82.4, 84.0, 72.4],  # SUB + condition (actor)
-        [98.4, 88.0, 90.4, 71.6],  # RAL (actor + critic)
+        [90.0, 78.8, 87.6, 71.2],  # SUB
+        [94.4, 82.4, 84.0, 78.4],  # SUB + condition (actor)
+        [98.4, 88.0, 90.4, 78.4],  # RAL (actor + critic)
     ]
 )
 STANDARD_DEVIATIONS = np.array(

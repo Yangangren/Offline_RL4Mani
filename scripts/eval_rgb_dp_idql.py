@@ -1437,12 +1437,6 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
                 "RISE-style RGB IDQL checkpoints must use "
                 "actor_source=hybrid_dp_chunk_actor or external_dp_chunk_critic"
             )
-        if external_dp_chunk_critic:
-            if not checkpoint.get("rise_style_rgb_chunk_idql", False):
-                raise ValueError(
-                    "actor_source=external_dp_chunk_critic requires a RISE-style "
-                    "chunk-IDQL critic checkpoint"
-                )
         validate_rise_dp_composition(
             dp_policy,
             dp_ckpt,

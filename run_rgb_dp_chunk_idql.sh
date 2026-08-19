@@ -90,7 +90,7 @@ case "$TASK" in
     TASK_FAILURE_MASK=failure_50
     TASK_FAILURE_COUNT=-1
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
-    TASK_CHUNK_EPOCHS=25
+    TASK_CHUNK_EPOCHS=50
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
@@ -114,7 +114,7 @@ case "$TASK" in
     TASK_FAILURE_MASK=failure_50
     TASK_FAILURE_COUNT=-1
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
-    TASK_CHUNK_EPOCHS=20
+    TASK_CHUNK_EPOCHS=50
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
@@ -789,7 +789,7 @@ case "$STAGE" in
 
   eval_chunk_grid_resilient)
     require_chunk_checkpoint
-    read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-1 8 16}"
+    read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-4 8 12 16}"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
     "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
       --idql-checkpoint "$CHUNK_IDQL_CHECKPOINT" \
@@ -893,7 +893,7 @@ case "$STAGE" in
 
   eval_composed_chunk_grid_resilient)
     require_chunk_checkpoint
-    read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-1 8 16}"
+    read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-4 8 12 16}"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
     "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
       --idql-checkpoint "$CHUNK_IDQL_CHECKPOINT" \

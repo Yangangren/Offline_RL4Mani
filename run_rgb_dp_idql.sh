@@ -128,11 +128,13 @@ case "$IDQL_REWARD_MODE" in
     DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_task_reward.hdf5
     DEFAULT_IDQL_OUTPUT_DIR=${TASK_IDQL_OUTPUT_DIR}_task_reward
     DEFAULT_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_task_reward
+    DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_pretrained_dp_actor_task_reward
     ;;
   rise)
     DEFAULT_IDQL_DATASET=$TASK_IDQL_DATASET
     DEFAULT_IDQL_OUTPUT_DIR=$TASK_IDQL_OUTPUT_DIR
     DEFAULT_EVAL_OUTPUT=$TASK_EVAL_OUTPUT
+    DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_pretrained_dp_actor
     ;;
   *)
     echo "Unsupported IDQL_REWARD_MODE=$IDQL_REWARD_MODE. Use task or rise." >&2
@@ -143,6 +145,8 @@ IDQL_DATASET=${IDQL_DATASET:-$DEFAULT_IDQL_DATASET}
 IDQL_OUTPUT_DIR=${IDQL_OUTPUT_DIR:-$DEFAULT_IDQL_OUTPUT_DIR}
 IDQL_CHECKPOINT=${IDQL_CHECKPOINT:-$IDQL_OUTPUT_DIR/last.pt}
 EVAL_OUTPUT=${EVAL_OUTPUT:-$DEFAULT_EVAL_OUTPUT}
+COMPOSED_DP_CHECKPOINT=${COMPOSED_DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
+COMPOSED_CHUNK_EVAL_OUTPUT=${COMPOSED_CHUNK_EVAL_OUTPUT:-$DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT}
 EVAL_HORIZON=${HORIZON:-$TASK_EVAL_HORIZON}
 CRITIC_LATE_FUSION_KEY=${CRITIC_LATE_FUSION_KEY:-$TASK_CRITIC_LATE_FUSION_KEY}
 EXPERT_MASK=${EXPERT_MASK:-$TASK_EXPERT_MASK}
@@ -176,6 +180,18 @@ fi
 MAX_GRADIENT_NORM_ARGS=()
 if [[ -n "${MAX_GRADIENT_NORM:-}" ]]; then
   MAX_GRADIENT_NORM_ARGS=(--max-gradient-norm "$MAX_GRADIENT_NORM")
+fi
+COMPOSED_CONDITION_ARGS=(
+  --no-require-success-condition-adapter
+  --forbid-success-condition-adapter
+)
+if [[ "${COMPOSED_CONDITIONED_ACTOR:-0}" == "1" ]]; then
+  COMPOSED_CONDITION_ARGS=(
+    --require-success-condition-adapter
+    --no-forbid-success-condition-adapter
+    --inference-success-condition 1.0
+    --inference-condition-mask 1.0
+  )
 fi
 
 build_dataset() {
@@ -368,8 +384,34 @@ case "$STAGE" in
       --clip-actions
     ;;
 
+  eval_composed_chunk_grid_resilient)
+    read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-4 8 12 16}"
+    read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
+    "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
+      --idql-checkpoint "$IDQL_CHECKPOINT" \
+      --dp-checkpoint "$COMPOSED_DP_CHECKPOINT" \
+      --expected-task "$TASK" \
+      --output-dir "$COMPOSED_CHUNK_EVAL_OUTPUT" \
+      --device "${DEVICE:-cuda}" \
+      "${EVAL_GPU_ARGS[@]}" \
+      --actor-source external_dp_chunk_critic \
+      --critic-source "${CRITIC_SOURCE:-online}" \
+      --n-rollouts "${N_ROLLOUTS:-50}" \
+      --horizon "$EVAL_HORIZON" \
+      --num-candidates "${candidate_args[@]}" \
+      --seeds "${seed_args[@]}" \
+      --rollouts-per-chunk "${ROLLOUTS_PER_CHUNK:-25}" \
+      --inter-chunk-sleep "${EVAL_INTER_CHUNK_SLEEP:-0}" \
+      --max-retries "${EVAL_MAX_RETRIES:-3}" \
+      --candidate-batch-size "${CANDIDATE_BATCH_SIZE:-16}" \
+      --execution-horizon "${EXECUTION_HORIZON:-8}" \
+      --selection "${SELECTION:-argmax}" \
+      "${COMPOSED_CONDITION_ARGS[@]}" \
+      --clip-actions
+    ;;
+
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang] {build_dataset|train|train_resilient|eval|eval_grid_resilient}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang] {build_dataset|train|train_resilient|eval|eval_grid_resilient|eval_composed_chunk_grid_resilient}" >&2
     exit 2
     ;;
 esac
