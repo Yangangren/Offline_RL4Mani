@@ -75,6 +75,28 @@ run:
   --stages validate prepare train --smoke --name-suffix preflight
 ```
 
+### Held-out checkpoint evaluation
+
+`validate` in the launcher checks the HDF5 data contract; it does not load a
+trained policy. Use the checkpoint evaluator to test all held-out windows. It
+reports the online-network diffusion validation loss separately from EMA
+rollout-action replay, uses fixed seeds, does not shuffle, and does not drop the
+last partial batch.
+
+```bash
+/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
+  scripts/real_robot/eval_pick_cup_rgb_dp_5hz_round1.py \
+  --checkpoint /absolute/path/to/model_epoch_100.pth \
+  --seeds 1 2 3 \
+  --batch-size 64 \
+  --device auto \
+  --output /absolute/path/to/model_epoch_100_heldout_eval.json
+```
+
+The command evaluates the five `valid`-mask demonstrations only. The action
+errors are open-loop command-imitation metrics, not closed-loop task success.
+Use `--max-windows N` only for a quick smoke test.
+
 ## Data contract
 
 - Two HDF5 shards preserve collection rounds 1 and 2. The standard robomimic
