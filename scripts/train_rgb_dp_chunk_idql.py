@@ -27,7 +27,12 @@ import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 from robomimic.algo.diffusion_policy import replace_bn_with_gn
-from robomimic.models.chunk_iql_nets import SequentialActionChunkEncoder, make_mlp
+from robomimic.models.chunk_iql_nets import (
+    CausalTemporalStateTrunk,
+    ResidualActionLatentRollout,
+    SequentialActionChunkEncoder,
+    make_mlp,
+)
 from robomimic.models.obs_core import CropRandomizer
 
 from rgb_dp_distributed import (
@@ -78,7 +83,14 @@ ACTOR_CONDITION_DEFINITIONS = {
     "human_success": "human_demo=1; success_rollout=1; failure_rollout=0",
 }
 DYNAMICS_PREDICTION_MODE = "actor_encoder_direct"
+WCM_DYNAMICS_PREDICTION_MODE = "shared_critic_latent_multi_offset_residual"
 PREDICTED_NEXT_Q_NORMALIZATION = "layer_norm"
+LEGACY_CRITIC_ARCHITECTURE = "legacy"
+WCM_CRITIC_ARCHITECTURE = "wcm_shared_temporal_v1"
+CRITIC_ARCHITECTURES = (
+    LEGACY_CRITIC_ARCHITECTURE,
+    WCM_CRITIC_ARCHITECTURE,
+)
 ACTOR_OPTIMIZER_TYPE = "adamw"
 ACTOR_WEIGHT_DECAY = 1e-6
 JOINT_ACTOR_INITIALIZATIONS = frozenset(
@@ -95,6 +107,99 @@ def critic_q_head_inputs(
     if bool(use_predicted_next_latent):
         inputs += ("predicted_next_encoder",)
     return inputs
+
+
+def architecture_q_head_inputs(
+    architecture: str,
+    use_predicted_next_latent: bool = False,
+) -> tuple[str, ...]:
+    if str(architecture) == WCM_CRITIC_ARCHITECTURE:
+        if bool(use_predicted_next_latent):
+            raise ValueError("WCM Q cannot consume a predicted-next latent")
+        return ("temporal_state", "action_repr")
+    return critic_q_head_inputs(use_predicted_next_latent)
+
+
+def checkpoint_critic_architecture(checkpoint: dict) -> str:
+    """Legacy checkpoints predate an explicit architecture marker."""
+    return str(
+        checkpoint.get(
+            "critic_architecture",
+            checkpoint.get("args", {}).get(
+                "critic_architecture",
+                LEGACY_CRITIC_ARCHITECTURE,
+            ),
+        )
+    )
+
+
+def configure_critic_architecture_args(args: argparse.Namespace) -> None:
+    """Install backward-compatible defaults and validate WCM-only contracts."""
+    defaults = {
+        "critic_architecture": LEGACY_CRITIC_ARCHITECTURE,
+        "temporal_num_layers": 2,
+        "temporal_num_heads": 6,
+        "temporal_feedforward_dim": 600,
+        "temporal_dropout": 0.0,
+        "dynamics_prediction_offsets": (2, 4, 6, 8),
+        "sigreg_weight": 0.0,
+        "sigreg_knots": 17,
+        "sigreg_num_projections": 1024,
+        "sigreg_global_batch": True,
+    }
+    for field, default in defaults.items():
+        if not hasattr(args, field):
+            setattr(args, field, default)
+    architecture = str(args.critic_architecture)
+    if architecture not in CRITIC_ARCHITECTURES:
+        raise ValueError(f"unsupported critic architecture: {architecture!r}")
+    offsets = tuple(int(value) for value in args.dynamics_prediction_offsets)
+    if architecture == LEGACY_CRITIC_ARCHITECTURE:
+        # Do not make old training load four unused RGB targets.
+        args.dynamics_prediction_offsets = ()
+        return
+    if bool(getattr(args, "critic_q_use_predicted_next_latent", False)):
+        raise ValueError(
+            "WCM Q heads cannot consume the predicted-next latent; use "
+            "--no-critic-q-use-predicted-next-latent"
+        )
+    if float(getattr(args, "dynamics_cosine_weight", 0.0)) != 0.0:
+        raise ValueError(
+            "WCM uses raw latent MSE; set --dynamics-cosine-weight 0"
+        )
+    if (
+        not offsets
+        or tuple(sorted(set(offsets))) != offsets
+        or offsets[0] < 1
+        or offsets[-1] > int(args.chunk_horizon)
+    ):
+        raise ValueError(
+            "WCM dynamics offsets must be sorted, unique, positive, and <= "
+            f"chunk_horizon={args.chunk_horizon}; got {offsets}"
+        )
+    if int(args.temporal_num_layers) < 1:
+        raise ValueError("temporal_num_layers must be positive")
+    if int(args.temporal_num_heads) < 1:
+        raise ValueError("temporal_num_heads must be positive")
+    if int(args.latent_dim) % int(args.temporal_num_heads) != 0:
+        raise ValueError(
+            f"latent_dim={args.latent_dim} must be divisible by "
+            f"temporal_num_heads={args.temporal_num_heads}"
+        )
+    if int(args.temporal_feedforward_dim) < 1:
+        raise ValueError("temporal_feedforward_dim must be positive")
+    if not 0.0 <= float(args.temporal_dropout) < 1.0:
+        raise ValueError("temporal_dropout must be in [0, 1)")
+    if float(args.sigreg_weight) < 0.0:
+        raise ValueError("sigreg_weight must be non-negative")
+    if int(args.sigreg_knots) < 2 or int(args.sigreg_num_projections) < 1:
+        raise ValueError("SIGReg requires at least 2 knots and 1 projection")
+    if int(args.vf_encoder_freeze_steps) != int(args.encoder_freeze_steps):
+        raise ValueError(
+            "WCM has one shared raw encoder, so vf_encoder_freeze_steps must "
+            "equal encoder_freeze_steps"
+        )
+    args.dynamics_prediction_offsets = offsets
 
 
 def checkpoint_critic_observation_horizon(checkpoint: dict) -> int:
@@ -770,6 +875,405 @@ def make_rise_chunk_value_networks(
     return critics, targets, vf
 
 
+class WCMChunkValueSystem(nn.Module):
+    """Shared WCM-style temporal representation for chunk Q, V, and dynamics.
+
+    Q heads never receive a predicted successor. They consume only the final
+    causal temporal state and their independently encoded action chunk. The
+    auxiliary world model starts from that same temporal state and predicts
+    stop-gradient frame latents at fixed action-prefix offsets.
+    """
+
+    def __init__(
+        self,
+        *,
+        obs_shapes: OrderedDict,
+        goal_shapes: OrderedDict,
+        encoder_kwargs: dict,
+        action_dim: int,
+        chunk_horizon: int,
+        hidden_dims: tuple[int, ...],
+        latent_dim: int,
+        action_hidden_dim: int,
+        num_attention_heads: int,
+        num_action_conv_layers: int,
+        dropout: float,
+        late_fusion_key: str | None,
+        observation_horizon: int,
+        num_critics: int,
+        temporal_num_layers: int,
+        temporal_num_heads: int,
+        temporal_feedforward_dim: int,
+        temporal_dropout: float,
+        dynamics_prediction_offsets: tuple[int, ...],
+    ):
+        super().__init__()
+        if int(observation_horizon) < 1:
+            raise ValueError("critic observation horizon must be positive")
+        if int(num_critics) < 2:
+            raise ValueError("WCM chunk IDQL requires at least two Q heads")
+        self.obs_shapes = OrderedDict(obs_shapes)
+        self.goal_shapes = OrderedDict(goal_shapes or {})
+        self.action_dim = int(action_dim)
+        self.chunk_horizon = int(chunk_horizon)
+        self.observation_horizon = int(observation_horizon)
+        self.latent_dim = int(latent_dim)
+        self.num_critics = int(num_critics)
+        self.dynamics_prediction_offsets = tuple(
+            int(value) for value in dynamics_prediction_offsets
+        )
+        self.late_fusion_keys = tuple(
+            key.strip()
+            for key in str(late_fusion_key or "").split(",")
+            if key.strip()
+        )
+
+        observation_group_shapes = OrderedDict(obs=OrderedDict(obs_shapes))
+        if self.goal_shapes:
+            observation_group_shapes["goal"] = self.goal_shapes
+        self.has_goal = "goal" in observation_group_shapes
+        self.nets = nn.ModuleDict()
+        self.nets["encoder"] = ObsNets.ObservationGroupEncoder(
+            observation_group_shapes=observation_group_shapes,
+            encoder_kwargs=encoder_kwargs,
+        )
+        self.encoder_output_dim = int(self.nets["encoder"].output_shape()[0])
+        late_fusion_frame_dim = 0
+        for key in self.late_fusion_keys:
+            if key not in self.obs_shapes:
+                raise KeyError(f"late_fusion_key={key} is absent from obs_shapes")
+            late_fusion_frame_dim += int(np.prod(self.obs_shapes[key]))
+        self.nets["frame_projection"] = make_mlp(
+            self.encoder_output_dim + late_fusion_frame_dim,
+            (),
+            self.latent_dim,
+            final_layer_norm=True,
+        )
+        self.nets["temporal_trunk"] = CausalTemporalStateTrunk(
+            state_dim=self.latent_dim,
+            max_history=self.observation_horizon,
+            num_layers=int(temporal_num_layers),
+            num_heads=int(temporal_num_heads),
+            feedforward_dim=int(temporal_feedforward_dim),
+            dropout=float(temporal_dropout),
+        )
+        self.nets["q_action_encoders"] = nn.ModuleList(
+            [
+                SequentialActionChunkEncoder(
+                    action_dim=self.action_dim,
+                    chunk_horizon=self.chunk_horizon,
+                    context_dim=self.latent_dim,
+                    hidden_dim=int(action_hidden_dim),
+                    output_dim=self.latent_dim,
+                    num_heads=int(num_attention_heads),
+                    num_conv_layers=int(num_action_conv_layers),
+                    dropout=float(dropout),
+                )
+                for _ in range(self.num_critics)
+            ]
+        )
+        self.nets["q_heads"] = nn.ModuleList(
+            [
+                make_mlp(
+                    2 * self.latent_dim,
+                    hidden_dims,
+                    1,
+                    dropout=float(dropout),
+                )
+                for _ in range(self.num_critics)
+            ]
+        )
+        self.nets["value_head"] = make_mlp(
+            self.latent_dim,
+            hidden_dims,
+            1,
+            dropout=float(dropout),
+        )
+        self.nets["dynamics"] = ResidualActionLatentRollout(
+            action_dim=self.action_dim,
+            chunk_horizon=self.chunk_horizon,
+            state_dim=self.latent_dim,
+            prediction_offsets=self.dynamics_prediction_offsets,
+            hidden_dims=hidden_dims,
+            dropout=float(dropout),
+        )
+
+    def _encode_frame(
+        self,
+        obs_dict: dict[str, torch.Tensor],
+        goal_dict: dict[str, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        inputs = {"obs": obs_dict}
+        if self.has_goal:
+            if goal_dict is None:
+                raise ValueError(
+                    "goal-conditioned WCM critic is missing goal observations"
+                )
+            inputs["goal"] = goal_dict
+        encoded = self.nets["encoder"](**inputs)
+        late_parts = [
+            obs_dict[key].flatten(start_dim=1)
+            for key in self.late_fusion_keys
+        ]
+        if late_parts:
+            encoded = torch.cat((encoded, *late_parts), dim=-1)
+        return self.nets["frame_projection"](encoded)
+
+    def encode_state(
+        self,
+        obs_dict: dict[str, torch.Tensor],
+        goal_dict: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        frames = observation_history_frames(
+            obs_dict,
+            self.obs_shapes,
+            self.observation_horizon,
+        )
+        frame_latents: list[torch.Tensor | None] = [None] * len(frames)
+        # Encode the newest frame first, matching the legacy crop/RNG order.
+        encode_order = (len(frames) - 1, *range(len(frames) - 1))
+        for frame_index in encode_order:
+            frame_latents[frame_index] = self._encode_frame(
+                frames[frame_index], goal_dict
+            )
+        stacked = torch.stack(
+            [value for value in frame_latents if value is not None],
+            dim=1,
+        )
+        temporal_tokens = self.nets["temporal_trunk"](stacked)
+        return {
+            "temporal_state": temporal_tokens[:, -1],
+            "current_frame_latent": stacked[:, -1],
+            "temporal_tokens": temporal_tokens,
+        }
+
+    @staticmethod
+    def expand_state(
+        state: dict[str, torch.Tensor],
+        batch_size: int,
+    ) -> dict[str, torch.Tensor]:
+        result = {}
+        for key in (
+            "temporal_state",
+            "current_frame_latent",
+            "temporal_tokens",
+        ):
+            value = state[key]
+            if int(value.shape[0]) == int(batch_size):
+                result[key] = value
+            elif int(value.shape[0]) == 1:
+                result[key] = value.expand(
+                    int(batch_size), *([-1] * (value.ndim - 1))
+                )
+            else:
+                raise ValueError(
+                    f"cannot expand WCM state batch {value.shape[0]} to "
+                    f"{batch_size}"
+                )
+        return result
+
+    def q_values_from_state(
+        self,
+        state: dict[str, torch.Tensor],
+        acts: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        temporal_state = state["temporal_state"]
+        if int(temporal_state.shape[0]) != int(acts.shape[0]):
+            state = self.expand_state(state, int(acts.shape[0]))
+            temporal_state = state["temporal_state"]
+        action_representations = [
+            encoder(temporal_state, acts, action_mask)
+            for encoder in self.nets["q_action_encoders"]
+        ]
+        return [
+            head(torch.cat((temporal_state, action_repr), dim=-1))
+            for head, action_repr in zip(
+                self.nets["q_heads"], action_representations
+            )
+        ]
+
+    def value_from_state(
+        self,
+        state: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        return self.nets["value_head"](state["temporal_state"])
+
+    def predict_dynamics_from_state(
+        self,
+        state: dict[str, torch.Tensor],
+        acts: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.nets["dynamics"](
+            state["temporal_state"],
+            state["current_frame_latent"],
+            acts,
+            action_mask,
+        )
+
+    def encode_dynamics_targets(
+        self,
+        obs_dict: dict[str, torch.Tensor],
+        goal_dict: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        offset_count = len(self.dynamics_prediction_offsets)
+        first_key = next(iter(self.obs_shapes))
+        first_value = obs_dict[first_key]
+        if first_value.ndim != len(self.obs_shapes[first_key]) + 2:
+            raise ValueError(
+                "dynamics targets must be [B,O,...], got "
+                f"{tuple(first_value.shape)} for {first_key!r}"
+            )
+        batch_size = int(first_value.shape[0])
+        if int(first_value.shape[1]) != offset_count:
+            raise ValueError(
+                f"dynamics target offset count={first_value.shape[1]} does "
+                f"not match {offset_count}"
+            )
+        flattened = {}
+        for key, shape in self.obs_shapes.items():
+            value = obs_dict[key]
+            expected = (batch_size, offset_count, *tuple(shape))
+            if tuple(value.shape) != expected:
+                raise ValueError(
+                    f"dynamics target {key!r} has shape {tuple(value.shape)}, "
+                    f"expected {expected}"
+                )
+            flattened[key] = value.reshape(batch_size * offset_count, *shape)
+        flattened_goal = None
+        if self.has_goal:
+            if goal_dict is None:
+                raise ValueError("dynamics target encoding requires goal observations")
+            flattened_goal = {
+                key: value.repeat_interleave(offset_count, dim=0)
+                for key, value in goal_dict.items()
+            }
+        return self._encode_frame(flattened, flattened_goal).reshape(
+            batch_size,
+            offset_count,
+            self.latent_dim,
+        )
+
+
+def make_wcm_chunk_value_system(
+    actor_algo,
+    *,
+    chunk_horizon: int,
+    hidden_dims: tuple[int, ...],
+    latent_dim: int,
+    action_hidden_dim: int,
+    num_attention_heads: int,
+    num_action_conv_layers: int,
+    dropout: float,
+    num_critics: int = 2,
+    critic_group_norm: bool = False,
+    late_fusion_key: str | None = "robot0_gripper_qpos",
+    observation_horizon: int = 1,
+    temporal_num_layers: int = 2,
+    temporal_num_heads: int = 3,
+    temporal_feedforward_dim: int = 600,
+    temporal_dropout: float = 0.0,
+    dynamics_prediction_offsets: tuple[int, ...] = (2, 4, 6, 8),
+) -> tuple[WCMChunkValueSystem, WCMChunkValueSystem]:
+    encoder_kwargs = ObsUtils.obs_encoder_kwargs_from_config(
+        actor_algo.obs_config.encoder
+    )
+    system = WCMChunkValueSystem(
+        obs_shapes=actor_algo.obs_shapes,
+        goal_shapes=actor_algo.goal_shapes,
+        encoder_kwargs=copy.deepcopy(encoder_kwargs),
+        action_dim=int(actor_algo.ac_dim),
+        chunk_horizon=int(chunk_horizon),
+        hidden_dims=tuple(int(value) for value in hidden_dims),
+        latent_dim=int(latent_dim),
+        action_hidden_dim=int(action_hidden_dim),
+        num_attention_heads=int(num_attention_heads),
+        num_action_conv_layers=int(num_action_conv_layers),
+        dropout=float(dropout),
+        late_fusion_key=late_fusion_key,
+        observation_horizon=int(observation_horizon),
+        num_critics=int(num_critics),
+        temporal_num_layers=int(temporal_num_layers),
+        temporal_num_heads=int(temporal_num_heads),
+        temporal_feedforward_dim=int(temporal_feedforward_dim),
+        temporal_dropout=float(temporal_dropout),
+        dynamics_prediction_offsets=tuple(
+            int(value) for value in dynamics_prediction_offsets
+        ),
+    )
+    if critic_group_norm:
+        system = replace_bn_with_gn(system)
+    return system, copy.deepcopy(system)
+
+
+def make_wcm_system_from_checkpoint(
+    actor_algo,
+    checkpoint: dict[str, Any],
+) -> tuple[WCMChunkValueSystem, WCMChunkValueSystem]:
+    """Strictly reconstruct every WCM shape-changing choice for evaluation."""
+    if checkpoint_critic_architecture(checkpoint) != WCM_CRITIC_ARCHITECTURE:
+        raise ValueError("checkpoint is not a WCM shared-temporal critic")
+    required = (
+        "critic_chunk_horizon",
+        "critic_hidden_dims",
+        "critic_latent_dim",
+        "critic_action_hidden_dim",
+        "critic_num_attention_heads",
+        "critic_num_action_conv_layers",
+        "critic_dropout",
+        "num_critics",
+        "critic_group_norm",
+        "critic_late_fusion_key",
+        "critic_observation_horizon",
+        "critic_temporal_num_layers",
+        "critic_temporal_num_heads",
+        "critic_temporal_feedforward_dim",
+        "critic_temporal_dropout",
+        "dynamics_prediction_offsets",
+    )
+    missing = [key for key in required if key not in checkpoint]
+    if missing:
+        raise ValueError(
+            f"WCM checkpoint is missing architecture fields: {missing}"
+        )
+    if bool(checkpoint.get("critic_q_use_predicted_next_latent", False)):
+        raise ValueError("WCM checkpoint illegally enables predicted-latent Q")
+    expected_inputs = architecture_q_head_inputs(WCM_CRITIC_ARCHITECTURE)
+    if tuple(checkpoint.get("critic_q_head_inputs", ())) != expected_inputs:
+        raise ValueError(
+            "WCM checkpoint Q-head metadata must be "
+            f"{expected_inputs!r}"
+        )
+    if bool(checkpoint.get("dynamics_prediction_consumed_by_q", True)):
+        raise ValueError("WCM dynamics prediction must not be consumed by Q")
+    return make_wcm_chunk_value_system(
+        actor_algo,
+        chunk_horizon=int(checkpoint["critic_chunk_horizon"]),
+        hidden_dims=tuple(int(x) for x in checkpoint["critic_hidden_dims"]),
+        latent_dim=int(checkpoint["critic_latent_dim"]),
+        action_hidden_dim=int(checkpoint["critic_action_hidden_dim"]),
+        num_attention_heads=int(checkpoint["critic_num_attention_heads"]),
+        num_action_conv_layers=int(
+            checkpoint["critic_num_action_conv_layers"]
+        ),
+        dropout=float(checkpoint["critic_dropout"]),
+        num_critics=int(checkpoint["num_critics"]),
+        critic_group_norm=bool(checkpoint["critic_group_norm"]),
+        late_fusion_key=checkpoint["critic_late_fusion_key"],
+        observation_horizon=int(checkpoint["critic_observation_horizon"]),
+        temporal_num_layers=int(checkpoint["critic_temporal_num_layers"]),
+        temporal_num_heads=int(checkpoint["critic_temporal_num_heads"]),
+        temporal_feedforward_dim=int(
+            checkpoint["critic_temporal_feedforward_dim"]
+        ),
+        temporal_dropout=float(checkpoint["critic_temporal_dropout"]),
+        dynamics_prediction_offsets=tuple(
+            int(x) for x in checkpoint["dynamics_prediction_offsets"]
+        ),
+    )
+
+
 def copy_matching_encoder_state(
     critic: RiseChunkActionValueNetwork,
     source_state: dict[str, torch.Tensor],
@@ -1123,6 +1627,15 @@ def validate_resume_semantics(
     requested_q_uses_predicted_next = bool(
         getattr(args, "critic_q_use_predicted_next_latent", False)
     )
+    requested_architecture = str(
+        getattr(args, "critic_architecture", LEGACY_CRITIC_ARCHITECTURE)
+    )
+    saved_architecture = checkpoint_critic_architecture(resume_state)
+    if saved_architecture != requested_architecture:
+        raise ValueError(
+            f"resume critic_architecture={saved_architecture!r} does not "
+            f"match requested {requested_architecture!r}; use a fresh run"
+        )
     if str(resume_state.get("task", "")) != str(args.task):
         raise ValueError(
             f"resume task={resume_state.get('task')!r} does not match "
@@ -1190,6 +1703,24 @@ def validate_resume_semantics(
         "critic_vf_lr_warmup_steps": int(args.critic_vf_lr_warmup_steps),
         "critic_vf_lr_num_cycles": float(args.critic_vf_lr_num_cycles),
     }
+    if requested_architecture == WCM_CRITIC_ARCHITECTURE:
+        exact_fields.update(
+            {
+                "temporal_num_layers": int(args.temporal_num_layers),
+                "temporal_num_heads": int(args.temporal_num_heads),
+                "temporal_feedforward_dim": int(
+                    args.temporal_feedforward_dim
+                ),
+                "temporal_dropout": float(args.temporal_dropout),
+                "dynamics_prediction_offsets": tuple(
+                    int(value) for value in args.dynamics_prediction_offsets
+                ),
+                "sigreg_weight": float(args.sigreg_weight),
+                "sigreg_knots": int(args.sigreg_knots),
+                "sigreg_num_projections": int(args.sigreg_num_projections),
+                "sigreg_global_batch": bool(args.sigreg_global_batch),
+            }
+        )
     if args.steps_per_epoch is not None:
         exact_fields["steps_per_epoch"] = int(args.steps_per_epoch)
     for field, requested in exact_fields.items():
@@ -1216,14 +1747,17 @@ def validate_resume_semantics(
             saved = saved_args[field]
         if field == "critic_hidden_dims":
             saved = tuple(int(x) for x in saved)
+        elif field == "dynamics_prediction_offsets":
+            saved = tuple(int(x) for x in saved)
         if saved != requested:
             raise ValueError(
                 f"resume {field}={saved!r} does not match requested "
                 f"{field}={requested!r}; use a source warm start for an "
                 "intentional objective change"
             )
-    expected_q_inputs = critic_q_head_inputs(
-        requested_q_uses_predicted_next
+    expected_q_inputs = architecture_q_head_inputs(
+        requested_architecture,
+        requested_q_uses_predicted_next,
     )
     saved_q_inputs = tuple(
         resume_state.get(
@@ -1565,6 +2099,7 @@ def process_chunk_batch(
     discount: float,
     reward_mode: str = "task",
     critic_observation_horizon: int = 1,
+    dynamics_prediction_offsets: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     """Extract a semi-MDP transition at the first executable DP action."""
     current_index = int(actor_algo.algo_config.horizon.observation_horizon) - 1
@@ -1631,6 +2166,67 @@ def process_chunk_batch(
         (valid_length == float(chunk_horizon)) & (terminal < 0.5)
     ).to(rewards.dtype)
 
+    dynamics_prediction_offsets = tuple(
+        int(value) for value in dynamics_prediction_offsets
+    )
+    if dynamics_prediction_offsets and (
+        tuple(sorted(set(dynamics_prediction_offsets)))
+        != dynamics_prediction_offsets
+        or dynamics_prediction_offsets[0] < 1
+        or dynamics_prediction_offsets[-1] > int(chunk_horizon)
+    ):
+        raise ValueError(
+            "dynamics_prediction_offsets must be sorted, unique, positive, "
+            f"and <= chunk_horizon={chunk_horizon}; got "
+            f"{dynamics_prediction_offsets}"
+        )
+    dynamics_targets = None
+    if dynamics_prediction_offsets:
+        offset_indices = torch.as_tensor(
+            [current_index + value - 1 for value in dynamics_prediction_offsets],
+            dtype=torch.long,
+            device=dones.device,
+        )
+        prefix_continuation = torch.cumprod(continuation, dim=1)
+        valid_mask = prefix_continuation[
+            :,
+            torch.as_tensor(
+                [value - 1 for value in dynamics_prediction_offsets],
+                dtype=torch.long,
+                device=dones.device,
+            ),
+        ]
+        if "chunk_dynamics_next_obs" in raw_batch:
+            target_obs = {
+                key: raw_batch["chunk_dynamics_next_obs"][key]
+                for key in actor_algo.obs_shapes
+            }
+            availability = raw_batch[
+                "chunk_dynamics_target_available"
+            ].to(dtype=valid_mask.dtype, device=valid_mask.device)
+        else:
+            target_obs = {
+                key: raw_batch["next_obs"][key].index_select(
+                    1, offset_indices
+                )
+                for key in actor_algo.obs_shapes
+            }
+            if "pad_mask" in raw_batch:
+                availability = raw_batch["pad_mask"].index_select(
+                    1, offset_indices
+                )
+                if availability.ndim == 3:
+                    availability = availability.squeeze(-1)
+                availability = availability.to(dtype=valid_mask.dtype)
+            else:
+                availability = torch.ones_like(valid_mask)
+        dynamics_targets = {
+            # This nested key must remain exactly ``next_obs`` so robomimic's
+            # postprocessor applies channel conversion and normalization.
+            "next_obs": target_obs,
+            "valid_mask": valid_mask * availability,
+        }
+
     batch = {
         "obs": {
             key: (
@@ -1677,6 +2273,8 @@ def process_chunk_batch(
         "exact_next": exact_next.reshape(-1, 1),
         "goal_obs": raw_batch.get("goal_obs"),
     }
+    if dynamics_targets is not None:
+        batch["dynamics_targets"] = dynamics_targets
     batch = TensorUtils.to_device(
         TensorUtils.to_float(batch),
         actor_algo.device,
@@ -1807,8 +2405,8 @@ def configure_encoder_target_random_crops(encoder: nn.Module) -> None:
 def compute_chunk_losses(
     critics: nn.ModuleList,
     targets: nn.ModuleList,
-    dynamics_target_encoder: nn.Module,
-    vf: RiseValueNetwork,
+    dynamics_target_encoder: nn.Module | None,
+    vf: RiseValueNetwork | None,
     batch: dict[str, Any],
     *,
     discount: float,
@@ -1989,6 +2587,351 @@ def compute_chunk_losses(
     return critic_losses, vf_loss, info
 
 
+def _global_valid_count(
+    local_count: torch.Tensor,
+    distributed_context: DistributedContext | None,
+) -> torch.Tensor:
+    global_count = local_count.detach().clone()
+    if distributed_context is not None and distributed_context.enabled:
+        dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+    return global_count
+
+
+def masked_wcm_dynamics_mse(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    valid_mask: torch.Tensor,
+    current_frame_latent: torch.Tensor,
+    *,
+    distributed_context: DistributedContext | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Raw latent MSE over one global mean of valid (row, offset) pairs."""
+    if predicted.shape != target.shape or predicted.ndim != 3:
+        raise ValueError(
+            "WCM prediction and target must share [B,O,D] shape, got "
+            f"{tuple(predicted.shape)} and {tuple(target.shape)}"
+        )
+    if tuple(valid_mask.shape) != tuple(predicted.shape[:2]):
+        raise ValueError(
+            f"WCM dynamics mask must be [B,O], got {tuple(valid_mask.shape)}"
+        )
+    rows = valid_mask.reshape(-1) > 0.5
+    predicted_rows = predicted.reshape(-1, predicted.shape[-1])[rows]
+    target_rows = target.reshape(-1, target.shape[-1])[rows]
+    per_row_mse = (predicted_rows - target_rows).square().mean(dim=-1)
+    local_count = rows.sum().detach()
+    global_count = _global_valid_count(local_count, distributed_context)
+    world_size = (
+        int(distributed_context.world_size)
+        if distributed_context is not None and distributed_context.enabled
+        else 1
+    )
+    denominator = global_count.to(dtype=predicted.dtype).clamp_min(1.0)
+    # Manual parameter-gradient synchronization later averages ranks. This
+    # scaling makes its result equal one mean over the global valid rows.
+    loss = per_row_mse.sum() * (
+        predicted.new_tensor(float(world_size)) / denominator
+    )
+
+    global_squared_sum = per_row_mse.detach().sum().clone()
+    if distributed_context is not None and distributed_context.enabled:
+        dist.all_reduce(global_squared_sum, op=dist.ReduceOp.SUM)
+    global_mse = torch.where(
+        global_count > 0,
+        global_squared_sum / denominator,
+        torch.zeros_like(global_squared_sum),
+    )
+
+    copy_prediction = current_frame_latent[:, None, :].expand_as(target)
+    copy_rows = copy_prediction.reshape(-1, target.shape[-1])[rows]
+    copy_per_row = (copy_rows - target_rows).square().mean(dim=-1)
+    global_copy_sum = copy_per_row.detach().sum().clone()
+    if distributed_context is not None and distributed_context.enabled:
+        dist.all_reduce(global_copy_sum, op=dist.ReduceOp.SUM)
+    global_copy_mse = torch.where(
+        global_count > 0,
+        global_copy_sum / denominator,
+        torch.zeros_like(global_copy_sum),
+    )
+
+    metrics: dict[str, torch.Tensor] = {
+        "dynamics/mse": global_mse.detach(),
+        "dynamics/rmse": torch.sqrt(global_mse.clamp_min(1e-12)).detach(),
+        "dynamics/copy_current_mse": global_copy_mse.detach(),
+        "dynamics/valid_pair_count": global_count.to(predicted.dtype),
+        "dynamics/valid_fraction": valid_mask.float().mean().detach(),
+    }
+    for offset_index in range(predicted.shape[1]):
+        offset_rows = valid_mask[:, offset_index] > 0.5
+        offset_errors = (
+            predicted[:, offset_index][offset_rows]
+            - target[:, offset_index][offset_rows]
+        ).square().mean(dim=-1)
+        offset_count = _global_valid_count(
+            offset_rows.sum().detach(), distributed_context
+        )
+        offset_sum = offset_errors.detach().sum().clone()
+        if distributed_context is not None and distributed_context.enabled:
+            dist.all_reduce(offset_sum, op=dist.ReduceOp.SUM)
+        metrics[f"dynamics/offset_index_{offset_index}_mse"] = torch.where(
+            offset_count > 0,
+            offset_sum / offset_count.to(offset_sum.dtype).clamp_min(1.0),
+            torch.zeros_like(offset_sum),
+        )
+        metrics[f"dynamics/offset_index_{offset_index}_valid_count"] = (
+            offset_count.to(predicted.dtype)
+        )
+    return loss, metrics
+
+
+def differentiable_global_batch(
+    features: torch.Tensor,
+    distributed_context: DistributedContext | None,
+) -> torch.Tensor:
+    if distributed_context is None or not distributed_context.enabled:
+        return features
+    local_shape = torch.as_tensor(
+        features.shape,
+        dtype=torch.long,
+        device=features.device,
+    )
+    gathered_shapes = [torch.empty_like(local_shape) for _ in range(
+        distributed_context.world_size
+    )]
+    dist.all_gather(gathered_shapes, local_shape)
+    if any(not torch.equal(shape, local_shape) for shape in gathered_shapes):
+        raise ValueError(
+            "global-batch SIGReg requires equal feature shapes on every rank; "
+            f"got {[shape.tolist() for shape in gathered_shapes]}"
+        )
+    from torch.distributed.nn.functional import all_gather
+
+    return torch.cat(tuple(all_gather(features)), dim=0)
+
+
+def sigreg_loss(
+    features: torch.Tensor,
+    *,
+    knots: int,
+    num_projections: int,
+    seed: int,
+    distributed_context: DistributedContext | None = None,
+    projection_chunk_size: int = 128,
+) -> torch.Tensor:
+    """WCM/LeJEPA Epps-Pulley SIGReg on a differentiable global batch."""
+    if features.ndim != 2:
+        raise ValueError(f"SIGReg features must be [B,D], got {features.shape}")
+    if int(knots) < 2 or int(num_projections) < 1:
+        raise ValueError("SIGReg knots and projection count must be positive")
+    features = differentiable_global_batch(
+        features.float(), distributed_context
+    )
+    batch_size, feature_dim = features.shape
+    if int(batch_size) < 2:
+        return features.sum() * 0.0
+    points = torch.linspace(
+        0.0,
+        3.0,
+        int(knots),
+        dtype=torch.float32,
+        device=features.device,
+    )
+    delta = 3.0 / float(int(knots) - 1)
+    weights = torch.full_like(points, 2.0 * delta)
+    weights[[0, -1]] = delta
+    gaussian_cf = torch.exp(-0.5 * points.square())
+    weights = weights * gaussian_cf
+    with fork_rng_with_seed(int(seed), features.device):
+        projections = torch.randn(
+            int(feature_dim),
+            int(num_projections),
+            dtype=torch.float32,
+            device=features.device,
+        )
+    projections = F.normalize(projections, dim=0)
+    total = features.new_zeros(())
+    for start in range(0, int(num_projections), int(projection_chunk_size)):
+        directions = projections[
+            :, start : start + int(projection_chunk_size)
+        ]
+        projected = features @ directions
+        phases = projected.unsqueeze(-1) * points
+        real_error = phases.cos().mean(dim=0) - gaussian_cf
+        imaginary = phases.sin().mean(dim=0)
+        per_projection = (
+            (real_error.square() + imaginary.square()) @ weights
+        ) * float(batch_size)
+        total = total + per_projection.sum()
+    return total / float(num_projections)
+
+
+def compute_wcm_chunk_losses(
+    system: WCMChunkValueSystem,
+    target_system: WCMChunkValueSystem,
+    batch: dict[str, Any],
+    *,
+    discount: float,
+    expectile: float,
+    use_huber: bool,
+    dynamics_weight: float,
+    sigreg_weight: float,
+    sigreg_knots: int,
+    sigreg_num_projections: int,
+    sigreg_global_batch: bool,
+    global_step: int,
+    distributed_context: DistributedContext | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if "dynamics_targets" not in batch:
+        raise KeyError("WCM batch is missing dense dynamics_targets")
+    device = batch["actions"].device
+    crop_seeds = torch.randint(
+        0,
+        torch.iinfo(torch.int32).max,
+        (3,),
+        device="cpu",
+    ).tolist()
+    current_crop_seed, next_crop_seed, dynamics_crop_seed = crop_seeds
+    with fork_rng_with_seed(current_crop_seed, device):
+        state = system.encode_state(batch["obs"], batch["goal_obs"])
+    q_predictions = system.q_values_from_state(
+        state,
+        batch["actions"],
+        batch["action_mask"],
+    )
+    vf_pred = system.value_from_state(state)
+    predicted_dynamics = system.predict_dynamics_from_state(
+        state,
+        batch["actions"],
+        batch["action_mask"],
+    )
+
+    with torch.no_grad():
+        with fork_rng_with_seed(next_crop_seed, device):
+            next_state = system.encode_state(
+                batch["next_obs"], batch["goal_obs"]
+            )
+            next_v = system.value_from_state(next_state)
+        bootstrap = torch.pow(
+            batch["valid_length"].new_tensor(float(discount)),
+            batch["valid_length"],
+        )
+        q_backup = (
+            batch["reward"]
+            + (1.0 - batch["terminal"]) * bootstrap * next_v
+        )
+        with fork_rng_with_seed(current_crop_seed, device):
+            target_state = target_system.encode_state(
+                batch["obs"], batch["goal_obs"]
+            )
+        target_qs = target_system.q_values_from_state(
+            target_state,
+            batch["actions"],
+            batch["action_mask"],
+        )
+        target_q_min = torch.cat(target_qs, dim=1).min(
+            dim=1, keepdim=True
+        ).values
+        with fork_rng_with_seed(dynamics_crop_seed, device):
+            target_dynamics = system.encode_dynamics_targets(
+                batch["dynamics_targets"]["next_obs"],
+                batch["goal_obs"],
+            ).detach()
+
+    regression = F.smooth_l1_loss if use_huber else F.mse_loss
+    q_losses = [regression(prediction, q_backup) for prediction in q_predictions]
+    vf_error = vf_pred - target_q_min
+    vf_weight = torch.where(
+        vf_error > 0.0,
+        1.0 - float(expectile),
+        float(expectile),
+    )
+    vf_loss = (vf_weight * vf_error.square()).mean()
+    dynamics_mse, dynamics_info = masked_wcm_dynamics_mse(
+        predicted_dynamics,
+        target_dynamics,
+        batch["dynamics_targets"]["valid_mask"],
+        state["current_frame_latent"],
+        distributed_context=distributed_context,
+    )
+    if float(sigreg_weight) > 0.0:
+        raw_sigreg = sigreg_loss(
+            state["temporal_state"],
+            knots=int(sigreg_knots),
+            num_projections=int(sigreg_num_projections),
+            seed=int(global_step) + 1729,
+            distributed_context=(
+                distributed_context if sigreg_global_batch else None
+            ),
+        )
+    else:
+        # Weight zero intentionally performs no distributed gather/projection.
+        raw_sigreg = state["temporal_state"].sum() * 0.0
+    weighted_dynamics = float(dynamics_weight) * dynamics_mse
+    weighted_sigreg = float(sigreg_weight) * raw_sigreg
+    total_loss = sum(q_losses) + vf_loss + weighted_dynamics + weighted_sigreg
+    q_tensor = torch.cat(q_predictions, dim=1)
+    target_valid_rows = target_dynamics[
+        batch["dynamics_targets"]["valid_mask"] > 0.5
+    ]
+    if int(target_valid_rows.shape[0]) > 0:
+        target_feature_std = target_valid_rows.std(
+            dim=0,
+            unbiased=False,
+        ).mean()
+        target_feature_norm = target_valid_rows.norm(dim=-1).mean()
+    else:
+        target_feature_std = target_dynamics.new_zeros(())
+        target_feature_norm = target_dynamics.new_zeros(())
+    info = {
+        **{
+            f"critic/q{index + 1}_loss": loss.detach()
+            for index, loss in enumerate(q_losses)
+        },
+        **{
+            f"critic/q{index + 1}_mean": prediction.mean().detach()
+            for index, prediction in enumerate(q_predictions)
+        },
+        **dynamics_info,
+        "critic/total_loss": total_loss.detach(),
+        "critic/q_target_mean": q_backup.mean().detach(),
+        "critic/q_ensemble_std": q_tensor.std(dim=1).mean().detach(),
+        "vf/loss": vf_loss.detach(),
+        "vf/value_mean": vf_pred.mean().detach(),
+        "vf/target_q_min_mean": target_q_min.mean().detach(),
+        "vf/error_mean": vf_error.mean().detach(),
+        "dynamics/weighted_loss": weighted_dynamics.detach(),
+        "dynamics/effective_mse_weight": q_tensor.new_tensor(
+            float(dynamics_weight)
+        ),
+        "dynamics/target_feature_std": target_feature_std.detach(),
+        "dynamics/target_feature_norm": target_feature_norm.detach(),
+        "sigreg/raw_loss": raw_sigreg.detach(),
+        "sigreg/weighted_loss": weighted_sigreg.detach(),
+        "sigreg/effective_weight": q_tensor.new_tensor(float(sigreg_weight)),
+        "representation/temporal_feature_std": state[
+            "temporal_state"
+        ].std(dim=0, unbiased=False).mean().detach(),
+        "representation/temporal_mean_norm": state[
+            "temporal_state"
+        ].mean(dim=0).norm().detach(),
+        "representation/frame_feature_std": state[
+            "current_frame_latent"
+        ].std(dim=0, unbiased=False).mean().detach(),
+        "data/chunk_return_mean": batch["reward"].mean().detach(),
+        "data/terminal_fraction": batch["terminal"].mean().detach(),
+        "data/valid_length_mean": batch["valid_length"].mean().detach(),
+        "data/action_abs_mean": batch["actions"].abs().mean().detach(),
+        "data/action_min": batch["actions"].min().detach(),
+        "data/action_max": batch["actions"].max().detach(),
+        "objective/monte_carlo_return_weight": q_tensor.new_zeros(()),
+    }
+    for offset_index, offset in enumerate(system.dynamics_prediction_offsets):
+        for suffix in ("mse", "valid_count"):
+            temporary_key = f"dynamics/offset_index_{offset_index}_{suffix}"
+            info[f"dynamics/offset_{offset}_{suffix}"] = info.pop(temporary_key)
+    return total_loss, info
+
+
 def make_critic_optimizer(
     critic: nn.Module,
     critic_lr: float,
@@ -2043,7 +2986,7 @@ def update_networks(
     targets: nn.ModuleList,
     vf: RiseValueNetwork,
     critic_optimizers: list[torch.optim.Optimizer],
-    vf_optimizer: torch.optim.Optimizer,
+    vf_optimizer: torch.optim.Optimizer | None,
     critic_losses: list[torch.Tensor],
     vf_loss: torch.Tensor,
     *,
@@ -2082,6 +3025,81 @@ def update_networks(
         TorchUtils.soft_update(critic, target, tau=float(target_tau))
 
 
+def make_wcm_optimizer(
+    system: WCMChunkValueSystem,
+    *,
+    critic_lr: float,
+    encoder_lr: float,
+    vf_lr: float,
+) -> torch.optim.Optimizer:
+    encoder_parameters = list(system.nets["encoder"].parameters())
+    value_parameters = list(system.nets["value_head"].parameters())
+    excluded = {
+        id(parameter)
+        for parameter in (*encoder_parameters, *value_parameters)
+    }
+    critic_parameters = [
+        parameter
+        for parameter in system.parameters()
+        if id(parameter) not in excluded
+    ]
+    return torch.optim.Adam(
+        [
+            {
+                "params": critic_parameters,
+                "lr": float(critic_lr),
+                "group_name": "critic",
+            },
+            {
+                "params": encoder_parameters,
+                "lr": float(encoder_lr),
+                "group_name": "encoder",
+            },
+            {
+                "params": value_parameters,
+                "lr": float(vf_lr),
+                "group_name": "vf",
+            },
+        ]
+    )
+
+
+def configure_wcm_target_random_crops(
+    target_system: WCMChunkValueSystem,
+) -> None:
+    target_system.eval().requires_grad_(False)
+    configure_encoder_target_random_crops(target_system.nets["encoder"])
+
+
+def set_wcm_encoder_trainable(
+    system: WCMChunkValueSystem,
+    trainable: bool,
+) -> None:
+    """Freeze only the copied visual encoder; fresh WCM modules always train."""
+    system.nets["encoder"].requires_grad_(bool(trainable))
+
+
+def update_wcm_system(
+    system: WCMChunkValueSystem,
+    target_system: WCMChunkValueSystem,
+    optimizer: torch.optim.Optimizer,
+    total_loss: torch.Tensor,
+    *,
+    target_tau: float,
+    max_gradient_norm: float | None,
+    gradient_sync_fn=None,
+) -> None:
+    optimizer.zero_grad(set_to_none=True)
+    total_loss.backward()
+    parameters = list(system.parameters())
+    if gradient_sync_fn is not None:
+        gradient_sync_fn(parameters)
+    if max_gradient_norm is not None:
+        torch.nn.utils.clip_grad_norm_(parameters, max_gradient_norm)
+    optimizer.step()
+    TorchUtils.soft_update(system, target_system, tau=float(target_tau))
+
+
 def validate_source(source: dict, args: argparse.Namespace) -> None:
     if not source.get("rise_style_rgb_idql", False):
         raise ValueError("source checkpoint is not a RISE-style RGB IDQL checkpoint")
@@ -2091,6 +3109,22 @@ def validate_source(source: dict, args: argparse.Namespace) -> None:
         raise ValueError(
             f"source task={source.get('task')} does not match task={args.task}"
         )
+    if str(args.critic_architecture) == WCM_CRITIC_ARCHITECTURE:
+        # A one-step IDQL source contributes only its actor lineage to a fresh
+        # WCM system. Its Q/V widths and encoder-head layout are deliberately
+        # unrelated to the newly constructed shared-temporal critic.
+        required = (
+            "actor_model",
+            "pretrained_dp_checkpoint",
+            "action_normalization_stats",
+        )
+        missing = [key for key in required if key not in source]
+        if missing:
+            raise ValueError(
+                "WCM actor warm start is missing source fields: "
+                f"{missing}"
+            )
+        return
     source_num_critics = int(source.get("num_critics", 0))
     if source_num_critics < 2:
         raise ValueError("source checkpoint does not contain twin critics")
@@ -2127,26 +3161,38 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
             f"source reward_mode={source_reward_mode!r} does not match "
             f"requested reward_mode={args.reward_mode!r}"
         )
-    if not bool(source.get("conditioned_actor", False)):
-        raise ValueError(
-            "joint chunk warm start requires a conditioned source actor"
-        )
-    source_condition_definition = str(
-        source.get("actor_condition_label_definition", "")
+    source_conditioned = bool(source.get("conditioned_actor", False))
+    validating_completed_resume = bool(
+        getattr(args, "validate_resume_only", False)
     )
-    required_condition_definition = actor_condition_definition(
-        args.actor_condition_mode
-    )
-    if source_condition_definition != required_condition_definition:
-        raise ValueError(
-            "source actor condition definition="
-            f"{source_condition_definition!r} does not match required "
-            f"{required_condition_definition!r}"
+    if validating_completed_resume:
+        if source_conditioned != bool(args.conditioned_actor):
+            raise ValueError(
+                "completed checkpoint conditioned_actor does not match the "
+                "requested validation configuration"
+            )
+    else:
+        if not source_conditioned:
+            raise ValueError(
+                "joint chunk warm start requires a conditioned source actor"
+            )
+        if not bool(args.conditioned_actor):
+            raise ValueError(
+                "source_chunk_idql_joint requires --conditioned-actor"
+            )
+    if source_conditioned:
+        source_condition_definition = str(
+            source.get("actor_condition_label_definition", "")
         )
-    if not bool(args.conditioned_actor):
-        raise ValueError(
-            "source_chunk_idql_joint requires --conditioned-actor"
+        required_condition_definition = actor_condition_definition(
+            args.actor_condition_mode
         )
+        if source_condition_definition != required_condition_definition:
+            raise ValueError(
+                "source actor condition definition="
+                f"{source_condition_definition!r} does not match required "
+                f"{required_condition_definition!r}"
+            )
 
     source_args = source.get("args", {})
     requested_critic_observation_horizon = int(
@@ -2155,6 +3201,13 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
     requested_q_uses_predicted_next = bool(
         getattr(args, "critic_q_use_predicted_next_latent", False)
     )
+    requested_architecture = str(args.critic_architecture)
+    source_architecture = checkpoint_critic_architecture(source)
+    if source_architecture != requested_architecture:
+        raise ValueError(
+            f"source critic_architecture={source_architecture!r} does not "
+            f"match requested {requested_architecture!r}"
+        )
     source_condition_hidden_dim = int(
         source_args.get(
             "condition_hidden_dim",
@@ -2186,6 +3239,20 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
         "critic_group_norm": bool(args.critic_group_norm),
         "critic_late_fusion_key": args.critic_late_fusion_key,
     }
+    if requested_architecture == WCM_CRITIC_ARCHITECTURE:
+        expected_fields.update(
+            {
+                "critic_temporal_num_layers": int(args.temporal_num_layers),
+                "critic_temporal_num_heads": int(args.temporal_num_heads),
+                "critic_temporal_feedforward_dim": int(
+                    args.temporal_feedforward_dim
+                ),
+                "critic_temporal_dropout": float(args.temporal_dropout),
+                "dynamics_prediction_offsets": tuple(
+                    args.dynamics_prediction_offsets
+                ),
+            }
+        )
     integer_fields = {
         "critic_chunk_horizon",
         "critic_observation_horizon",
@@ -2194,10 +3261,15 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
         "critic_num_attention_heads",
         "critic_num_action_conv_layers",
         "num_critics",
+        "critic_temporal_num_layers",
+        "critic_temporal_num_heads",
+        "critic_temporal_feedforward_dim",
     }
     for field, expected in expected_fields.items():
         value = source.get(field)
         if field == "critic_hidden_dims":
+            value = tuple(value or ())
+        elif field == "dynamics_prediction_offsets":
             value = tuple(value or ())
         elif field == "critic_observation_horizon":
             value = checkpoint_critic_observation_horizon(source)
@@ -2205,7 +3277,7 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
             value = checkpoint_q_uses_predicted_next_latent(source)
         elif field in integer_fields:
             value = int(value if value is not None else -1)
-        elif field == "critic_dropout":
+        elif field in ("critic_dropout", "critic_temporal_dropout"):
             value = float(value if value is not None else float("nan"))
         elif field == "critic_group_norm":
             value = bool(value)
@@ -2214,13 +3286,19 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
                 f"{field}={expected!r} does not match source value {value!r}"
             )
 
-    if str(source.get("dynamics_prediction_mode", "")) != DYNAMICS_PREDICTION_MODE:
+    expected_dynamics_mode = (
+        WCM_DYNAMICS_PREDICTION_MODE
+        if requested_architecture == WCM_CRITIC_ARCHITECTURE
+        else DYNAMICS_PREDICTION_MODE
+    )
+    if str(source.get("dynamics_prediction_mode", "")) != expected_dynamics_mode:
         raise ValueError(
             "source dynamics prediction mode does not match the current "
-            f"{DYNAMICS_PREDICTION_MODE!r} architecture"
+            f"{expected_dynamics_mode!r} architecture"
         )
-    expected_q_inputs = critic_q_head_inputs(
-        requested_q_uses_predicted_next
+    expected_q_inputs = architecture_q_head_inputs(
+        requested_architecture,
+        requested_q_uses_predicted_next,
     )
     source_q_inputs = tuple(
         source.get(
@@ -2245,23 +3323,34 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
             "normalization"
         )
     required_keys = (
-        "actor_model",
-        "critics",
-        "critic_targets",
-        "dynamics_target_encoder",
-        "vf",
-        "pretrained_dp_checkpoint",
-        "action_normalization_stats",
+        (
+            "actor_model",
+            "chunk_value_system",
+            "chunk_value_target",
+            "pretrained_dp_checkpoint",
+            "action_normalization_stats",
+        )
+        if requested_architecture == WCM_CRITIC_ARCHITECTURE
+        else (
+            "actor_model",
+            "critics",
+            "critic_targets",
+            "dynamics_target_encoder",
+            "vf",
+            "pretrained_dp_checkpoint",
+            "action_normalization_stats",
+        )
     )
     missing = [key for key in required_keys if key not in source]
     if missing:
         raise ValueError(
             f"source chunk checkpoint is missing required fields: {missing}"
         )
-    if len(source["critics"]) != int(args.num_critics):
-        raise ValueError("source checkpoint critic count is inconsistent")
-    if len(source["critic_targets"]) != int(args.num_critics):
-        raise ValueError("source checkpoint target critic count is inconsistent")
+    if requested_architecture != WCM_CRITIC_ARCHITECTURE:
+        if len(source["critics"]) != int(args.num_critics):
+            raise ValueError("source checkpoint critic count is inconsistent")
+        if len(source["critic_targets"]) != int(args.num_critics):
+            raise ValueError("source checkpoint target critic count is inconsistent")
 
 
 def checkpoint_payload(
@@ -2279,6 +3368,10 @@ def checkpoint_payload(
     vf_optimizer: torch.optim.Optimizer,
     critic_lr_schedulers: list[Any],
     vf_lr_scheduler: Any,
+    wcm_system: WCMChunkValueSystem | None,
+    wcm_target_system: WCMChunkValueSystem | None,
+    wcm_optimizer: torch.optim.Optimizer | None,
+    wcm_lr_scheduler: Any,
     action_stats: dict,
     epoch: int,
     global_step: int,
@@ -2296,13 +3389,54 @@ def checkpoint_payload(
         if distributed_context is not None
         else 1
     )
+    is_wcm = args.critic_architecture == WCM_CRITIC_ARCHITECTURE
+    if is_wcm:
+        if any(
+            value is None
+            for value in (wcm_system, wcm_target_system, wcm_optimizer)
+        ):
+            raise ValueError("WCM checkpoint payload is missing system state")
+        model_state = {
+            "chunk_value_system": wcm_system.state_dict(),
+            "chunk_value_target": wcm_target_system.state_dict(),
+            "chunk_value_optimizer": wcm_optimizer.state_dict(),
+            "chunk_value_lr_scheduler": (
+                wcm_lr_scheduler.state_dict()
+                if wcm_lr_scheduler is not None
+                else None
+            ),
+        }
+    else:
+        if dynamics_target_encoder is None or vf is None or vf_optimizer is None:
+            raise ValueError("legacy checkpoint payload is missing critic state")
+        model_state = {
+            "critics": [critic.state_dict() for critic in critics],
+            "critic_targets": [target.state_dict() for target in targets],
+            "dynamics_target_encoder": dynamics_target_encoder.state_dict(),
+            "vf": vf.state_dict(),
+            "critic_optimizers": [
+                optimizer.state_dict() for optimizer in critic_optimizers
+            ],
+            "vf_optimizer": vf_optimizer.state_dict(),
+            "critic_lr_schedulers": [
+                scheduler.state_dict() if scheduler is not None else None
+                for scheduler in critic_lr_schedulers
+            ],
+            "vf_lr_scheduler": (
+                vf_lr_scheduler.state_dict()
+                if vf_lr_scheduler is not None
+                else None
+            ),
+        }
     return {
         "rise_style_rgb_idql": True,
         "rise_style_rgb_chunk_idql": True,
         "hybrid_dp_chunk_actor_iql": True,
         "visual_critic_idql": True,
-        "critic_q_head_inputs": critic_q_head_inputs(
-            args.critic_q_use_predicted_next_latent
+        "critic_architecture": str(args.critic_architecture),
+        "critic_q_head_inputs": architecture_q_head_inputs(
+            args.critic_architecture,
+            args.critic_q_use_predicted_next_latent,
         ),
         "critic_q_use_predicted_next_latent": bool(
             args.critic_q_use_predicted_next_latent
@@ -2313,33 +3447,37 @@ def checkpoint_payload(
             else None
         ),
         "critic_representation_modules": (
-            "encoder",
-            "context",
-            "context_norm",
+            ("encoder", "frame_projection", "temporal_trunk")
+            if is_wcm
+            else ("encoder", "context", "context_norm")
         ),
+        "critic_shared_state_representation": bool(is_wcm),
         "actor_model": actor_model,
-        "critics": [critic.state_dict() for critic in critics],
-        "critic_targets": [target.state_dict() for target in targets],
-        "dynamics_prediction_mode": DYNAMICS_PREDICTION_MODE,
-        "dynamics_prediction_target": "normalized_actor_encoder_features",
-        "dynamics_target_encoder": dynamics_target_encoder.state_dict(),
+        **model_state,
+        "dynamics_prediction_mode": (
+            WCM_DYNAMICS_PREDICTION_MODE
+            if is_wcm
+            else DYNAMICS_PREDICTION_MODE
+        ),
+        "dynamics_prediction_target": (
+            "stop_gradient_online_critic_frame_latent"
+            if is_wcm
+            else "normalized_actor_encoder_features"
+        ),
+        "dynamics_prediction_offsets": tuple(
+            int(value) for value in args.dynamics_prediction_offsets
+        ),
+        "dynamics_prediction_consumed_by_q": False if is_wcm else bool(
+            args.critic_q_use_predicted_next_latent
+        ),
         "dynamics_target_last_sync_step": int(
             dynamics_target_last_sync_step
         ),
-        "vf": vf.state_dict(),
-        "critic_optimizers": [
-            optimizer.state_dict() for optimizer in critic_optimizers
-        ],
-        "vf_optimizer": vf_optimizer.state_dict(),
-        "critic_lr_schedulers": [
-            scheduler.state_dict() if scheduler is not None else None
-            for scheduler in critic_lr_schedulers
-        ],
-        "vf_lr_scheduler": (
-            vf_lr_scheduler.state_dict()
-            if vf_lr_scheduler is not None
-            else None
-        ),
+        "sigreg_weight": float(args.sigreg_weight),
+        "sigreg_knots": int(args.sigreg_knots),
+        "sigreg_num_projections": int(args.sigreg_num_projections),
+        "sigreg_global_batch": bool(args.sigreg_global_batch),
+        "monte_carlo_return_weight": 0.0,
         "args": vars(args),
         "epoch": int(epoch),
         "step": int(global_step),
@@ -2439,12 +3577,18 @@ def checkpoint_payload(
         ),
         "critic_source_mask": "none_all_shared_batch_rows",
         "critic_training_objective": (
-            "task_reward_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
+            "task_reward_semi_mdp_chunk_iql_with_shared_wcm_dynamics"
+            if is_wcm and args.reward_mode == "task"
+            else "rise_semi_mdp_chunk_iql_with_shared_wcm_dynamics"
+            if is_wcm
+            else "task_reward_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
             if args.reward_mode == "task"
             else "rise_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
         ),
         "critic_input_mode": (
-            "independent_raw_observation_history_chunk_encoders"
+            "shared_raw_observation_causal_temporal_state"
+            if is_wcm
+            else "independent_raw_observation_history_chunk_encoders"
         ),
         "critic_action_space": "pretrained_dp_normalized_action_chunk",
         "critic_hidden_dims": tuple(int(x) for x in args.critic_hidden_dims),
@@ -2457,6 +3601,12 @@ def checkpoint_payload(
         "critic_num_attention_heads": int(args.num_attention_heads),
         "critic_num_action_conv_layers": int(args.num_action_conv_layers),
         "critic_dropout": float(args.dropout),
+        "critic_temporal_num_layers": int(args.temporal_num_layers),
+        "critic_temporal_num_heads": int(args.temporal_num_heads),
+        "critic_temporal_feedforward_dim": int(
+            args.temporal_feedforward_dim
+        ),
+        "critic_temporal_dropout": float(args.temporal_dropout),
         "num_critics": int(args.num_critics),
         "critic_group_norm": bool(args.critic_group_norm),
         "critic_late_fusion_key": args.critic_late_fusion_key,
@@ -2469,7 +3619,9 @@ def checkpoint_payload(
         "expectile": float(args.expectile),
         "target_tau": float(args.target_tau),
         "dynamics_target_source": (
-            "periodic_deployed_actor_ema_obs_encoder"
+            "stop_gradient_online_critic_frame_encoder"
+            if is_wcm
+            else "periodic_deployed_actor_ema_obs_encoder"
             if trains_joint_actor(args)
             else "fixed_deployed_actor_ema_obs_encoder"
         ),
@@ -2544,6 +3696,7 @@ def checkpoint_payload(
 
 
 def train(args: argparse.Namespace) -> dict[str, Any]:
+    configure_critic_architecture_args(args)
     distributed = initialize_distributed(args)
     args.distributed = bool(distributed.enabled)
     args.distributed_rank = int(distributed.rank)
@@ -2601,10 +3754,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "",
             )
         )
-        if saved_dynamics_mode != DYNAMICS_PREDICTION_MODE:
+        expected_dynamics_mode = (
+            WCM_DYNAMICS_PREDICTION_MODE
+            if args.critic_architecture == WCM_CRITIC_ARCHITECTURE
+            else DYNAMICS_PREDICTION_MODE
+        )
+        if saved_dynamics_mode != expected_dynamics_mode:
             raise ValueError(
                 f"resume dynamics_prediction_mode={saved_dynamics_mode!r} "
-                f"does not match {DYNAMICS_PREDICTION_MODE!r}; start a "
+                f"does not match {expected_dynamics_mode!r}; start a "
                 "fresh output directory"
             )
         saved_sync_interval = int(
@@ -2949,6 +4107,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             f"observation horizon: {args.critic_observation_horizon} > "
             f"{args.observation_horizon}"
         )
+    if (
+        args.critic_architecture == WCM_CRITIC_ARCHITECTURE
+        and int(args.critic_observation_horizon) < 2
+    ):
+        raise ValueError(
+            "WCM causal temporal training requires critic_observation_horizon "
+            "of at least 2"
+        )
     args.actor_prediction_horizon = int(
         actor_algo.algo_config.horizon.prediction_horizon
     )
@@ -3100,138 +4266,216 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     obs_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
     del dp_checkpoint
 
-    critics, targets, vf = make_rise_chunk_value_networks(
-        actor_algo,
-        chunk_horizon=args.chunk_horizon,
-        hidden_dims=tuple(int(x) for x in args.critic_hidden_dims),
-        latent_dim=args.latent_dim,
-        action_hidden_dim=args.action_hidden_dim,
-        num_attention_heads=args.num_attention_heads,
-        num_action_conv_layers=args.num_action_conv_layers,
-        dropout=args.dropout,
-        num_critics=args.num_critics,
-        critic_group_norm=args.critic_group_norm,
-        late_fusion_key=args.critic_late_fusion_key,
-        observation_horizon=args.critic_observation_horizon,
-        q_use_predicted_next_latent=(
-            args.critic_q_use_predicted_next_latent
-        ),
-    )
+    is_wcm = args.critic_architecture == WCM_CRITIC_ARCHITECTURE
+    wcm_system: WCMChunkValueSystem | None = None
+    wcm_target_system: WCMChunkValueSystem | None = None
+    wcm_optimizer: torch.optim.Optimizer | None = None
+    wcm_lr_scheduler = None
+    critics = nn.ModuleList()
+    targets = nn.ModuleList()
+    vf: RiseValueNetwork | None = None
+    dynamics_target_encoder: nn.Module | None = None
+    critic_optimizers: list[torch.optim.Optimizer] = []
+    vf_optimizer: torch.optim.Optimizer | None = None
+    critic_lr_schedulers: list[Any] = []
+    vf_lr_scheduler = None
     warm_start_audit: dict[str, Any] = {"mode": "resume_checkpoint"}
-    if resume_state is not None:
-        warm_start_audit = {
-            "mode": "resume_checkpoint",
-            "critics": [
-                match_encoder_normalization_to_checkpoint(critic, state)
-                for critic, state in zip(
-                    critics,
-                    resume_state["critics"],
-                )
-            ],
-            "vf": match_encoder_normalization_to_checkpoint(
-                vf,
-                resume_state["vf"],
-            ),
-        }
-        targets = copy.deepcopy(critics)
-    elif (
-        source_for_warm_start is not None
-        and args.initialization == "source_chunk_idql_joint"
-    ):
-        warm_start_audit = {
-            "mode": "source_chunk_idql_complete_model",
-            "checkpoint": str(args.source_chunk_idql_checkpoint),
-            "fresh_optimizers_and_schedulers": True,
-            "fresh_epoch_and_global_step": True,
-            "critics": [
-                match_encoder_normalization_to_checkpoint(critic, state)
-                for critic, state in zip(
-                    critics,
-                    source_for_warm_start["critics"],
-                )
-            ],
-            "vf": match_encoder_normalization_to_checkpoint(
-                vf,
-                source_for_warm_start["vf"],
-            ),
-        }
-        targets = copy.deepcopy(critics)
-    elif source_for_warm_start is not None:
-        if int(args.critic_observation_horizon) == 1:
-            vf.load_state_dict(source_for_warm_start["vf"], strict=True)
-            vf_warm_start_audit = {
-                "mode": "complete_one_frame_value_network",
-                "tensor_count": int(len(source_for_warm_start["vf"])),
+
+    if is_wcm:
+        wcm_system, wcm_target_system = make_wcm_chunk_value_system(
+            actor_algo,
+            chunk_horizon=args.chunk_horizon,
+            hidden_dims=tuple(int(x) for x in args.critic_hidden_dims),
+            latent_dim=args.latent_dim,
+            action_hidden_dim=args.action_hidden_dim,
+            num_attention_heads=args.num_attention_heads,
+            num_action_conv_layers=args.num_action_conv_layers,
+            dropout=args.dropout,
+            num_critics=args.num_critics,
+            critic_group_norm=args.critic_group_norm,
+            late_fusion_key=args.critic_late_fusion_key,
+            observation_horizon=args.critic_observation_horizon,
+            temporal_num_layers=args.temporal_num_layers,
+            temporal_num_heads=args.temporal_num_heads,
+            temporal_feedforward_dim=args.temporal_feedforward_dim,
+            temporal_dropout=args.temporal_dropout,
+            dynamics_prediction_offsets=args.dynamics_prediction_offsets,
+        )
+        reference_state = None
+        if resume_state is not None:
+            reference_state = resume_state["chunk_value_system"]
+            warm_start_audit = {
+                "mode": "resume_checkpoint",
+                "system": match_encoder_normalization_to_checkpoint(
+                    wcm_system, reference_state
+                ),
+            }
+        elif (
+            source_for_warm_start is not None
+            and args.initialization == "source_chunk_idql_joint"
+        ):
+            reference_state = source_for_warm_start["chunk_value_system"]
+            warm_start_audit = {
+                "mode": "source_chunk_idql_complete_wcm_system",
+                "checkpoint": str(args.source_chunk_idql_checkpoint),
+                "fresh_optimizers_and_schedulers": True,
+                "fresh_epoch_and_global_step": True,
+                "system": match_encoder_normalization_to_checkpoint(
+                    wcm_system, reference_state
+                ),
             }
         else:
-            vf_warm_start_audit = copy_matching_vf_encoder_state(
-                vf,
-                source_for_warm_start["vf"],
+            encoder_audit = copy_deployed_dp_encoder_state(
+                wcm_system, actor_algo
             )
-        warm_start_audit = {
-            "mode": "source_one_step_idql_representations",
-            "critics": [
-                copy_matching_encoder_state(critic, state)
-                for critic, state in zip(
-                    critics,
-                    source_for_warm_start["critics"],
-                )
-            ],
-            "vf": vf_warm_start_audit,
-        }
-        targets = copy.deepcopy(critics)
-    elif resume_state is None:
-        warm_start_audit = {
-            "mode": "deployed_pretrained_dp_raw_obs_encoder_copy",
-            "critics": [
-                copy_deployed_dp_encoder_state(critic, actor_algo)
-                for critic in critics
-            ],
-            "vf": copy_deployed_dp_encoder_state(vf, actor_algo),
-        }
-        targets = copy.deepcopy(critics)
-
-    dynamics_target_encoder = copy.deepcopy(
-        deployed_actor_obs_encoder(actor_algo)
-    )
-    critics = critics.float().to(device)
-    targets = targets.float().to(device)
-    dynamics_target_encoder = dynamics_target_encoder.float().to(device)
-    vf = vf.float().to(device)
-    target_encoder_output_dim = int(
-        dynamics_target_encoder.output_shape()[0]
-    )
-    critic_encoder_output_dims = {
-        int(critic.encoder_output_dim) for critic in critics
-    }
-    if critic_encoder_output_dims != {target_encoder_output_dim}:
-        raise RuntimeError(
-            "actor dynamics target and critic raw encoder output dimensions "
-            f"differ: target={target_encoder_output_dim}, "
-            f"critics={sorted(critic_encoder_output_dims)}"
+            warm_start_audit = {
+                "mode": "deployed_actor_raw_encoder_fresh_wcm_heads",
+                "encoder": encoder_audit,
+                "one_step_source_used_for_actor_only": bool(
+                    source_for_warm_start is not None
+                ),
+            }
+        wcm_target_system = copy.deepcopy(wcm_system)
+        wcm_system = wcm_system.float().to(device)
+        wcm_target_system = wcm_target_system.float().to(device)
+        target_encoder_output_dim = int(wcm_system.latent_dim)
+        wcm_optimizer = make_wcm_optimizer(
+            wcm_system,
+            critic_lr=args.critic_lr,
+            encoder_lr=args.encoder_lr,
+            vf_lr=args.vf_lr,
         )
-    critic_optimizers = [
-        make_critic_optimizer(critic, args.critic_lr, args.encoder_lr)
-        for critic in critics
-    ]
-    vf_optimizer = make_critic_optimizer(vf, args.vf_lr, args.encoder_lr)
-    critic_lr_schedulers = [
-        make_step_lr_scheduler(
-            optimizer,
+        wcm_lr_scheduler = make_step_lr_scheduler(
+            wcm_optimizer,
             scheduler_type=args.critic_vf_lr_scheduler,
             warmup_steps=args.resolved_critic_vf_lr_warmup_steps,
             total_steps=args.critic_vf_lr_total_steps,
             num_cycles=args.critic_vf_lr_num_cycles,
         )
-        for optimizer in critic_optimizers
-    ]
-    vf_lr_scheduler = make_step_lr_scheduler(
-        vf_optimizer,
-        scheduler_type=args.critic_vf_lr_scheduler,
-        warmup_steps=args.resolved_critic_vf_lr_warmup_steps,
-        total_steps=args.critic_vf_lr_total_steps,
-        num_cycles=args.critic_vf_lr_num_cycles,
-    )
+    else:
+        critics, targets, vf = make_rise_chunk_value_networks(
+            actor_algo,
+            chunk_horizon=args.chunk_horizon,
+            hidden_dims=tuple(int(x) for x in args.critic_hidden_dims),
+            latent_dim=args.latent_dim,
+            action_hidden_dim=args.action_hidden_dim,
+            num_attention_heads=args.num_attention_heads,
+            num_action_conv_layers=args.num_action_conv_layers,
+            dropout=args.dropout,
+            num_critics=args.num_critics,
+            critic_group_norm=args.critic_group_norm,
+            late_fusion_key=args.critic_late_fusion_key,
+            observation_horizon=args.critic_observation_horizon,
+            q_use_predicted_next_latent=(
+                args.critic_q_use_predicted_next_latent
+            ),
+        )
+        if resume_state is not None:
+            warm_start_audit = {
+                "mode": "resume_checkpoint",
+                "critics": [
+                    match_encoder_normalization_to_checkpoint(critic, state)
+                    for critic, state in zip(critics, resume_state["critics"])
+                ],
+                "vf": match_encoder_normalization_to_checkpoint(
+                    vf, resume_state["vf"]
+                ),
+            }
+            targets = copy.deepcopy(critics)
+        elif (
+            source_for_warm_start is not None
+            and args.initialization == "source_chunk_idql_joint"
+        ):
+            warm_start_audit = {
+                "mode": "source_chunk_idql_complete_model",
+                "checkpoint": str(args.source_chunk_idql_checkpoint),
+                "fresh_optimizers_and_schedulers": True,
+                "fresh_epoch_and_global_step": True,
+                "critics": [
+                    match_encoder_normalization_to_checkpoint(critic, state)
+                    for critic, state in zip(
+                        critics, source_for_warm_start["critics"]
+                    )
+                ],
+                "vf": match_encoder_normalization_to_checkpoint(
+                    vf, source_for_warm_start["vf"]
+                ),
+            }
+            targets = copy.deepcopy(critics)
+        elif source_for_warm_start is not None:
+            if int(args.critic_observation_horizon) == 1:
+                vf.load_state_dict(source_for_warm_start["vf"], strict=True)
+                vf_warm_start_audit = {
+                    "mode": "complete_one_frame_value_network",
+                    "tensor_count": int(len(source_for_warm_start["vf"])),
+                }
+            else:
+                vf_warm_start_audit = copy_matching_vf_encoder_state(
+                    vf, source_for_warm_start["vf"]
+                )
+            warm_start_audit = {
+                "mode": "source_one_step_idql_representations",
+                "critics": [
+                    copy_matching_encoder_state(critic, state)
+                    for critic, state in zip(
+                        critics, source_for_warm_start["critics"]
+                    )
+                ],
+                "vf": vf_warm_start_audit,
+            }
+            targets = copy.deepcopy(critics)
+        else:
+            warm_start_audit = {
+                "mode": "deployed_pretrained_dp_raw_obs_encoder_copy",
+                "critics": [
+                    copy_deployed_dp_encoder_state(critic, actor_algo)
+                    for critic in critics
+                ],
+                "vf": copy_deployed_dp_encoder_state(vf, actor_algo),
+            }
+            targets = copy.deepcopy(critics)
+
+        dynamics_target_encoder = copy.deepcopy(
+            deployed_actor_obs_encoder(actor_algo)
+        )
+        critics = critics.float().to(device)
+        targets = targets.float().to(device)
+        dynamics_target_encoder = dynamics_target_encoder.float().to(device)
+        vf = vf.float().to(device)
+        target_encoder_output_dim = int(
+            dynamics_target_encoder.output_shape()[0]
+        )
+        critic_encoder_output_dims = {
+            int(critic.encoder_output_dim) for critic in critics
+        }
+        if critic_encoder_output_dims != {target_encoder_output_dim}:
+            raise RuntimeError(
+                "actor dynamics target and critic raw encoder output dimensions "
+                f"differ: target={target_encoder_output_dim}, "
+                f"critics={sorted(critic_encoder_output_dims)}"
+            )
+        critic_optimizers = [
+            make_critic_optimizer(critic, args.critic_lr, args.encoder_lr)
+            for critic in critics
+        ]
+        vf_optimizer = make_critic_optimizer(vf, args.vf_lr, args.encoder_lr)
+        critic_lr_schedulers = [
+            make_step_lr_scheduler(
+                optimizer,
+                scheduler_type=args.critic_vf_lr_scheduler,
+                warmup_steps=args.resolved_critic_vf_lr_warmup_steps,
+                total_steps=args.critic_vf_lr_total_steps,
+                num_cycles=args.critic_vf_lr_num_cycles,
+            )
+            for optimizer in critic_optimizers
+        ]
+        vf_lr_scheduler = make_step_lr_scheduler(
+            vf_optimizer,
+            scheduler_type=args.critic_vf_lr_scheduler,
+            warmup_steps=args.resolved_critic_vf_lr_warmup_steps,
+            total_steps=args.critic_vf_lr_total_steps,
+            num_cycles=args.critic_vf_lr_num_cycles,
+        )
 
     start_epoch = 0
     global_step = 0
@@ -3239,46 +4483,65 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     dynamics_target_last_sync_step = 0
     history: list[dict] = []
     if resume_state is not None:
-        for critic, state in zip(critics, resume_state["critics"]):
-            critic.load_state_dict(state)
-        for target, state in zip(targets, resume_state["critic_targets"]):
-            target.load_state_dict(state)
-        dynamics_target_encoder.load_state_dict(
-            resume_state["dynamics_target_encoder"],
-            strict=True,
-        )
-        vf.load_state_dict(resume_state["vf"])
-        for optimizer, state in zip(
-            critic_optimizers, resume_state["critic_optimizers"]
-        ):
-            optimizer.load_state_dict(state)
-        vf_optimizer.load_state_dict(resume_state["vf_optimizer"])
         scheduler_enabled = args.critic_vf_lr_scheduler != "constant"
-        critic_scheduler_states = resume_state["critic_lr_schedulers"]
-        if len(critic_scheduler_states) != len(critic_lr_schedulers):
-            raise ValueError(
-                "resume checkpoint critic LR scheduler count does not match "
-                f"num_critics={len(critic_lr_schedulers)}"
+        if is_wcm:
+            wcm_system.load_state_dict(
+                resume_state["chunk_value_system"], strict=True
             )
-        for scheduler, state in zip(
-            critic_lr_schedulers,
-            critic_scheduler_states,
-        ):
-            if (state is not None) != scheduler_enabled:
+            wcm_target_system.load_state_dict(
+                resume_state["chunk_value_target"], strict=True
+            )
+            wcm_optimizer.load_state_dict(
+                resume_state["chunk_value_optimizer"]
+            )
+            scheduler_state = resume_state["chunk_value_lr_scheduler"]
+            if (scheduler_state is not None) != scheduler_enabled:
                 raise ValueError(
-                    "resume critic LR scheduler state does not match "
+                    "resume WCM LR scheduler state does not match "
                     f"critic_vf_lr_scheduler={args.critic_vf_lr_scheduler}"
                 )
-            if scheduler is not None:
-                scheduler.load_state_dict(state)
-        vf_scheduler_state = resume_state["vf_lr_scheduler"]
-        if (vf_scheduler_state is not None) != scheduler_enabled:
-            raise ValueError(
-                "resume VF LR scheduler state does not match "
-                f"critic_vf_lr_scheduler={args.critic_vf_lr_scheduler}"
+            if wcm_lr_scheduler is not None:
+                wcm_lr_scheduler.load_state_dict(scheduler_state)
+        else:
+            for critic, state in zip(critics, resume_state["critics"]):
+                critic.load_state_dict(state)
+            for target, state in zip(targets, resume_state["critic_targets"]):
+                target.load_state_dict(state)
+            dynamics_target_encoder.load_state_dict(
+                resume_state["dynamics_target_encoder"],
+                strict=True,
             )
-        if vf_lr_scheduler is not None:
-            vf_lr_scheduler.load_state_dict(vf_scheduler_state)
+            vf.load_state_dict(resume_state["vf"])
+            for optimizer, state in zip(
+                critic_optimizers, resume_state["critic_optimizers"]
+            ):
+                optimizer.load_state_dict(state)
+            vf_optimizer.load_state_dict(resume_state["vf_optimizer"])
+            critic_scheduler_states = resume_state["critic_lr_schedulers"]
+            if len(critic_scheduler_states) != len(critic_lr_schedulers):
+                raise ValueError(
+                    "resume checkpoint critic LR scheduler count does not match "
+                    f"num_critics={len(critic_lr_schedulers)}"
+                )
+            for scheduler, state in zip(
+                critic_lr_schedulers,
+                critic_scheduler_states,
+            ):
+                if (state is not None) != scheduler_enabled:
+                    raise ValueError(
+                        "resume critic LR scheduler state does not match "
+                        f"critic_vf_lr_scheduler={args.critic_vf_lr_scheduler}"
+                    )
+                if scheduler is not None:
+                    scheduler.load_state_dict(state)
+            vf_scheduler_state = resume_state["vf_lr_scheduler"]
+            if (vf_scheduler_state is not None) != scheduler_enabled:
+                raise ValueError(
+                    "resume VF LR scheduler state does not match "
+                    f"critic_vf_lr_scheduler={args.critic_vf_lr_scheduler}"
+                )
+            if vf_lr_scheduler is not None:
+                vf_lr_scheduler.load_state_dict(vf_scheduler_state)
         start_epoch = int(resume_state["epoch"])
         global_step = int(resume_state["step"])
         global_samples_seen = int(
@@ -3288,17 +4551,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
         dynamics_target_last_sync_step = int(
-            resume_state["dynamics_target_last_sync_step"]
+            resume_state.get("dynamics_target_last_sync_step", 0)
         )
         if scheduler_enabled:
-            scheduler_steps = [
-                *[
-                    int(scheduler.last_epoch)
-                    for scheduler in critic_lr_schedulers
-                    if scheduler is not None
-                ],
-                int(vf_lr_scheduler.last_epoch),
-            ]
+            scheduler_steps = (
+                [int(wcm_lr_scheduler.last_epoch)]
+                if is_wcm
+                else [
+                    *[
+                        int(scheduler.last_epoch)
+                        for scheduler in critic_lr_schedulers
+                        if scheduler is not None
+                    ],
+                    int(vf_lr_scheduler.last_epoch),
+                ]
+            )
             if any(step != global_step for step in scheduler_steps):
                 raise ValueError(
                     f"critic/VF LR scheduler steps {scheduler_steps} do not "
@@ -3355,36 +4622,43 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         source_for_warm_start is not None
         and args.initialization == "source_chunk_idql_joint"
     ):
-        for critic, state in zip(
-            critics,
-            source_for_warm_start["critics"],
-        ):
-            critic.load_state_dict(state, strict=True)
-        for target, state in zip(
-            targets,
-            source_for_warm_start["critic_targets"],
-        ):
-            target.load_state_dict(state, strict=True)
-        dynamics_target_encoder.load_state_dict(
-            source_for_warm_start["dynamics_target_encoder"],
-            strict=True,
-        )
-        dynamics_sync_audit = sync_actor_dynamics_target_encoder(
-            dynamics_target_encoder,
-            actor_algo,
-        )
-        warm_start_audit["dynamics_target_resync"] = {
-            **dynamics_sync_audit,
-            "source_last_sync_step": int(
-                source_for_warm_start["dynamics_target_last_sync_step"]
-            ),
-            "fresh_round_sync_step": 0,
-        }
-        vf.load_state_dict(source_for_warm_start["vf"], strict=True)
+        if is_wcm:
+            wcm_system.load_state_dict(
+                source_for_warm_start["chunk_value_system"], strict=True
+            )
+            wcm_target_system.load_state_dict(
+                source_for_warm_start["chunk_value_target"], strict=True
+            )
+        else:
+            for critic, state in zip(
+                critics,
+                source_for_warm_start["critics"],
+            ):
+                critic.load_state_dict(state, strict=True)
+            for target, state in zip(
+                targets,
+                source_for_warm_start["critic_targets"],
+            ):
+                target.load_state_dict(state, strict=True)
+            dynamics_target_encoder.load_state_dict(
+                source_for_warm_start["dynamics_target_encoder"],
+                strict=True,
+            )
+            dynamics_sync_audit = sync_actor_dynamics_target_encoder(
+                dynamics_target_encoder,
+                actor_algo,
+            )
+            warm_start_audit["dynamics_target_resync"] = {
+                **dynamics_sync_audit,
+                "source_last_sync_step": int(
+                    source_for_warm_start["dynamics_target_last_sync_step"]
+                ),
+                "fresh_round_sync_step": 0,
+            }
+            vf.load_state_dict(source_for_warm_start["vf"], strict=True)
         if distributed.is_main_process:
             print(
-                "Warm-started actor, actor EMA, twin critics, target critics, "
-                "VF, and a dynamics target resynced from the loaded actor EMA at "
+                "Warm-started actor, actor EMA, complete critic/value system at "
                 f"{args.source_chunk_idql_checkpoint}; starting fresh "
                 "optimizers, LR schedules, epoch=0, and global_step=0",
                 flush=True,
@@ -3395,25 +4669,37 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             f"epochs={args.epochs}. Use that checkpoint for evaluation or "
             "increase epochs with a fresh source warm start and schedule."
         )
-    configure_target_random_crops(targets)
-    configure_encoder_target_random_crops(dynamics_target_encoder)
-
-    synchronized_modules: list[nn.Module] = [
-        actor_algo.nets,
-        critics,
-        targets,
-        dynamics_target_encoder,
-        vf,
-    ]
+    if is_wcm:
+        configure_wcm_target_random_crops(wcm_target_system)
+        synchronized_modules: list[nn.Module] = [
+            actor_algo.nets,
+            wcm_system,
+            wcm_target_system,
+        ]
+        training_buffer_modules = (
+            [actor_algo.nets, wcm_system]
+            if trains_joint_actor(args)
+            else [wcm_system]
+        )
+    else:
+        configure_target_random_crops(targets)
+        configure_encoder_target_random_crops(dynamics_target_encoder)
+        synchronized_modules = [
+            actor_algo.nets,
+            critics,
+            targets,
+            dynamics_target_encoder,
+            vf,
+        ]
+        training_buffer_modules = (
+            [actor_algo.nets, critics, vf]
+            if trains_joint_actor(args)
+            else [critics, vf]
+        )
     if actor_algo.ema is not None:
         synchronized_modules.append(actor_algo.ema.averaged_model)
     if getattr(actor_algo, "reference_nets", None) is not None:
         synchronized_modules.append(actor_algo.reference_nets)
-    training_buffer_modules = (
-        [actor_algo.nets, critics, vf]
-        if trains_joint_actor(args)
-        else [critics, vf]
-    )
     synchronize_training_buffers = modules_have_mutable_batch_norm(
         training_buffer_modules
     )
@@ -3471,6 +4757,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             vf_optimizer=vf_optimizer,
             critic_lr_schedulers=critic_lr_schedulers,
             vf_lr_scheduler=vf_lr_scheduler,
+            wcm_system=wcm_system,
+            wcm_target_system=wcm_target_system,
+            wcm_optimizer=wcm_optimizer,
+            wcm_lr_scheduler=wcm_lr_scheduler,
             action_stats=action_stats,
             epoch=checkpoint_epoch,
             global_step=global_step,
@@ -3504,21 +4794,36 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "actor": actor_audit,
         "conditional_diffusion_actor": bool(args.conditioned_actor),
         "actor_condition_adapter": args.actor_condition_adapter_type,
-        "critic_parameter_counts": [parameter_count(x) for x in critics],
-        "target_critic_parameter_counts": [parameter_count(x) for x in targets],
-        "dynamics_target_encoder_parameter_count": parameter_count(
-            dynamics_target_encoder
+        "critic_architecture": str(args.critic_architecture),
+        "critic_parameter_counts": (
+            [parameter_count(wcm_system)]
+            if is_wcm
+            else [parameter_count(x) for x in critics]
+        ),
+        "target_critic_parameter_counts": (
+            [parameter_count(wcm_target_system)]
+            if is_wcm
+            else [parameter_count(x) for x in targets]
+        ),
+        "dynamics_target_encoder_parameter_count": (
+            None if is_wcm else parameter_count(dynamics_target_encoder)
         ),
         "dynamics_target_encoder_output_dim": target_encoder_output_dim,
-        "vf_parameter_count": parameter_count(vf),
-        "independent_raw_obs_encoders": True,
+        "vf_parameter_count": (
+            parameter_count(wcm_system.nets["value_head"])
+            if is_wcm
+            else parameter_count(vf)
+        ),
+        "independent_raw_obs_encoders": not is_wcm,
+        "shared_state_representation": bool(is_wcm),
         "critic_chunk_horizon": int(args.chunk_horizon),
         "critic_observation_horizon": int(
             args.critic_observation_horizon
         ),
         "critic_q_head_inputs": list(
-            critic_q_head_inputs(
-                args.critic_q_use_predicted_next_latent
+            architecture_q_head_inputs(
+                args.critic_architecture,
+                args.critic_q_use_predicted_next_latent,
             )
         ),
         "critic_q_use_predicted_next_latent": bool(
@@ -3529,28 +4834,41 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             if args.critic_q_use_predicted_next_latent
             else None
         ),
-        "critic_representation_modules": [
-            "encoder",
-            "context",
-            "context_norm",
-        ],
+        "critic_representation_modules": (
+            ["encoder", "frame_projection", "temporal_trunk"]
+            if is_wcm
+            else ["encoder", "context", "context_norm"]
+        ),
         "latent_dynamics": True,
-        "actor_encoder_feature_dynamics": True,
-        "dynamics_prediction_mode": DYNAMICS_PREDICTION_MODE,
-        "dynamics_prediction_output": "raw_actor_encoder_features",
+        "actor_encoder_feature_dynamics": not is_wcm,
+        "dynamics_prediction_mode": (
+            WCM_DYNAMICS_PREDICTION_MODE
+            if is_wcm
+            else DYNAMICS_PREDICTION_MODE
+        ),
+        "dynamics_prediction_output": (
+            "shared_critic_frame_latents"
+            if is_wcm
+            else "raw_actor_encoder_features"
+        ),
         "dynamics_prediction_output_dim": target_encoder_output_dim,
-        "dynamics_prediction_residual": False,
-        "dynamics_prediction_consumed_by_q": bool(
-            args.critic_q_use_predicted_next_latent
+        "dynamics_prediction_residual": bool(is_wcm),
+        "dynamics_prediction_offsets": list(args.dynamics_prediction_offsets),
+        "dynamics_prediction_consumed_by_q": (
+            False if is_wcm else bool(args.critic_q_use_predicted_next_latent)
         ),
         "dynamics_target_encoder": (
-            "frozen_copy_periodically_hard_synced_from_deployed_actor_ema_"
+            "stop_gradient_online_shared_frame_encoder"
+            if is_wcm
+            else "frozen_copy_periodically_hard_synced_from_deployed_actor_ema_"
             "obs_encoder"
             if trains_joint_actor(args)
             else "frozen_copy_of_deployed_actor_ema_obs_encoder"
         ),
         "dynamics_target_update": (
-            "periodic_hard_sync"
+            "stop_gradient_no_teacher_update"
+            if is_wcm
+            else "periodic_hard_sync"
             if trains_joint_actor(args)
             else "fixed_after_initialization"
         ),
@@ -3563,8 +4881,22 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "eval_except_crop_randomizers_in_training_mode"
         ),
         "vf_training": (
-            "head_from_step_zero_raw_observation_encoder_delayed"
+            "shared_temporal_state_expectile_head"
+            if is_wcm
+            else "head_from_step_zero_raw_observation_encoder_delayed"
         ),
+        "temporal_num_layers": int(args.temporal_num_layers),
+        "temporal_num_heads": int(args.temporal_num_heads),
+        "temporal_feedforward_dim": int(args.temporal_feedforward_dim),
+        "temporal_dropout": float(args.temporal_dropout),
+        "sigreg": {
+            "weight": float(args.sigreg_weight),
+            "knots": int(args.sigreg_knots),
+            "num_projections": int(args.sigreg_num_projections),
+            "global_batch": bool(args.sigreg_global_batch),
+            "scope": "newest_temporal_context",
+        },
+        "monte_carlo_return_weight": 0.0,
         "actor_reference_distillation": actor_reference_audit,
         "warm_start": warm_start_audit,
     }
@@ -3616,10 +4948,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "steps_per_epoch_source": args.steps_per_epoch_source,
             "sequence_length": int(sequence_length),
             "sparse_chunk_loader": bool(args.sparse_chunk_loader),
-            "observation_frames_per_sample": (
-                int(args.observation_horizon)
-                + int(args.critic_observation_horizon)
-                if args.sparse_chunk_loader
+                "observation_frames_per_sample": (
+                    int(args.observation_horizon)
+                    + int(args.critic_observation_horizon)
+                    + len(args.dynamics_prediction_offsets)
+                    if args.sparse_chunk_loader
                 else 2 * (
                     int(args.observation_horizon) - 1 + int(sequence_length)
                 )
@@ -3847,6 +5180,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 critic_observation_horizon=(
                     args.critic_observation_horizon
                 ),
+                dynamics_prediction_offsets=(
+                    args.dynamics_prediction_offsets
+                ),
             )
             encoder_trainable = global_step >= int(
                 args.resolved_encoder_freeze_steps
@@ -3854,10 +5190,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             vf_encoder_trainable = (
                 global_step >= int(args.resolved_vf_encoder_freeze_steps)
             )
-            critics.train()
-            set_representation_trainable(critics, encoder_trainable)
-            vf.train()
-            set_vf_encoder_trainable(vf, vf_encoder_trainable)
+            if is_wcm:
+                wcm_system.train()
+                set_wcm_encoder_trainable(wcm_system, encoder_trainable)
+            else:
+                critics.train()
+                set_representation_trainable(critics, encoder_trainable)
+                vf.train()
+                set_vf_encoder_trainable(vf, vf_encoder_trainable)
             if synchronize_training_buffers:
                 broadcast_module_buffers(
                     training_buffer_modules,
@@ -3869,34 +5209,60 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 / max(float(args.resolved_dynamics_warmup_steps), 1.0),
             )
             effective_dynamics = float(args.dynamics_weight) * ramp
-            effective_dynamics_cosine = (
-                float(args.dynamics_cosine_weight) * ramp
-            )
-            critic_losses, vf_loss, info = compute_chunk_losses(
-                critics,
-                targets,
-                dynamics_target_encoder,
-                vf,
-                batch,
-                discount=args.discount,
-                expectile=args.expectile,
-                use_huber=args.use_huber,
-                dynamics_weight=effective_dynamics,
-                dynamics_cosine_weight=effective_dynamics_cosine,
-                distributed_context=distributed,
-            )
-            update_networks(
-                critics,
-                targets,
-                vf,
-                critic_optimizers,
-                vf_optimizer,
-                critic_losses,
-                vf_loss,
-                target_tau=args.resolved_target_tau,
-                max_gradient_norm=max_grad,
-                gradient_sync_fn=gradient_sync_fn,
-            )
+            if is_wcm:
+                total_critic_loss, info = compute_wcm_chunk_losses(
+                    wcm_system,
+                    wcm_target_system,
+                    batch,
+                    discount=args.discount,
+                    expectile=args.expectile,
+                    use_huber=args.use_huber,
+                    dynamics_weight=effective_dynamics,
+                    sigreg_weight=args.sigreg_weight,
+                    sigreg_knots=args.sigreg_knots,
+                    sigreg_num_projections=args.sigreg_num_projections,
+                    sigreg_global_batch=args.sigreg_global_batch,
+                    global_step=global_step,
+                    distributed_context=distributed,
+                )
+                update_wcm_system(
+                    wcm_system,
+                    wcm_target_system,
+                    wcm_optimizer,
+                    total_critic_loss,
+                    target_tau=args.resolved_target_tau,
+                    max_gradient_norm=max_grad,
+                    gradient_sync_fn=gradient_sync_fn,
+                )
+            else:
+                effective_dynamics_cosine = (
+                    float(args.dynamics_cosine_weight) * ramp
+                )
+                critic_losses, vf_loss, info = compute_chunk_losses(
+                    critics,
+                    targets,
+                    dynamics_target_encoder,
+                    vf,
+                    batch,
+                    discount=args.discount,
+                    expectile=args.expectile,
+                    use_huber=args.use_huber,
+                    dynamics_weight=effective_dynamics,
+                    dynamics_cosine_weight=effective_dynamics_cosine,
+                    distributed_context=distributed,
+                )
+                update_networks(
+                    critics,
+                    targets,
+                    vf,
+                    critic_optimizers,
+                    vf_optimizer,
+                    critic_losses,
+                    vf_loss,
+                    target_tau=args.resolved_target_tau,
+                    max_gradient_norm=max_grad,
+                    gradient_sync_fn=gradient_sync_fn,
+                )
 
             # update condition diffusion actor
             actor_info: dict[str, Any] = {}
@@ -3938,11 +5304,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 del actor_batch
                 if args.conditioned_actor:
                     del condition_labels
-            for scheduler in critic_lr_schedulers:
-                if scheduler is not None:
-                    scheduler.step()
-            if vf_lr_scheduler is not None:
-                vf_lr_scheduler.step()
+            if is_wcm:
+                if wcm_lr_scheduler is not None:
+                    wcm_lr_scheduler.step()
+            else:
+                for scheduler in critic_lr_schedulers:
+                    if scheduler is not None:
+                        scheduler.step()
+                if vf_lr_scheduler is not None:
+                    vf_lr_scheduler.step()
             global_samples_seen += int(
                 raw_batch["actions"].shape[0] * distributed.world_size
             )
@@ -3950,7 +5320,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             global_step += 1
             dynamics_target_synced = False
             if (
-                trains_joint_actor(args)
+                not is_wcm
+                and trains_joint_actor(args)
                 and global_step
                 % int(args.resolved_dynamics_target_sync_interval)
                 == 0
@@ -3969,31 +5340,39 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             metrics["dynamics/target_last_sync_step"] = float(
                 dynamics_target_last_sync_step
             )
-            metrics["dynamics/target_sync_age"] = float(
-                global_step - dynamics_target_last_sync_step
+            metrics["dynamics/target_sync_age"] = (
+                0.0
+                if is_wcm
+                else float(global_step - dynamics_target_last_sync_step)
             )
             metrics["encoder/trainable"] = float(encoder_trainable)
-            metrics["representation/trainable"] = float(encoder_trainable)
+            metrics["representation/trainable"] = 1.0 if is_wcm else float(
+                encoder_trainable
+            )
             metrics["vf/trainable"] = 1.0
             metrics["vf/head_trainable"] = 1.0
-            metrics["vf/encoder_trainable"] = float(
+            metrics["vf/encoder_trainable"] = float(encoder_trainable) if is_wcm else float(
                 vf_encoder_trainable
             )
             if trains_joint_actor(args):
                 for group in actor_algo.optimizers["policy"].param_groups:
                     group_name = str(group.get("group_name", "unknown"))
                     metrics[f"lr/actor_{group_name}"] = float(group["lr"])
-            metrics["lr/critic"] = float(
-                critic_optimizers[0].param_groups[0]["lr"]
-            )
-            metrics["lr/encoder"] = float(
-                critic_optimizers[0].param_groups[1]["lr"]
-            )
-            metrics["lr/vf"] = float(vf_optimizer.param_groups[0]["lr"])
-            if len(vf_optimizer.param_groups) > 1:
-                metrics["lr/vf_encoder"] = float(
-                    vf_optimizer.param_groups[1]["lr"]
+            if is_wcm:
+                for group in wcm_optimizer.param_groups:
+                    metrics[f"lr/{group['group_name']}"] = float(group["lr"])
+            else:
+                metrics["lr/critic"] = float(
+                    critic_optimizers[0].param_groups[0]["lr"]
                 )
+                metrics["lr/encoder"] = float(
+                    critic_optimizers[0].param_groups[1]["lr"]
+                )
+                metrics["lr/vf"] = float(vf_optimizer.param_groups[0]["lr"])
+                if len(vf_optimizer.param_groups) > 1:
+                    metrics["lr/vf_encoder"] = float(
+                        vf_optimizer.param_groups[1]["lr"]
+                    )
             metrics["distributed/world_size"] = float(distributed.world_size)
             metrics["data/effective_global_batch_rows"] = float(
                 raw_batch["actions"].shape[0] * distributed.world_size
@@ -4026,7 +5405,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     flush=True,
                 )
-            del batch, critic_losses, vf_loss
+            if is_wcm:
+                del batch, total_critic_loss
+            else:
+                del batch, critic_losses, vf_loss
 
         epoch_summary = {
             "global_samples_seen": int(global_samples_seen),
@@ -4191,6 +5573,15 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--chunk-horizon", type=int, default=8)
     parser.add_argument(
+        "--critic-architecture",
+        choices=CRITIC_ARCHITECTURES,
+        default=LEGACY_CRITIC_ARCHITECTURE,
+        help=(
+            "legacy preserves existing checkpoints; wcm_shared_temporal_v1 "
+            "uses one causal state representation for twin Q, V, and dynamics"
+        ),
+    )
+    parser.add_argument(
         "--critic-observation-horizon",
         type=int,
         default=1,
@@ -4267,6 +5658,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-attention-heads", type=int, default=4)
     parser.add_argument("--num-action-conv-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--temporal-num-layers", type=int, default=2)
+    parser.add_argument(
+        "--temporal-num-heads",
+        type=int,
+        default=6,
+        help="Attention heads in the causal state trunk (separate from action heads).",
+    )
+    parser.add_argument("--temporal-feedforward-dim", type=int, default=600)
+    parser.add_argument("--temporal-dropout", type=float, default=0.0)
     parser.add_argument("--num-critics", type=int, default=2)
     parser.add_argument(
         "--critic-group-norm",
@@ -4289,6 +5689,22 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dynamics-weight", type=float, default=0.05)
     parser.add_argument("--dynamics-cosine-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--dynamics-prediction-offsets",
+        type=int,
+        nargs="+",
+        default=(2, 4, 6, 8),
+        help="WCM future-latent offsets measured in executed chunk actions.",
+    )
+    parser.add_argument("--sigreg-weight", type=float, default=0.0)
+    parser.add_argument("--sigreg-knots", type=int, default=17)
+    parser.add_argument("--sigreg-num-projections", type=int, default=1024)
+    parser.add_argument(
+        "--sigreg-global-batch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Differentiably gather temporal contexts across ranks for SIGReg.",
+    )
     parser.add_argument("--dynamics-warmup-steps", type=int, default=1000)
     parser.add_argument("--encoder-freeze-steps", type=int, default=1000)
     parser.add_argument(
@@ -4328,6 +5744,10 @@ def make_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = make_parser()
     args = parser.parse_args()
+    try:
+        configure_critic_architecture_args(args)
+    except ValueError as error:
+        parser.error(str(error))
     for key in (
         "checkpoint",
         "source_idql_checkpoint",

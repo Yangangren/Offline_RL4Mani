@@ -1,4 +1,4 @@
-"""Compact sequential chunk critic for semi-MDP IQL.
+"""Compact sequential chunk critics for semi-MDP IQL.
 
 The critic consumes an encoded observation history and an action *sequence*.
 Actions are kept as temporal tokens, processed by residual temporal convolutions,
@@ -164,6 +164,228 @@ class SequentialActionChunkEncoder(nn.Module):
         attended = attended.squeeze(1)
         pooled = (tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
         return self.output_projection(torch.cat([attended, pooled], dim=-1))
+
+
+class CausalTemporalStateTrunk(nn.Module):
+    """Turn chronological frame latents into causal temporal state tokens.
+
+    The final token can only attend to the supplied history (never a future
+    frame). Keeping this module separate from the image encoder makes the
+    temporal representation an explicit, checkpointed part of the critic.
+    """
+
+    def __init__(
+        self,
+        *,
+        state_dim: int,
+        max_history: int,
+        num_layers: int = 2,
+        num_heads: int = 3,
+        feedforward_dim: int = 600,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        state_dim = int(state_dim)
+        num_heads = int(num_heads)
+        if state_dim <= 0 or int(max_history) <= 0:
+            raise ValueError("state_dim and max_history must be positive")
+        if int(num_layers) <= 0 or int(feedforward_dim) <= 0:
+            raise ValueError("temporal layer and feedforward counts must be positive")
+        if state_dim % num_heads != 0:
+            raise ValueError(
+                f"temporal state_dim={state_dim} must be divisible by "
+                f"num_heads={num_heads}"
+            )
+        self.state_dim = state_dim
+        self.max_history = int(max_history)
+        self.position_embedding = nn.Parameter(
+            torch.empty(self.max_history, self.state_dim)
+        )
+        nn.init.normal_(self.position_embedding, mean=0.0, std=0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=self.state_dim,
+            nhead=num_heads,
+            dim_feedforward=int(feedforward_dim),
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            layer,
+            num_layers=int(num_layers),
+            enable_nested_tensor=False,
+        )
+        self.output_norm = nn.LayerNorm(self.state_dim)
+
+    def forward(self, frame_latents: torch.Tensor) -> torch.Tensor:
+        if frame_latents.ndim != 3:
+            raise ValueError(
+                "frame_latents must be [B,T,D], got "
+                f"{tuple(frame_latents.shape)}"
+            )
+        _, history, state_dim = frame_latents.shape
+        if not 1 <= int(history) <= self.max_history:
+            raise ValueError(
+                f"history must be in [1,{self.max_history}], got {history}"
+            )
+        if int(state_dim) != self.state_dim:
+            raise ValueError(
+                f"frame latent dim={state_dim} does not match {self.state_dim}"
+            )
+        tokens = frame_latents + self.position_embedding[None, :history]
+        causal_mask = torch.triu(
+            torch.ones(
+                (history, history),
+                dtype=torch.bool,
+                device=frame_latents.device,
+            ),
+            diagonal=1,
+        )
+        return self.output_norm(self.transformer(tokens, mask=causal_mask))
+
+
+class ResidualActionLatentRollout(nn.Module):
+    """Recurrently predict future frame latents at fixed action offsets.
+
+    A GRU carries the action-prefix state. The predicted frame latent is
+    updated residually at every action, so predictions at offsets 2, 4, 6,
+    and 8 are genuinely prefix-conditioned rather than four independent
+    regressions over a flattened chunk.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        chunk_horizon: int,
+        state_dim: int,
+        prediction_offsets: Sequence[int],
+        hidden_dims: Sequence[int] = (300, 300),
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.action_dim = int(action_dim)
+        self.chunk_horizon = int(chunk_horizon)
+        self.state_dim = int(state_dim)
+        self.prediction_offsets = tuple(int(value) for value in prediction_offsets)
+        if self.action_dim <= 0 or self.chunk_horizon <= 0 or self.state_dim <= 0:
+            raise ValueError("action, chunk, and state dimensions must be positive")
+        if (
+            not self.prediction_offsets
+            or tuple(sorted(set(self.prediction_offsets))) != self.prediction_offsets
+            or self.prediction_offsets[0] < 1
+            or self.prediction_offsets[-1] > self.chunk_horizon
+        ):
+            raise ValueError(
+                "prediction_offsets must be sorted, unique, positive, and no "
+                f"larger than chunk_horizon={self.chunk_horizon}; got "
+                f"{self.prediction_offsets}"
+            )
+        self.action_projection = nn.Sequential(
+            nn.Linear(self.action_dim, self.state_dim),
+            nn.LayerNorm(self.state_dim),
+            nn.SiLU(),
+        )
+        self.action_position_embedding = nn.Parameter(
+            torch.empty(self.chunk_horizon, self.state_dim)
+        )
+        nn.init.normal_(self.action_position_embedding, mean=0.0, std=0.02)
+        self.prefix_cell = nn.GRUCell(self.state_dim, self.state_dim)
+        self.offset_embedding = nn.Parameter(
+            torch.empty(len(self.prediction_offsets), self.state_dim)
+        )
+        nn.init.normal_(self.offset_embedding, mean=0.0, std=0.02)
+        self.condition_norm = nn.LayerNorm(self.state_dim)
+        self.film = nn.Linear(2 * self.state_dim, 3 * self.state_dim)
+        self.residual_block = make_mlp(
+            self.state_dim,
+            tuple(int(value) for value in hidden_dims),
+            self.state_dim,
+            dropout=float(dropout),
+        )
+        self.delta_output = nn.Linear(self.state_dim, self.state_dim)
+        # WCM-style near-identity initialization: the gated residual begins
+        # mostly closed and the final latent delta begins near zero.
+        with torch.no_grad():
+            self.film.bias[2 * self.state_dim :].fill_(-2.0)
+        nn.init.normal_(self.delta_output.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.delta_output.bias)
+
+    def forward(
+        self,
+        temporal_state: torch.Tensor,
+        current_frame_latent: torch.Tensor,
+        actions: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if temporal_state.ndim != 2 or current_frame_latent.ndim != 2:
+            raise ValueError("temporal and current-frame states must be [B,D]")
+        if temporal_state.shape != current_frame_latent.shape:
+            raise ValueError(
+                "temporal and current-frame states must have identical shapes"
+            )
+        if actions.ndim != 3 or tuple(actions.shape[1:]) != (
+            self.chunk_horizon,
+            self.action_dim,
+        ):
+            raise ValueError(
+                "dynamics actions must be "
+                f"[B,{self.chunk_horizon},{self.action_dim}], got "
+                f"{tuple(actions.shape)}"
+            )
+        if int(temporal_state.shape[-1]) != self.state_dim:
+            raise ValueError(
+                f"state dim={temporal_state.shape[-1]} does not match "
+                f"{self.state_dim}"
+            )
+        if action_mask is None:
+            valid = actions.new_ones(actions.shape[:2])
+        else:
+            if action_mask.shape != actions.shape[:2]:
+                raise ValueError(
+                    f"action_mask must be [B,H], got {tuple(action_mask.shape)}"
+                )
+            valid = action_mask.to(dtype=actions.dtype)
+
+        hidden = temporal_state
+        predictions: list[torch.Tensor] = []
+        offset_to_index = {
+            offset: index
+            for index, offset in enumerate(self.prediction_offsets)
+        }
+        for step in range(self.chunk_horizon):
+            action_token = (
+                self.action_projection(actions[:, step])
+                + self.action_position_embedding[step]
+            )
+            candidate_hidden = self.prefix_cell(action_token, hidden)
+            step_valid = valid[:, step : step + 1]
+            hidden = step_valid * candidate_hidden + (1.0 - step_valid) * hidden
+            offset_index = offset_to_index.get(step + 1)
+            if offset_index is not None:
+                film_input = torch.cat(
+                    (
+                        hidden,
+                        self.offset_embedding[offset_index]
+                        .unsqueeze(0)
+                        .expand(hidden.shape[0], -1),
+                    ),
+                    dim=-1,
+                )
+                shift, scale, gate = self.film(film_input).chunk(3, dim=-1)
+                conditioned = (
+                    self.condition_norm(temporal_state)
+                    * (1.0 + scale)
+                    + shift
+                )
+                world_hidden = temporal_state + torch.sigmoid(gate) * (
+                    self.residual_block(conditioned)
+                )
+                predictions.append(
+                    current_frame_latent + self.delta_output(world_hidden)
+                )
+        return torch.stack(predictions, dim=1)
 
 
 class ChunkIQLDynamicsCritic(nn.Module):

@@ -746,6 +746,7 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
         chunk_horizon,
         observation_horizon,
         next_observation_horizon=1,
+        dynamics_prediction_offsets=(),
     ):
         super().__init__()
         if dataset.__class__.__name__ != "SequenceDataset":
@@ -754,6 +755,9 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
         self.chunk_horizon = int(chunk_horizon)
         self.observation_horizon = int(observation_horizon)
         self.next_observation_horizon = int(next_observation_horizon)
+        self.dynamics_prediction_offsets = tuple(
+            int(value) for value in dynamics_prediction_offsets
+        )
         if (
             self.chunk_horizon < 1
             or self.observation_horizon < 1
@@ -767,6 +771,17 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                 "next_observation_horizon cannot exceed the actor observation "
                 f"horizon: {self.next_observation_horizon} > "
                 f"{self.observation_horizon}"
+            )
+        if self.dynamics_prediction_offsets and (
+            tuple(sorted(set(self.dynamics_prediction_offsets)))
+            != self.dynamics_prediction_offsets
+            or self.dynamics_prediction_offsets[0] < 1
+            or self.dynamics_prediction_offsets[-1] > self.chunk_horizon
+        ):
+            raise ValueError(
+                "dynamics_prediction_offsets must be sorted, unique, positive, "
+                f"and <= chunk_horizon={self.chunk_horizon}; got "
+                f"{self.dynamics_prediction_offsets}"
             )
         if int(dataset.n_frame_stack) != self.observation_horizon:
             raise ValueError(
@@ -878,6 +893,33 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
             valid_length=valid_length,
         )
         meta["chunk_sparse_next_obs"] = np.float32(1.0)
+        if self.dynamics_prediction_offsets:
+            dense_targets = []
+            target_available = []
+            for offset in self.dynamics_prediction_offsets:
+                requested_index = index_in_demo + int(offset) - 1
+                target_index = min(demo_length - 1, requested_index)
+                target = base.get_obs_sequence_from_demo(
+                    demo_id,
+                    index_in_demo=target_index,
+                    keys=base.obs_keys,
+                    num_frames_to_stack=0,
+                    seq_length=1,
+                    prefix="next_obs",
+                )
+                target.pop("pad_mask", None)
+                dense_targets.append(target)
+                target_available.append(float(requested_index < demo_length))
+            meta["chunk_dynamics_next_obs"] = {
+                key: np.concatenate(
+                    [target[key] for target in dense_targets], axis=0
+                )
+                for key in base.obs_keys
+            }
+            meta["chunk_dynamics_target_available"] = np.asarray(
+                target_available,
+                dtype=np.float32,
+            )
 
         if base.goal_mode == "last":
             demo_length_offset = 0 if base.pad_seq_length else base.seq_length - 1

@@ -33,8 +33,12 @@ from robomimic.envs.wrappers import EnvWrapper
 
 from train_square_rgb_dp_one_step_idql import ChunkIQLCritic, OneStepDiffusionActor, make_scheduler
 from train_rgb_dp_chunk_idql import (
+    LEGACY_CRITIC_ARCHITECTURE,
     PREDICTED_NEXT_Q_NORMALIZATION,
+    WCM_CRITIC_ARCHITECTURE,
+    checkpoint_critic_architecture,
     critic_q_head_inputs,
+    make_wcm_system_from_checkpoint,
     make_rise_chunk_value_networks,
     match_encoder_normalization_to_checkpoint,
 )
@@ -766,12 +770,18 @@ class RiseStyleRGBIDQLPolicy:
         selection_seed: int,
         clip_actions: bool,
         execution_horizon: int,
+        wcm_q_system=None,
+        wcm_value_system=None,
     ):
         self.dp_policy = dp_policy
         self.dp_ckpt = dp_ckpt
         self.algo = dp_policy.policy
         self.critics = critics
         self.vf = vf
+        self.wcm_q_system = wcm_q_system
+        self.wcm_value_system = wcm_value_system
+        if (self.wcm_q_system is None) != (self.wcm_value_system is None):
+            raise ValueError("WCM evaluation requires both Q and value systems")
         self.checkpoint = checkpoint
         self.num_candidates = int(num_candidates)
         self.candidate_batch_size = int(candidate_batch_size)
@@ -795,9 +805,19 @@ class RiseStyleRGBIDQLPolicy:
                 f"execution_horizon must be positive, got {self.execution_horizon}"
             )
         self.critic_used = self.num_candidates > 1
-        if self.critic_used and len(self.critics) < 2:
+        q_head_count = (
+            int(self.wcm_q_system.num_critics)
+            if self.wcm_q_system is not None
+            else len(self.critics)
+        )
+        if self.critic_used and q_head_count < 2:
             raise ValueError("RISE-style reranking requires twin critics")
-        if self.critic_used and self.selection == "advantage_softmax" and self.vf is None:
+        if (
+            self.critic_used
+            and self.selection == "advantage_softmax"
+            and self.vf is None
+            and self.wcm_value_system is None
+        ):
             raise ValueError("advantage_softmax selection requires a value net")
         self.action_queue: deque[np.ndarray] = deque()
         self.last_q: np.ndarray | None = None
@@ -906,16 +926,10 @@ class RiseStyleRGBIDQLPolicy:
                     self.algo,
                     prepared_obs,
                 )
-            obs_batch = repeat_obs(current_obs, self.num_candidates)
-            if self.critic_chunk_horizon == 1:
-                q_predictions = [
-                    critic(obs_dict=obs_batch, acts=first_actions, goal_dict=None)
-                    for critic in self.critics
-                ]
-            else:
+            if self.wcm_q_system is not None:
                 if normalized_trajectories.shape[1] < self.critic_chunk_horizon:
                     raise ValueError(
-                        "actor proposal is shorter than critic chunk horizon: "
+                        "actor proposal is shorter than WCM chunk horizon: "
                         f"proposal={normalized_trajectories.shape[1]}, "
                         f"critic={self.critic_chunk_horizon}"
                     )
@@ -927,21 +941,69 @@ class RiseStyleRGBIDQLPolicy:
                     device=critic_actions.device,
                     dtype=critic_actions.dtype,
                 )
-                q_predictions = [
-                    critic(
-                        obs_dict=obs_batch,
-                        acts=critic_actions,
-                        action_mask=action_mask,
-                        goal_dict=None,
+                q_state = self.wcm_q_system.encode_state(current_obs, None)
+                q_predictions = self.wcm_q_system.q_values_from_state(
+                    q_state,
+                    critic_actions,
+                    action_mask,
+                )
+                if len(q_predictions) < 2 or any(
+                    tuple(value.shape) != (self.num_candidates, 1)
+                    for value in q_predictions
+                ):
+                    raise ValueError(
+                        "WCM Q heads must return twin [N,1] predictions"
                     )
-                    for critic in self.critics
-                ]
-            q = torch.cat(q_predictions, dim=1).min(dim=1).values
-            v = (
-                self.vf(obs_dict=current_obs, goal_dict=None).reshape(())
-                if self.vf is not None
-                else q.new_zeros(())
-            )
+                q = torch.cat(q_predictions, dim=1).min(dim=1).values
+                value_state = (
+                    q_state
+                    if self.wcm_value_system is self.wcm_q_system
+                    else self.wcm_value_system.encode_state(current_obs, None)
+                )
+                v = self.wcm_value_system.value_from_state(
+                    value_state
+                ).reshape(())
+            else:
+                obs_batch = repeat_obs(current_obs, self.num_candidates)
+                if self.critic_chunk_horizon == 1:
+                    q_predictions = [
+                        critic(
+                            obs_dict=obs_batch,
+                            acts=first_actions,
+                            goal_dict=None,
+                        )
+                        for critic in self.critics
+                    ]
+                else:
+                    if normalized_trajectories.shape[1] < self.critic_chunk_horizon:
+                        raise ValueError(
+                            "actor proposal is shorter than critic chunk horizon: "
+                            f"proposal={normalized_trajectories.shape[1]}, "
+                            f"critic={self.critic_chunk_horizon}"
+                        )
+                    critic_actions = normalized_trajectories[
+                        :, : self.critic_chunk_horizon
+                    ]
+                    action_mask = torch.ones(
+                        critic_actions.shape[:2],
+                        device=critic_actions.device,
+                        dtype=critic_actions.dtype,
+                    )
+                    q_predictions = [
+                        critic(
+                            obs_dict=obs_batch,
+                            acts=critic_actions,
+                            action_mask=action_mask,
+                            goal_dict=None,
+                        )
+                        for critic in self.critics
+                    ]
+                q = torch.cat(q_predictions, dim=1).min(dim=1).values
+                v = (
+                    self.vf(obs_dict=current_obs, goal_dict=None).reshape(())
+                    if self.vf is not None
+                    else q.new_zeros(())
+                )
             selected = self.choose_index(q, v)
             self.last_q = q.detach().cpu().numpy()
             self.last_v = float(v.detach().cpu())
@@ -1495,7 +1557,21 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
 
         selected_critics = torch.nn.ModuleList()
         vf = None
-        if int(args.num_candidates) > 1:
+        wcm_q_system = None
+        wcm_value_system = None
+        critic_architecture = checkpoint_critic_architecture(checkpoint)
+        if critic_architecture not in (
+            LEGACY_CRITIC_ARCHITECTURE,
+            WCM_CRITIC_ARCHITECTURE,
+        ):
+            raise ValueError(
+                f"unsupported critic architecture: {critic_architecture!r}"
+            )
+        checkpoint["critic_architecture"] = critic_architecture
+        if (
+            int(args.num_candidates) > 1
+            and critic_architecture != WCM_CRITIC_ARCHITECTURE
+        ):
             if checkpoint.get("rise_style_rgb_chunk_idql", False):
                 q_uses_predicted_next = bool(
                     checkpoint.get(
@@ -1626,8 +1702,54 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             else:
                 vf = None
                 checkpoint["eval_vf_encoder_normalization"] = None
+        elif int(args.num_candidates) > 1:
+            online_system, target_system = make_wcm_system_from_checkpoint(
+                dp_policy.policy,
+                checkpoint,
+            )
+            online_state = checkpoint.get("chunk_value_system")
+            target_state = checkpoint.get("chunk_value_target")
+            if online_state is None or target_state is None:
+                raise ValueError(
+                    "WCM checkpoint is missing online or target system state"
+                )
+            online_encoder_normalization = (
+                match_encoder_normalization_to_checkpoint(
+                    online_system, online_state
+                )
+            )
+            online_system.load_state_dict(online_state, strict=True)
+            if args.critic_source == "target":
+                target_encoder_normalization = (
+                    match_encoder_normalization_to_checkpoint(
+                        target_system, target_state
+                    )
+                )
+                target_system.load_state_dict(target_state, strict=True)
+                wcm_q_system = target_system
+                checkpoint["eval_critic_key"] = "chunk_value_target"
+                checkpoint["eval_critic_encoder_normalization"] = [
+                    target_encoder_normalization
+                ]
+            else:
+                wcm_q_system = online_system
+                checkpoint["eval_critic_key"] = "chunk_value_system"
+                checkpoint["eval_critic_encoder_normalization"] = [
+                    online_encoder_normalization
+                ]
+            wcm_value_system = online_system
+            checkpoint["eval_vf_key"] = "chunk_value_system.value_head"
+            wcm_q_system = wcm_q_system.float().to(device)
+            wcm_q_system.eval().requires_grad_(False)
+            if wcm_value_system is not wcm_q_system:
+                wcm_value_system = wcm_value_system.float().to(device)
+                wcm_value_system.eval().requires_grad_(False)
+            checkpoint["eval_vf_encoder_normalization"] = (
+                online_encoder_normalization
+            )
         else:
             checkpoint["eval_critic_key"] = None
+            checkpoint["eval_vf_key"] = None
 
         for heavy_key in (
             "actor_model",
@@ -1642,6 +1764,10 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             "critic_optimizer",
             "critic_lr_scheduler",
             "vf_lr_scheduler",
+            "chunk_value_system",
+            "chunk_value_target",
+            "chunk_value_optimizer",
+            "chunk_value_lr_scheduler",
             "rng_state",
             "loader_generator_state",
             "history",
@@ -1661,6 +1787,8 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             selection_seed=effective_policy_seed(args),
             clip_actions=args.clip_actions,
             execution_horizon=args.execution_horizon,
+            wcm_q_system=wcm_q_system,
+            wcm_value_system=wcm_value_system,
         )
 
     hybrid_dp_chunk_actor_iql = bool(checkpoint.get("hybrid_dp_chunk_actor_iql", False))
@@ -2005,6 +2133,12 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         "critic_observation_horizon": int(
             policy.checkpoint.get("critic_observation_horizon", 1)
         ),
+        "critic_architecture": policy.checkpoint.get(
+            "critic_architecture", LEGACY_CRITIC_ARCHITECTURE
+        ),
+        "critic_shared_state_representation": bool(
+            policy.checkpoint.get("critic_shared_state_representation", False)
+        ),
         "critic_q_head_inputs": list(
             policy.checkpoint.get(
                 "critic_q_head_inputs",
@@ -2020,6 +2154,17 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         "critic_q_predicted_next_normalization": policy.checkpoint.get(
             "critic_q_predicted_next_normalization"
         ),
+        "dynamics_prediction_offsets": list(
+            policy.checkpoint.get("dynamics_prediction_offsets", ())
+        ),
+        "dynamics_prediction_consumed_by_q": bool(
+            policy.checkpoint.get("dynamics_prediction_consumed_by_q", False)
+        ),
+        "sigreg_weight": float(policy.checkpoint.get("sigreg_weight", 0.0)),
+        "sigreg_global_batch": bool(
+            policy.checkpoint.get("sigreg_global_batch", False)
+        ),
+        "eval_vf_key": policy.checkpoint.get("eval_vf_key"),
         "critic_input_mode": policy.checkpoint.get("critic_input_mode"),
         "critic_action_space": policy.checkpoint.get("critic_action_space"),
         "critic_late_fusion_key": policy.checkpoint.get("critic_late_fusion_key"),

@@ -508,6 +508,9 @@ def build_single_loader(
                 next_observation_horizon=int(
                     getattr(args, "critic_observation_horizon", 1)
                 ),
+                dynamics_prediction_offsets=tuple(
+                    getattr(args, "dynamics_prediction_offsets", ())
+                ),
             )
         elif sparse_one_step_loader:
             dataset = SparseOneStepSequenceDataset(
