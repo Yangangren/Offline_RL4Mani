@@ -1029,17 +1029,32 @@ class WCMChunkValueSystem(nn.Module):
             self.obs_shapes,
             self.observation_horizon,
         )
-        frame_latents: list[torch.Tensor | None] = [None] * len(frames)
-        # Encode the newest frame first, matching the legacy crop/RNG order.
+        batch_size = int(next(iter(frames[0].values())).shape[0])
+        # Encode the full history in one larger image batch. Keeping newest
+        # first preserves the established frame ordering for paired online /
+        # target crop draws while avoiding one encoder launch per timestep.
         encode_order = (len(frames) - 1, *range(len(frames) - 1))
-        for frame_index in encode_order:
-            frame_latents[frame_index] = self._encode_frame(
-                frames[frame_index], goal_dict
+        flattened_frames = {
+            key: torch.cat(
+                [frames[frame_index][key] for frame_index in encode_order],
+                dim=0,
             )
-        stacked = torch.stack(
-            [value for value in frame_latents if value is not None],
-            dim=1,
+            for key in self.obs_shapes
+        }
+        flattened_goal = (
+            None
+            if goal_dict is None
+            else {
+                key: torch.cat([value] * len(frames), dim=0)
+                for key, value in goal_dict.items()
+            }
         )
+        encoded = self._encode_frame(flattened_frames, flattened_goal)
+        encoded_in_order = encoded.split(batch_size, dim=0)
+        frame_latents: list[torch.Tensor | None] = [None] * len(frames)
+        for frame_index, latent in zip(encode_order, encoded_in_order):
+            frame_latents[frame_index] = latent
+        stacked = torch.stack(frame_latents, dim=1)
         temporal_tokens = self.nets["temporal_trunk"](stacked)
         return {
             "temporal_state": temporal_tokens[:, -1],
@@ -2275,10 +2290,15 @@ def process_chunk_batch(
     }
     if dynamics_targets is not None:
         batch["dynamics_targets"] = dynamics_targets
-    batch = TensorUtils.to_device(
-        TensorUtils.to_float(batch),
-        actor_algo.device,
-        non_blocking=actor_algo.device.type == "cuda",
+    # Keep DataLoader-pinned uint8 RGB tensors compact during H2D transfer.
+    # Casting them on CPU first both expands traffic by 4x and returns an
+    # unpinned allocation, defeating the requested non-blocking copy.
+    batch = TensorUtils.to_float(
+        TensorUtils.to_device(
+            batch,
+            actor_algo.device,
+            non_blocking=actor_algo.device.type == "cuda",
+        )
     )
     batch = actor_algo.postprocess_batch_for_training(
         batch, obs_normalization_stats=obs_normalization_stats
@@ -2587,16 +2607,6 @@ def compute_chunk_losses(
     return critic_losses, vf_loss, info
 
 
-def _global_valid_count(
-    local_count: torch.Tensor,
-    distributed_context: DistributedContext | None,
-) -> torch.Tensor:
-    global_count = local_count.detach().clone()
-    if distributed_context is not None and distributed_context.enabled:
-        dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
-    return global_count
-
-
 def masked_wcm_dynamics_mse(
     predicted: torch.Tensor,
     target: torch.Tensor,
@@ -2619,8 +2629,36 @@ def masked_wcm_dynamics_mse(
     predicted_rows = predicted.reshape(-1, predicted.shape[-1])[rows]
     target_rows = target.reshape(-1, target.shape[-1])[rows]
     per_row_mse = (predicted_rows - target_rows).square().mean(dim=-1)
-    local_count = rows.sum().detach()
-    global_count = _global_valid_count(local_count, distributed_context)
+    local_count = rows.sum().to(dtype=predicted.dtype).detach()
+
+    copy_prediction = current_frame_latent[:, None, :].expand_as(target)
+    copy_rows = copy_prediction.reshape(-1, target.shape[-1])[rows]
+    copy_per_row = (copy_rows - target_rows).square().mean(dim=-1)
+
+    # Pack all detached dynamics statistics into one collective. The previous
+    # implementation issued count + sum reductions globally and again for
+    # every offset (11 blocking NCCL calls for four targets).
+    packed_statistics = [
+        local_count,
+        per_row_mse.detach().sum(),
+        copy_per_row.detach().sum(),
+    ]
+    for offset_index in range(predicted.shape[1]):
+        offset_rows = valid_mask[:, offset_index] > 0.5
+        errors = (
+            predicted[:, offset_index][offset_rows]
+            - target[:, offset_index][offset_rows]
+        ).square().mean(dim=-1)
+        packed_statistics.extend(
+            (
+                offset_rows.sum().to(dtype=predicted.dtype).detach(),
+                errors.detach().sum(),
+            )
+        )
+    global_statistics = torch.stack(packed_statistics)
+    if distributed_context is not None and distributed_context.enabled:
+        dist.all_reduce(global_statistics, op=dist.ReduceOp.SUM)
+    global_count = global_statistics[0]
     world_size = (
         int(distributed_context.world_size)
         if distributed_context is not None and distributed_context.enabled
@@ -2632,22 +2670,13 @@ def masked_wcm_dynamics_mse(
     loss = per_row_mse.sum() * (
         predicted.new_tensor(float(world_size)) / denominator
     )
-
-    global_squared_sum = per_row_mse.detach().sum().clone()
-    if distributed_context is not None and distributed_context.enabled:
-        dist.all_reduce(global_squared_sum, op=dist.ReduceOp.SUM)
+    global_squared_sum = global_statistics[1]
     global_mse = torch.where(
         global_count > 0,
         global_squared_sum / denominator,
         torch.zeros_like(global_squared_sum),
     )
-
-    copy_prediction = current_frame_latent[:, None, :].expand_as(target)
-    copy_rows = copy_prediction.reshape(-1, target.shape[-1])[rows]
-    copy_per_row = (copy_rows - target_rows).square().mean(dim=-1)
-    global_copy_sum = copy_per_row.detach().sum().clone()
-    if distributed_context is not None and distributed_context.enabled:
-        dist.all_reduce(global_copy_sum, op=dist.ReduceOp.SUM)
+    global_copy_sum = global_statistics[2]
     global_copy_mse = torch.where(
         global_count > 0,
         global_copy_sum / denominator,
@@ -2659,54 +2688,26 @@ def masked_wcm_dynamics_mse(
         "dynamics/rmse": torch.sqrt(global_mse.clamp_min(1e-12)).detach(),
         "dynamics/copy_current_mse": global_copy_mse.detach(),
         "dynamics/valid_pair_count": global_count.to(predicted.dtype),
-        "dynamics/valid_fraction": valid_mask.float().mean().detach(),
+        "dynamics/valid_fraction": (
+            global_count
+            / predicted.new_tensor(
+                float(valid_mask.numel() * world_size)
+            )
+        ).detach(),
     }
     for offset_index in range(predicted.shape[1]):
-        offset_rows = valid_mask[:, offset_index] > 0.5
-        offset_errors = (
-            predicted[:, offset_index][offset_rows]
-            - target[:, offset_index][offset_rows]
-        ).square().mean(dim=-1)
-        offset_count = _global_valid_count(
-            offset_rows.sum().detach(), distributed_context
-        )
-        offset_sum = offset_errors.detach().sum().clone()
-        if distributed_context is not None and distributed_context.enabled:
-            dist.all_reduce(offset_sum, op=dist.ReduceOp.SUM)
+        statistics_start = 3 + 2 * offset_index
+        offset_count = global_statistics[statistics_start]
+        offset_sum = global_statistics[statistics_start + 1]
         metrics[f"dynamics/offset_index_{offset_index}_mse"] = torch.where(
             offset_count > 0,
-            offset_sum / offset_count.to(offset_sum.dtype).clamp_min(1.0),
+            offset_sum / offset_count.clamp_min(1.0),
             torch.zeros_like(offset_sum),
         )
         metrics[f"dynamics/offset_index_{offset_index}_valid_count"] = (
             offset_count.to(predicted.dtype)
         )
     return loss, metrics
-
-
-def differentiable_global_batch(
-    features: torch.Tensor,
-    distributed_context: DistributedContext | None,
-) -> torch.Tensor:
-    if distributed_context is None or not distributed_context.enabled:
-        return features
-    local_shape = torch.as_tensor(
-        features.shape,
-        dtype=torch.long,
-        device=features.device,
-    )
-    gathered_shapes = [torch.empty_like(local_shape) for _ in range(
-        distributed_context.world_size
-    )]
-    dist.all_gather(gathered_shapes, local_shape)
-    if any(not torch.equal(shape, local_shape) for shape in gathered_shapes):
-        raise ValueError(
-            "global-batch SIGReg requires equal feature shapes on every rank; "
-            f"got {[shape.tolist() for shape in gathered_shapes]}"
-        )
-    from torch.distributed.nn.functional import all_gather
-
-    return torch.cat(tuple(all_gather(features)), dim=0)
 
 
 def sigreg_loss(
@@ -2723,11 +2724,15 @@ def sigreg_loss(
         raise ValueError(f"SIGReg features must be [B,D], got {features.shape}")
     if int(knots) < 2 or int(num_projections) < 1:
         raise ValueError("SIGReg knots and projection count must be positive")
-    features = differentiable_global_batch(
-        features.float(), distributed_context
+    features = features.float()
+    local_batch_size, feature_dim = features.shape
+    world_size = (
+        int(distributed_context.world_size)
+        if distributed_context is not None and distributed_context.enabled
+        else 1
     )
-    batch_size, feature_dim = features.shape
-    if int(batch_size) < 2:
+    global_batch_size = int(local_batch_size) * world_size
+    if global_batch_size < 2:
         return features.sum() * 0.0
     points = torch.linspace(
         0.0,
@@ -2749,20 +2754,39 @@ def sigreg_loss(
             device=features.device,
         )
     projections = F.normalize(projections, dim=0)
-    total = features.new_zeros(())
+    moment_chunks = []
     for start in range(0, int(num_projections), int(projection_chunk_size)):
         directions = projections[
             :, start : start + int(projection_chunk_size)
         ]
         projected = features @ directions
         phases = projected.unsqueeze(-1) * points
-        real_error = phases.cos().mean(dim=0) - gaussian_cf
-        imaginary = phases.sin().mean(dim=0)
-        per_projection = (
-            (real_error.square() + imaginary.square()) @ weights
-        ) * float(batch_size)
-        total = total + per_projection.sum()
-    return total / float(num_projections)
+        moment_chunks.append(
+            torch.stack(
+                (phases.cos().sum(dim=0), phases.sin().sum(dim=0)),
+                dim=0,
+            )
+        )
+    characteristic_sums = torch.cat(moment_chunks, dim=1)
+    if distributed_context is not None and distributed_context.enabled:
+        # Reduce only the characteristic-function moments. Gathering the full
+        # feature batch made every GPU redundantly evaluate the global
+        # B x projections x knots trigonometric objective. One moment
+        # collective retains the exact global-batch loss and gradient.
+        from torch.distributed.nn.functional import all_reduce
+
+        characteristic_sums = all_reduce(
+            characteristic_sums,
+            op=dist.ReduceOp.SUM,
+        )
+    real_error = (
+        characteristic_sums[0] / float(global_batch_size) - gaussian_cf
+    )
+    imaginary = characteristic_sums[1] / float(global_batch_size)
+    per_projection = (
+        (real_error.square() + imaginary.square()) @ weights
+    ) * float(global_batch_size)
+    return per_projection.sum() / float(num_projections)
 
 
 def compute_wcm_chunk_losses(
@@ -4715,6 +4739,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if distributed.enabled
         else None
     )
+    wcm_gradient_sync_fn = (
+        (
+            lambda parameters: all_reduce_gradients(
+                parameters,
+                distributed,
+                bucket_cap_mb=args.gradient_bucket_cap_mb,
+                preserve_unused_parameters=False,
+            )
+        )
+        if distributed.enabled
+        else None
+    )
     if trains_joint_actor(args):
         actor_algo.gradient_sync_fn = gradient_sync_fn
     if distributed.enabled and resume_state is None:
@@ -4895,6 +4931,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "num_projections": int(args.sigreg_num_projections),
             "global_batch": bool(args.sigreg_global_batch),
             "scope": "newest_temporal_context",
+            "distributed_reduction": "global_characteristic_moments",
         },
         "monte_carlo_return_weight": 0.0,
         "actor_reference_distillation": actor_reference_audit,
@@ -4948,12 +4985,28 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "steps_per_epoch_source": args.steps_per_epoch_source,
             "sequence_length": int(sequence_length),
             "sparse_chunk_loader": bool(args.sparse_chunk_loader),
-                "observation_frames_per_sample": (
-                    int(args.observation_horizon)
-                    + int(args.critic_observation_horizon)
-                    + len(args.dynamics_prediction_offsets)
-                    if args.sparse_chunk_loader
-                else 2 * (
+            "num_workers_per_rank": int(args.num_workers),
+            "total_worker_processes": int(
+                args.num_workers * distributed.world_size
+            ),
+            "prefetch_factor": (
+                int(args.prefetch_factor) if int(args.num_workers) > 0 else None
+            ),
+            "pin_memory": bool(args.pin_memory),
+            "persistent_workers": bool(args.persistent_workers),
+            "dense_target_read_strategy": (
+                "one_coalesced_successor_window_per_observation_key"
+                if args.sparse_chunk_loader
+                and len(args.dynamics_prediction_offsets) > 0
+                else "not_applicable"
+            ),
+            "observation_frames_per_sample": (
+                int(args.observation_horizon)
+                + int(args.critic_observation_horizon)
+                + len(args.dynamics_prediction_offsets)
+                if args.sparse_chunk_loader
+                else 2
+                * (
                     int(args.observation_horizon) - 1 + int(sequence_length)
                 )
             ),
@@ -5232,7 +5285,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     total_critic_loss,
                     target_tau=args.resolved_target_tau,
                     max_gradient_norm=max_grad,
-                    gradient_sync_fn=gradient_sync_fn,
+                    gradient_sync_fn=wcm_gradient_sync_fn,
                 )
             else:
                 effective_dynamics_cosine = (

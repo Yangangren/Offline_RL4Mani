@@ -886,33 +886,44 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
             )
         )
         valid_length = int(action_mask.sum())
-        meta["next_obs"] = self._get_next_obs_sequence(
-            demo_id=demo_id,
-            index_in_demo=index_in_demo,
-            demo_length=demo_length,
-            valid_length=valid_length,
-        )
-        meta["chunk_sparse_next_obs"] = np.float32(1.0)
         if self.dynamics_prediction_offsets:
-            dense_targets = []
+            # All bootstrap-history and dense-dynamics frames lie in one short
+            # successor window. Read that window once per observation key.
+            # This is materially faster for the compressed RGB datasets used
+            # here: issuing one single-frame HDF5 read per offset repeatedly
+            # inflates the same time-major gzip chunks.
+            next_obs_window = base.get_obs_sequence_from_demo(
+                demo_id,
+                index_in_demo=index_in_demo,
+                keys=base.obs_keys,
+                num_frames_to_stack=self.next_observation_horizon - 1,
+                seq_length=self.chunk_horizon,
+                prefix="next_obs",
+            )
+            bootstrap_start = valid_length - 1
+            bootstrap_end = (
+                bootstrap_start + self.next_observation_horizon
+            )
+            meta["next_obs"] = {
+                key: value[bootstrap_start:bootstrap_end]
+                for key, value in next_obs_window.items()
+            }
+
             target_available = []
+            target_positions = []
             for offset in self.dynamics_prediction_offsets:
                 requested_index = index_in_demo + int(offset) - 1
-                target_index = min(demo_length - 1, requested_index)
-                target = base.get_obs_sequence_from_demo(
-                    demo_id,
-                    index_in_demo=target_index,
-                    keys=base.obs_keys,
-                    num_frames_to_stack=0,
-                    seq_length=1,
-                    prefix="next_obs",
+                target_positions.append(
+                    self.next_observation_horizon + int(offset) - 2
                 )
-                target.pop("pad_mask", None)
-                dense_targets.append(target)
                 target_available.append(float(requested_index < demo_length))
             meta["chunk_dynamics_next_obs"] = {
-                key: np.concatenate(
-                    [target[key] for target in dense_targets], axis=0
+                key: np.stack(
+                    [
+                        next_obs_window[key][position]
+                        for position in target_positions
+                    ],
+                    axis=0,
                 )
                 for key in base.obs_keys
             }
@@ -920,6 +931,14 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                 target_available,
                 dtype=np.float32,
             )
+        else:
+            meta["next_obs"] = self._get_next_obs_sequence(
+                demo_id=demo_id,
+                index_in_demo=index_in_demo,
+                demo_length=demo_length,
+                valid_length=valid_length,
+            )
+        meta["chunk_sparse_next_obs"] = np.float32(1.0)
 
         if base.goal_mode == "last":
             demo_length_offset = 0 if base.pad_seq_length else base.seq_length - 1
