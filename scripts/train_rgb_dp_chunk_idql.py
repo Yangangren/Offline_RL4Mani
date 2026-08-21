@@ -84,6 +84,9 @@ ACTOR_CONDITION_DEFINITIONS = {
 }
 DYNAMICS_PREDICTION_MODE = "actor_encoder_direct"
 WCM_DYNAMICS_PREDICTION_MODE = "shared_critic_latent_multi_offset_residual"
+WCM_DYNAMICS_TARGET_MODE = "periodic_hard_copy_frame_encoder_v1"
+LEGACY_WCM_DYNAMICS_TARGET_MODE = "online_stop_gradient_frame_encoder_v0"
+WCM_DYNAMICS_TARGET_STATE_KEY = "wcm_dynamics_frame_target"
 PREDICTED_NEXT_Q_NORMALIZATION = "layer_norm"
 LEGACY_CRITIC_ARCHITECTURE = "legacy"
 WCM_CRITIC_ARCHITECTURE = "wcm_shared_temporal_v1"
@@ -91,6 +94,8 @@ CRITIC_ARCHITECTURES = (
     LEGACY_CRITIC_ARCHITECTURE,
     WCM_CRITIC_ARCHITECTURE,
 )
+DEFAULT_WCM_DYNAMICS_TARGET_SYNC_INTERVAL = 500
+DEFAULT_LEGACY_DYNAMICS_TARGET_SYNC_INTERVAL = 1000
 ACTOR_OPTIMIZER_TYPE = "adamw"
 ACTOR_WEIGHT_DECAY = 1e-6
 JOINT_ACTOR_INITIALIZATIONS = frozenset(
@@ -133,6 +138,18 @@ def checkpoint_critic_architecture(checkpoint: dict) -> str:
     )
 
 
+def checkpoint_wcm_dynamics_target_mode(checkpoint: dict) -> str | None:
+    """Infer the old online-stop-gradient contract for legacy WCM checkpoints."""
+    if checkpoint_critic_architecture(checkpoint) != WCM_CRITIC_ARCHITECTURE:
+        return None
+    return str(
+        checkpoint.get(
+            "wcm_dynamics_target_mode",
+            LEGACY_WCM_DYNAMICS_TARGET_MODE,
+        )
+    )
+
+
 def configure_critic_architecture_args(args: argparse.Namespace) -> None:
     """Install backward-compatible defaults and validate WCM-only contracts."""
     defaults = {
@@ -153,6 +170,12 @@ def configure_critic_architecture_args(args: argparse.Namespace) -> None:
     architecture = str(args.critic_architecture)
     if architecture not in CRITIC_ARCHITECTURES:
         raise ValueError(f"unsupported critic architecture: {architecture!r}")
+    if getattr(args, "dynamics_target_sync_interval", None) is None:
+        args.dynamics_target_sync_interval = int(
+            DEFAULT_WCM_DYNAMICS_TARGET_SYNC_INTERVAL
+            if architecture == WCM_CRITIC_ARCHITECTURE
+            else DEFAULT_LEGACY_DYNAMICS_TARGET_SYNC_INTERVAL
+        )
     offsets = tuple(int(value) for value in args.dynamics_prediction_offsets)
     if architecture == LEGACY_CRITIC_ARCHITECTURE:
         # Do not make old training load four unused RGB targets.
@@ -875,6 +898,94 @@ def make_rise_chunk_value_networks(
     return critics, targets, vf
 
 
+def named_crop_randomizers(encoder: nn.Module) -> list[tuple[str, CropRandomizer]]:
+    return [
+        (name, module)
+        for name, module in encoder.named_modules()
+        if isinstance(module, CropRandomizer)
+    ]
+
+
+def make_wcm_temporal_crop_plan(
+    encoder: nn.Module,
+    *,
+    batch_size: int,
+    seed: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Sample one crop per trajectory and camera without touching ambient RNG."""
+    if int(batch_size) < 1:
+        raise ValueError("WCM crop-plan batch size must be positive")
+    generator_device = device if device.type == "cuda" else torch.device("cpu")
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(int(seed))
+    plan: dict[str, torch.Tensor] = {}
+    for name, randomizer in named_crop_randomizers(encoder):
+        image_height = int(randomizer.input_shape[1])
+        image_width = int(randomizer.input_shape[2])
+        max_height = image_height - int(randomizer.crop_height)
+        max_width = image_width - int(randomizer.crop_width)
+        if max_height <= 0 or max_width <= 0:
+            raise ValueError(
+                f"invalid crop geometry for {name!r}: input="
+                f"{tuple(randomizer.input_shape)}, crop="
+                f"({randomizer.crop_height},{randomizer.crop_width})"
+            )
+        shape = (int(batch_size), int(randomizer.num_crops))
+        height = (
+            max_height
+            * torch.rand(
+                shape,
+                generator=generator,
+                device=generator_device,
+            )
+        ).to(dtype=torch.long)
+        width = (
+            max_width
+            * torch.rand(
+                shape,
+                generator=generator,
+                device=generator_device,
+            )
+        ).to(dtype=torch.long)
+        plan[name] = torch.stack((height, width), dim=-1)
+    return plan
+
+
+@contextmanager
+def use_wcm_temporal_crop_plan(
+    encoder: nn.Module,
+    crop_plan: dict[str, torch.Tensor] | None,
+    group_ids: torch.Tensor,
+):
+    """Apply a shared per-trajectory crop plan to one flattened encoder call."""
+    randomizers = named_crop_randomizers(encoder)
+    if crop_plan is None or not randomizers:
+        yield
+        return
+    expected_names = {name for name, _ in randomizers}
+    if set(crop_plan) != expected_names:
+        raise ValueError(
+            "WCM crop-plan randomizers do not match encoder: "
+            f"plan={sorted(crop_plan)}, encoder={sorted(expected_names)}"
+        )
+    previous = []
+    try:
+        for name, randomizer in randomizers:
+            previous.append(
+                (
+                    randomizer,
+                    randomizer._external_crop_indices,
+                    randomizer._external_crop_group_ids,
+                )
+            )
+            randomizer.set_external_crop_plan(crop_plan[name], group_ids)
+        yield
+    finally:
+        for randomizer, crop_indices, prior_group_ids in previous:
+            randomizer.set_external_crop_plan(crop_indices, prior_group_ids)
+
+
 class WCMChunkValueSystem(nn.Module):
     """Shared WCM-style temporal representation for chunk Q, V, and dynamics.
 
@@ -1023,6 +1134,8 @@ class WCMChunkValueSystem(nn.Module):
         self,
         obs_dict: dict[str, torch.Tensor],
         goal_dict: dict[str, torch.Tensor] | None = None,
+        *,
+        crop_plan: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         frames = observation_history_frames(
             obs_dict,
@@ -1049,7 +1162,17 @@ class WCMChunkValueSystem(nn.Module):
                 for key, value in goal_dict.items()
             }
         )
-        encoded = self._encode_frame(flattened_frames, flattened_goal)
+        group_ids = torch.arange(
+            batch_size,
+            device=next(iter(flattened_frames.values())).device,
+            dtype=torch.long,
+        ).repeat(len(frames))
+        with use_wcm_temporal_crop_plan(
+            self.nets["encoder"],
+            crop_plan,
+            group_ids,
+        ):
+            encoded = self._encode_frame(flattened_frames, flattened_goal)
         encoded_in_order = encoded.split(batch_size, dim=0)
         frame_latents: list[torch.Tensor | None] = [None] * len(frames)
         for frame_index, latent in zip(encode_order, encoded_in_order):
@@ -1131,6 +1254,8 @@ class WCMChunkValueSystem(nn.Module):
         self,
         obs_dict: dict[str, torch.Tensor],
         goal_dict: dict[str, torch.Tensor] | None = None,
+        *,
+        crop_plan: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         offset_count = len(self.dynamics_prediction_offsets)
         first_key = next(iter(self.obs_shapes))
@@ -1164,10 +1289,61 @@ class WCMChunkValueSystem(nn.Module):
                 key: value.repeat_interleave(offset_count, dim=0)
                 for key, value in goal_dict.items()
             }
-        return self._encode_frame(flattened, flattened_goal).reshape(
+        group_ids = torch.arange(
             batch_size,
-            offset_count,
-            self.latent_dim,
+            device=first_value.device,
+            dtype=torch.long,
+        ).repeat_interleave(offset_count)
+        with use_wcm_temporal_crop_plan(
+            self.nets["encoder"],
+            crop_plan,
+            group_ids,
+        ):
+            encoded = self._encode_frame(flattened, flattened_goal)
+        return encoded.reshape(batch_size, offset_count, self.latent_dim)
+
+
+class WCMFrameTargetEncoder(nn.Module):
+    """Frozen observation-to-frame-latent teacher for WCM dynamics."""
+
+    def __init__(self, source: WCMChunkValueSystem):
+        super().__init__()
+        self.obs_shapes = copy.deepcopy(source.obs_shapes)
+        self.goal_shapes = copy.deepcopy(source.goal_shapes)
+        self.has_goal = bool(source.has_goal)
+        self.latent_dim = int(source.latent_dim)
+        self.dynamics_prediction_offsets = tuple(
+            int(value) for value in source.dynamics_prediction_offsets
+        )
+        self.late_fusion_keys = tuple(source.late_fusion_keys)
+        self.nets = nn.ModuleDict(
+            {
+                "encoder": copy.deepcopy(source.nets["encoder"]),
+                "frame_projection": copy.deepcopy(
+                    source.nets["frame_projection"]
+                ),
+            }
+        )
+
+    def _encode_frame(
+        self,
+        obs_dict: dict[str, torch.Tensor],
+        goal_dict: dict[str, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        return WCMChunkValueSystem._encode_frame(self, obs_dict, goal_dict)
+
+    def encode_dynamics_targets(
+        self,
+        obs_dict: dict[str, torch.Tensor],
+        goal_dict: dict[str, torch.Tensor] | None = None,
+        *,
+        crop_plan: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        return WCMChunkValueSystem.encode_dynamics_targets(
+            self,
+            obs_dict,
+            goal_dict,
+            crop_plan=crop_plan,
         )
 
 
@@ -1382,6 +1558,53 @@ def copy_deployed_dp_encoder_state(module: nn.Module, actor_algo) -> dict[str, i
         "parameter_count": int(
             sum(value.numel() for value in source_state.values())
         ),
+    }
+
+
+@torch.no_grad()
+def hard_sync_wcm_dynamics_target_encoder(
+    target_encoder: WCMFrameTargetEncoder,
+    source_system: WCMChunkValueSystem,
+) -> dict[str, float | int]:
+    """Hard-copy the complete online frame-latent coordinate system."""
+    floating_difference = 0.0
+    floating_reference = 0.0
+    tensor_count = 0
+    parameter_count = 0
+    for key in ("encoder", "frame_projection"):
+        source_state = source_system.nets[key].state_dict()
+        target_state = target_encoder.nets[key].state_dict()
+        if set(source_state) != set(target_state):
+            raise ValueError(f"WCM dynamics target {key} state keys do not match")
+        for name, source_value in source_state.items():
+            target_value = target_state[name]
+            if source_value.shape != target_value.shape:
+                raise ValueError(
+                    f"WCM dynamics target {key}.{name} shape mismatch: "
+                    f"{tuple(target_value.shape)} != {tuple(source_value.shape)}"
+                )
+            tensor_count += 1
+            if torch.is_floating_point(source_value):
+                difference = (
+                    source_value.detach().float() - target_value.detach().float()
+                )
+                floating_difference += float(difference.square().sum())
+                floating_reference += float(
+                    target_value.detach().float().square().sum()
+                )
+        target_encoder.nets[key].load_state_dict(source_state, strict=True)
+        parameter_count += sum(
+            parameter.numel()
+            for parameter in source_system.nets[key].parameters()
+        )
+    configure_wcm_dynamics_target_random_crops(target_encoder)
+    relative_l2 = (
+        floating_difference / max(floating_reference, 1e-12)
+    ) ** 0.5
+    return {
+        "tensor_count": int(tensor_count),
+        "parameter_count": int(parameter_count),
+        "pre_sync_relative_l2": float(relative_l2),
     }
 
 
@@ -1651,6 +1874,46 @@ def validate_resume_semantics(
             f"resume critic_architecture={saved_architecture!r} does not "
             f"match requested {requested_architecture!r}; use a fresh run"
         )
+    if requested_architecture == WCM_CRITIC_ARCHITECTURE:
+        saved_target_mode = checkpoint_wcm_dynamics_target_mode(resume_state)
+        if saved_target_mode != WCM_DYNAMICS_TARGET_MODE:
+            raise ValueError(
+                f"resume WCM dynamics target mode={saved_target_mode!r} does "
+                f"not match required {WCM_DYNAMICS_TARGET_MODE!r}; use the "
+                "checkpoint for evaluation or a fresh source warm start"
+            )
+        if WCM_DYNAMICS_TARGET_STATE_KEY not in resume_state:
+            raise ValueError(
+                "hard-copy WCM resume checkpoint is missing "
+                f"{WCM_DYNAMICS_TARGET_STATE_KEY!r}"
+            )
+        saved_interval_value = saved_args.get(
+            "dynamics_target_sync_interval"
+        )
+        if saved_interval_value is None:
+            raise ValueError(
+                "hard-copy WCM resume checkpoint has no immutable "
+                "dynamics_target_sync_interval configuration"
+            )
+        interval = int(saved_interval_value)
+        if interval != int(args.dynamics_target_sync_interval):
+            raise ValueError(
+                f"resume dynamics_target_sync_interval={interval} does not match "
+                f"requested {args.dynamics_target_sync_interval}"
+            )
+        global_step = int(resume_state.get("step", -1))
+        last_sync_step = int(
+            resume_state.get("dynamics_target_last_sync_step", -1)
+        )
+        expected_last_sync = (
+            global_step // interval * interval if global_step >= 0 else -1
+        )
+        if last_sync_step != expected_last_sync:
+            raise ValueError(
+                "resume WCM dynamics target sync state is inconsistent: "
+                f"step={global_step}, last_sync={last_sync_step}, "
+                f"expected={expected_last_sync}"
+            )
     if str(resume_state.get("task", "")) != str(args.task):
         raise ValueError(
             f"resume task={resume_state.get('task')!r} does not match "
@@ -2152,6 +2415,8 @@ def process_chunk_batch(
                 "task_rewards"
             )
         critic_rewards = task_rewards
+    elif str(reward_mode) == "terminal_success":
+        pass
     elif str(reward_mode) != "rise":
         raise ValueError(f"unsupported chunk critic reward_mode={reward_mode!r}")
     rewards = critic_rewards[:, current_index:end_index].float()
@@ -2792,6 +3057,7 @@ def sigreg_loss(
 def compute_wcm_chunk_losses(
     system: WCMChunkValueSystem,
     target_system: WCMChunkValueSystem,
+    dynamics_target_encoder: WCMFrameTargetEncoder,
     batch: dict[str, Any],
     *,
     discount: float,
@@ -2808,15 +3074,26 @@ def compute_wcm_chunk_losses(
     if "dynamics_targets" not in batch:
         raise KeyError("WCM batch is missing dense dynamics_targets")
     device = batch["actions"].device
-    crop_seeds = torch.randint(
-        0,
-        torch.iinfo(torch.int32).max,
-        (3,),
-        device="cpu",
-    ).tolist()
-    current_crop_seed, next_crop_seed, dynamics_crop_seed = crop_seeds
-    with fork_rng_with_seed(current_crop_seed, device):
-        state = system.encode_state(batch["obs"], batch["goal_obs"])
+    augmentation_seed = int(
+        torch.randint(
+            0,
+            torch.iinfo(torch.int32).max,
+            (),
+            device="cpu",
+        ).item()
+    )
+    batch_size = int(batch["actions"].shape[0])
+    crop_plan = make_wcm_temporal_crop_plan(
+        system.nets["encoder"],
+        batch_size=batch_size,
+        seed=augmentation_seed,
+        device=device,
+    )
+    state = system.encode_state(
+        batch["obs"],
+        batch["goal_obs"],
+        crop_plan=crop_plan,
+    )
     q_predictions = system.q_values_from_state(
         state,
         batch["actions"],
@@ -2830,11 +3107,12 @@ def compute_wcm_chunk_losses(
     )
 
     with torch.no_grad():
-        with fork_rng_with_seed(next_crop_seed, device):
-            next_state = system.encode_state(
-                batch["next_obs"], batch["goal_obs"]
-            )
-            next_v = system.value_from_state(next_state)
+        next_state = system.encode_state(
+            batch["next_obs"],
+            batch["goal_obs"],
+            crop_plan=crop_plan,
+        )
+        next_v = system.value_from_state(next_state)
         bootstrap = torch.pow(
             batch["valid_length"].new_tensor(float(discount)),
             batch["valid_length"],
@@ -2843,10 +3121,11 @@ def compute_wcm_chunk_losses(
             batch["reward"]
             + (1.0 - batch["terminal"]) * bootstrap * next_v
         )
-        with fork_rng_with_seed(current_crop_seed, device):
-            target_state = target_system.encode_state(
-                batch["obs"], batch["goal_obs"]
-            )
+        target_state = target_system.encode_state(
+            batch["obs"],
+            batch["goal_obs"],
+            crop_plan=crop_plan,
+        )
         target_qs = target_system.q_values_from_state(
             target_state,
             batch["actions"],
@@ -2855,11 +3134,11 @@ def compute_wcm_chunk_losses(
         target_q_min = torch.cat(target_qs, dim=1).min(
             dim=1, keepdim=True
         ).values
-        with fork_rng_with_seed(dynamics_crop_seed, device):
-            target_dynamics = system.encode_dynamics_targets(
-                batch["dynamics_targets"]["next_obs"],
-                batch["goal_obs"],
-            ).detach()
+        target_dynamics = dynamics_target_encoder.encode_dynamics_targets(
+            batch["dynamics_targets"]["next_obs"],
+            batch["goal_obs"],
+            crop_plan=crop_plan,
+        ).detach()
 
     regression = F.smooth_l1_loss if use_huber else F.mse_loss
     q_losses = [regression(prediction, q_backup) for prediction in q_predictions]
@@ -3093,6 +3372,13 @@ def configure_wcm_target_random_crops(
 ) -> None:
     target_system.eval().requires_grad_(False)
     configure_encoder_target_random_crops(target_system.nets["encoder"])
+
+
+def configure_wcm_dynamics_target_random_crops(
+    target_encoder: WCMFrameTargetEncoder,
+) -> None:
+    target_encoder.eval().requires_grad_(False)
+    configure_encoder_target_random_crops(target_encoder.nets["encoder"])
 
 
 def set_wcm_encoder_trainable(
@@ -3370,6 +3656,16 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
         raise ValueError(
             f"source chunk checkpoint is missing required fields: {missing}"
         )
+    if (
+        requested_architecture == WCM_CRITIC_ARCHITECTURE
+        and checkpoint_wcm_dynamics_target_mode(source)
+        == WCM_DYNAMICS_TARGET_MODE
+        and WCM_DYNAMICS_TARGET_STATE_KEY not in source
+    ):
+        raise ValueError(
+            "source declares the hard-copy WCM dynamics target but is missing "
+            f"{WCM_DYNAMICS_TARGET_STATE_KEY!r}"
+        )
     if requested_architecture != WCM_CRITIC_ARCHITECTURE:
         if len(source["critics"]) != int(args.num_critics):
             raise ValueError("source checkpoint critic count is inconsistent")
@@ -3394,6 +3690,7 @@ def checkpoint_payload(
     vf_lr_scheduler: Any,
     wcm_system: WCMChunkValueSystem | None,
     wcm_target_system: WCMChunkValueSystem | None,
+    wcm_dynamics_target_encoder: WCMFrameTargetEncoder | None,
     wcm_optimizer: torch.optim.Optimizer | None,
     wcm_lr_scheduler: Any,
     action_stats: dict,
@@ -3417,12 +3714,20 @@ def checkpoint_payload(
     if is_wcm:
         if any(
             value is None
-            for value in (wcm_system, wcm_target_system, wcm_optimizer)
+            for value in (
+                wcm_system,
+                wcm_target_system,
+                wcm_dynamics_target_encoder,
+                wcm_optimizer,
+            )
         ):
             raise ValueError("WCM checkpoint payload is missing system state")
         model_state = {
             "chunk_value_system": wcm_system.state_dict(),
             "chunk_value_target": wcm_target_system.state_dict(),
+            WCM_DYNAMICS_TARGET_STATE_KEY: (
+                wcm_dynamics_target_encoder.state_dict()
+            ),
             "chunk_value_optimizer": wcm_optimizer.state_dict(),
             "chunk_value_lr_scheduler": (
                 wcm_lr_scheduler.state_dict()
@@ -3484,9 +3789,12 @@ def checkpoint_payload(
             else DYNAMICS_PREDICTION_MODE
         ),
         "dynamics_prediction_target": (
-            "stop_gradient_online_critic_frame_latent"
+            "stop_gradient_periodic_hard_copy_critic_frame_latent"
             if is_wcm
             else "normalized_actor_encoder_features"
+        ),
+        "wcm_dynamics_target_mode": (
+            WCM_DYNAMICS_TARGET_MODE if is_wcm else None
         ),
         "dynamics_prediction_offsets": tuple(
             int(value) for value in args.dynamics_prediction_offsets
@@ -3533,6 +3841,8 @@ def checkpoint_payload(
         "critic_reward_source": (
             "rewards=source_environment_task_reward"
             if args.reward_mode == "task"
+            else "rewards=canonical_first_success_terminal_reward"
+            if args.reward_mode == "terminal_success"
             else "rewards=expert_1_non_expert_0"
         ),
         "actor_training_objective": (
@@ -3603,10 +3913,14 @@ def checkpoint_payload(
         "critic_training_objective": (
             "task_reward_semi_mdp_chunk_iql_with_shared_wcm_dynamics"
             if is_wcm and args.reward_mode == "task"
+            else "terminal_success_semi_mdp_chunk_iql_with_shared_wcm_dynamics"
+            if is_wcm and args.reward_mode == "terminal_success"
             else "rise_semi_mdp_chunk_iql_with_shared_wcm_dynamics"
             if is_wcm
             else "task_reward_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
             if args.reward_mode == "task"
+            else "terminal_success_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
+            if args.reward_mode == "terminal_success"
             else "rise_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
         ),
         "critic_input_mode": (
@@ -3643,7 +3957,7 @@ def checkpoint_payload(
         "expectile": float(args.expectile),
         "target_tau": float(args.target_tau),
         "dynamics_target_source": (
-            "stop_gradient_online_critic_frame_encoder"
+            "periodic_hard_copy_online_critic_frame_encoder_and_projection"
             if is_wcm
             else "periodic_deployed_actor_ema_obs_encoder"
             if trains_joint_actor(args)
@@ -3656,8 +3970,10 @@ def checkpoint_payload(
         "dynamics_cosine_weight": float(args.dynamics_cosine_weight),
         "dynamics_warmup_steps": int(args.dynamics_warmup_steps),
         "augmentation": (
-            "paired_training_random_crops_online_dynamics_target_and_vf_target_"
-            "plus_paired_actor_student_and_reference_teacher_crops"
+            "explicit_per_trajectory_camera_crop_plan_shared_across_all_wcm_"
+            "history_bootstrap_q_target_and_periodic_teacher_future_frames"
+            if is_wcm
+            else "paired_online_and_target_encoder_random_crops_via_rng_fork"
         ),
         "q_loss": "huber" if args.use_huber else "mse",
         "max_gradient_norm": (
@@ -4293,6 +4609,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     is_wcm = args.critic_architecture == WCM_CRITIC_ARCHITECTURE
     wcm_system: WCMChunkValueSystem | None = None
     wcm_target_system: WCMChunkValueSystem | None = None
+    wcm_dynamics_target_encoder: WCMFrameTargetEncoder | None = None
     wcm_optimizer: torch.optim.Optimizer | None = None
     wcm_lr_scheduler = None
     critics = nn.ModuleList()
@@ -4360,8 +4677,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             }
         wcm_target_system = copy.deepcopy(wcm_system)
+        wcm_dynamics_target_encoder = WCMFrameTargetEncoder(wcm_system)
         wcm_system = wcm_system.float().to(device)
         wcm_target_system = wcm_target_system.float().to(device)
+        wcm_dynamics_target_encoder = (
+            wcm_dynamics_target_encoder.float().to(device)
+        )
         target_encoder_output_dim = int(wcm_system.latent_dim)
         wcm_optimizer = make_wcm_optimizer(
             wcm_system,
@@ -4515,6 +4836,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             wcm_target_system.load_state_dict(
                 resume_state["chunk_value_target"], strict=True
             )
+            wcm_dynamics_target_encoder.load_state_dict(
+                resume_state[WCM_DYNAMICS_TARGET_STATE_KEY],
+                strict=True,
+            )
             wcm_optimizer.load_state_dict(
                 resume_state["chunk_value_optimizer"]
             )
@@ -4653,6 +4978,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             wcm_target_system.load_state_dict(
                 source_for_warm_start["chunk_value_target"], strict=True
             )
+            dynamics_sync_audit = hard_sync_wcm_dynamics_target_encoder(
+                wcm_dynamics_target_encoder,
+                wcm_system,
+            )
+            warm_start_audit["dynamics_target_resync"] = {
+                **dynamics_sync_audit,
+                "source_target_mode": (
+                    checkpoint_wcm_dynamics_target_mode(
+                        source_for_warm_start
+                    )
+                ),
+                "fresh_round_sync_step": 0,
+            }
         else:
             for critic, state in zip(
                 critics,
@@ -4695,10 +5033,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         )
     if is_wcm:
         configure_wcm_target_random_crops(wcm_target_system)
+        configure_wcm_dynamics_target_random_crops(
+            wcm_dynamics_target_encoder
+        )
         synchronized_modules: list[nn.Module] = [
             actor_algo.nets,
             wcm_system,
             wcm_target_system,
+            wcm_dynamics_target_encoder,
         ]
         training_buffer_modules = (
             [actor_algo.nets, wcm_system]
@@ -4795,6 +5137,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             vf_lr_scheduler=vf_lr_scheduler,
             wcm_system=wcm_system,
             wcm_target_system=wcm_target_system,
+            wcm_dynamics_target_encoder=wcm_dynamics_target_encoder,
             wcm_optimizer=wcm_optimizer,
             wcm_lr_scheduler=wcm_lr_scheduler,
             action_stats=action_stats,
@@ -4842,7 +5185,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             else [parameter_count(x) for x in targets]
         ),
         "dynamics_target_encoder_parameter_count": (
-            None if is_wcm else parameter_count(dynamics_target_encoder)
+            parameter_count(wcm_dynamics_target_encoder)
+            if is_wcm
+            else parameter_count(dynamics_target_encoder)
         ),
         "dynamics_target_encoder_output_dim": target_encoder_output_dim,
         "vf_parameter_count": (
@@ -4894,7 +5239,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             False if is_wcm else bool(args.critic_q_use_predicted_next_latent)
         ),
         "dynamics_target_encoder": (
-            "stop_gradient_online_shared_frame_encoder"
+            "frozen_complete_frame_encoder_and_projection_hard_copy"
             if is_wcm
             else "frozen_copy_periodically_hard_synced_from_deployed_actor_ema_"
             "obs_encoder"
@@ -4902,16 +5247,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             else "frozen_copy_of_deployed_actor_ema_obs_encoder"
         ),
         "dynamics_target_update": (
-            "stop_gradient_no_teacher_update"
+            "periodic_full_state_dict_hard_sync"
             if is_wcm
             else "periodic_hard_sync"
             if trains_joint_actor(args)
             else "fixed_after_initialization"
         ),
+        "wcm_dynamics_target_mode": (
+            WCM_DYNAMICS_TARGET_MODE if is_wcm else None
+        ),
         "dynamics_target_context_mlp": False,
         "training_augmentation": (
-            "paired_random_crop_coordinates_for_online_and_target_encoders_"
-            "plus_paired_actor_student_and_reference_teacher_crops"
+            "one_explicit_random_crop_per_trajectory_and_camera_shared_across_"
+            "history_bootstrap_q_target_and_periodic_teacher_future_frames"
+            if is_wcm
+            else "paired_online_and_target_encoder_random_crops_via_rng_fork"
         ),
         "target_encoder_mode": (
             "eval_except_crop_randomizers_in_training_mode"
@@ -5017,6 +5367,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "critic_reward_source": (
                 "rewards=source_environment_task_reward"
                 if args.reward_mode == "task"
+                else "rewards=canonical_first_success_terminal_reward"
+                if args.reward_mode == "terminal_success"
                 else "rewards=expert_1_non_expert_0"
             ),
             "actor_rows": (
@@ -5266,6 +5618,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 total_critic_loss, info = compute_wcm_chunk_losses(
                     wcm_system,
                     wcm_target_system,
+                    wcm_dynamics_target_encoder,
                     batch,
                     discount=args.discount,
                     expectile=args.expectile,
@@ -5370,21 +5723,39 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 raw_batch["actions"].shape[0] * distributed.world_size
             )
             actor_info["critic/data_rows"] = float(raw_batch["actions"].shape[0])
+            dynamics_target_age_used_for_loss = float(
+                global_step - dynamics_target_last_sync_step
+            )
             global_step += 1
             dynamics_target_synced = False
+            dynamics_sync_audit: dict[str, float | int] = {}
             if (
-                not is_wcm
-                and trains_joint_actor(args)
-                and global_step
+                global_step
                 % int(args.resolved_dynamics_target_sync_interval)
                 == 0
             ):
-                sync_actor_dynamics_target_encoder(
-                    dynamics_target_encoder,
-                    actor_algo,
-                )
-                dynamics_target_last_sync_step = global_step
-                dynamics_target_synced = True
+                if is_wcm:
+                    dynamics_sync_audit = (
+                        hard_sync_wcm_dynamics_target_encoder(
+                            wcm_dynamics_target_encoder,
+                            wcm_system,
+                        )
+                    )
+                    broadcast_module_state(
+                        [wcm_dynamics_target_encoder],
+                        distributed,
+                    )
+                    dynamics_target_synced = True
+                elif trains_joint_actor(args):
+                    dynamics_sync_audit = (
+                        sync_actor_dynamics_target_encoder(
+                            dynamics_target_encoder,
+                            actor_algo,
+                        )
+                    )
+                    dynamics_target_synced = True
+                if dynamics_target_synced:
+                    dynamics_target_last_sync_step = global_step
             metrics = dict(info)
             metrics.update(actor_info)
             metrics["dynamics/target_synced_after_update"] = float(
@@ -5393,10 +5764,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             metrics["dynamics/target_last_sync_step"] = float(
                 dynamics_target_last_sync_step
             )
-            metrics["dynamics/target_sync_age"] = (
-                0.0
-                if is_wcm
-                else float(global_step - dynamics_target_last_sync_step)
+            metrics["dynamics/target_age_used_for_loss"] = (
+                dynamics_target_age_used_for_loss
+            )
+            metrics["dynamics/target_sync_age"] = float(
+                global_step - dynamics_target_last_sync_step
+            )
+            metrics["dynamics/target_sync_count"] = float(
+                dynamics_target_last_sync_step
+                // int(args.resolved_dynamics_target_sync_interval)
+            )
+            metrics["dynamics/target_pre_sync_relative_l2"] = float(
+                dynamics_sync_audit.get("pre_sync_relative_l2", 0.0)
             )
             metrics["encoder/trainable"] = float(encoder_trainable)
             metrics["representation/trainable"] = 1.0 if is_wcm else float(
@@ -5655,10 +6034,11 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dynamics-target-sync-interval",
         type=int,
-        default=1000,
+        default=None,
         help=(
-            "Hard-sync the frozen dynamics target encoder from the deployed "
-            "actor EMA after this many joint-training optimizer steps."
+            "Optimizer-update interval for hard-copying the WCM frame-latent teacher "
+            "(or the legacy joint actor dynamics target encoder); defaults to "
+            "500 for WCM and 1000 for the legacy architecture."
         ),
     )
     parser.add_argument("--actor-adapter-lr", type=float, default=1e-4)

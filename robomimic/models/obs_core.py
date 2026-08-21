@@ -524,6 +524,67 @@ class CropRandomizer(Randomizer):
         self.crop_width = crop_width
         self.num_crops = num_crops
         self.pos_enc = pos_enc
+        # Optional scoped crop coordinates installed by temporal representation
+        # learners. These are deliberately runtime-only (not checkpoint state).
+        self._external_crop_indices = None
+        self._external_crop_group_ids = None
+
+    def set_external_crop_plan(self, crop_indices=None, group_ids=None):
+        """Install or clear explicit crop coordinates for the next scoped call.
+
+        Args:
+            crop_indices (torch.Tensor or None): coordinates [B, N, 2], with
+                one plan per logical trajectory and crop.
+            group_ids (torch.Tensor or None): logical trajectory index for each
+                flattened image row. This allows one plan to be shared across
+                several temporal frames without splitting encoder batches.
+        """
+        if crop_indices is None or group_ids is None:
+            if crop_indices is not None or group_ids is not None:
+                raise ValueError(
+                    "crop_indices and group_ids must both be set or both be None"
+                )
+            self._external_crop_indices = None
+            self._external_crop_group_ids = None
+            return
+        if crop_indices.ndim != 3 or crop_indices.shape[-1] != 2:
+            raise ValueError(
+                "external crop_indices must have shape [B, N, 2], got "
+                f"{tuple(crop_indices.shape)}"
+            )
+        if int(crop_indices.shape[1]) != int(self.num_crops):
+            raise ValueError(
+                f"external crop count={crop_indices.shape[1]} does not match "
+                f"num_crops={self.num_crops}"
+            )
+        if group_ids.ndim != 1:
+            raise ValueError(
+                f"external crop group_ids must be one-dimensional, got "
+                f"{tuple(group_ids.shape)}"
+            )
+        self._external_crop_indices = crop_indices
+        self._external_crop_group_ids = group_ids
+
+    def _source_with_position_encoding(self, inputs):
+        if not self.pos_enc:
+            return inputs
+        height, width = inputs.shape[-2:]
+        pos_y, pos_x = torch.meshgrid(
+            torch.arange(height, device=inputs.device),
+            torch.arange(width, device=inputs.device),
+            indexing="ij",
+        )
+        position = torch.stack(
+            (
+                pos_y.float() / float(height),
+                pos_x.float() / float(width),
+            ),
+            dim=0,
+        )
+        position = position.reshape(
+            *((1,) * len(inputs.shape[:-3])), 2, height, width
+        ).expand(*inputs.shape[:-3], 2, height, width)
+        return torch.cat((inputs, position), dim=-3)
 
     def output_shape_in(self, input_shape=None):
         """
@@ -572,13 +633,36 @@ class CropRandomizer(Randomizer):
         inputs to [B * N, ...].
         """
         assert len(inputs.shape) >= 3 # must have at least (C, H, W) dimensions
-        out, _ = ObsUtils.sample_random_image_crops(
-            images=inputs,
-            crop_height=self.crop_height,
-            crop_width=self.crop_width,
-            num_crops=self.num_crops,
-            pos_enc=self.pos_enc,
-        )
+        if self._external_crop_indices is None:
+            out, _ = ObsUtils.sample_random_image_crops(
+                images=inputs,
+                crop_height=self.crop_height,
+                crop_width=self.crop_width,
+                num_crops=self.num_crops,
+                pos_enc=self.pos_enc,
+            )
+        else:
+            if int(inputs.shape[0]) != int(self._external_crop_group_ids.numel()):
+                raise ValueError(
+                    f"flattened crop input batch={inputs.shape[0]} does not match "
+                    "external group_ids="
+                    f"{self._external_crop_group_ids.numel()}"
+                )
+            group_ids = self._external_crop_group_ids.to(
+                device=inputs.device, dtype=torch.long
+            )
+            crop_indices = self._external_crop_indices.to(
+                device=inputs.device, dtype=torch.long
+            )
+            selected_indices = crop_indices.index_select(0, group_ids)
+            source = self._source_with_position_encoding(inputs)
+            out = ObsUtils.crop_image_from_indices(
+                images=source,
+                crop_indices=selected_indices,
+                crop_height=self.crop_height,
+                crop_width=self.crop_width,
+                validate_indices=False,
+            )
         # [B, N, ...] -> [B * N, ...]
         return TensorUtils.join_dimensions(out, 0, 1)
 

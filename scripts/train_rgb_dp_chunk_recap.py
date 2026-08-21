@@ -97,9 +97,11 @@ def _dataset_reward_mode(dataset: Path) -> str:
         mode = "task"
     if not mode and definition == "expert_transition=1; non_expert_transition=0":
         mode = "rise"
-    if mode not in ("task", "rise"):
+    if not mode and definition.startswith("successful_episode: truncate_at_first"):
+        mode = "terminal_success"
+    if mode not in ("task", "terminal_success", "rise"):
         raise ValueError(
-            f"mixed dataset has unsupported reward_mode={mode!r}; expected task or rise"
+            f"mixed dataset has unsupported reward_mode={mode!r}"
         )
     return mode
 
@@ -215,7 +217,11 @@ def prepare_targets(args: argparse.Namespace) -> dict[str, Any]:
             handle.attrs.get("reward_definition", "")
         ) == "expert_transition=1; non_expert_transition=0":
             source_reward_mode = "rise"
-        if source_reward_mode not in ("task", "rise"):
+        if not source_reward_mode and _decode(
+            handle.attrs.get("reward_definition", "")
+        ).startswith("successful_episode: truncate_at_first"):
+            source_reward_mode = "terminal_success"
+        if source_reward_mode not in ("task", "terminal_success", "rise"):
             raise ValueError(
                 f"mixed dataset has unsupported reward_mode={source_reward_mode!r}"
             )
@@ -229,7 +235,7 @@ def prepare_targets(args: argparse.Namespace) -> dict[str, Any]:
                 raise ValueError(
                     f"data/{demo_key} has unsupported rise_source={source!r}"
                 )
-            if source_reward_mode == "rise" and "task_rewards" not in episode:
+            if source_reward_mode != "task" and "task_rewards" not in episode:
                 raise KeyError(
                     f"data/{demo_key} is from a rise-reward dataset but has no "
                     "preserved task_rewards for success-terminal detection"

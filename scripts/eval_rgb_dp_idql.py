@@ -1766,6 +1766,7 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             "vf_lr_scheduler",
             "chunk_value_system",
             "chunk_value_target",
+            "wcm_dynamics_frame_target",
             "chunk_value_optimizer",
             "chunk_value_lr_scheduler",
             "rng_state",

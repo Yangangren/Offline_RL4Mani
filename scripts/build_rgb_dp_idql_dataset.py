@@ -2,11 +2,14 @@
 """Build one RGB IDQL dataset from expert and deployment trajectories.
 
 The default ``task`` reward mode keeps each source trajectory's environment
-reward. The optional ``rise`` mode reproduces the prior binary imitation reward
-(human transition 1, rollout transition 0). Source identity and the actor's
-condition are stored separately from critic rewards. Large arrays stay in their
-source HDF5 files through external links; shifted ``next_obs`` arrays are HDF5
-virtual datasets.
+reward. ``terminal_success`` canonicalizes sparse task rewards across sources:
+successful episodes end at their first positive task reward and receive exactly
+one terminal reward, while failed episodes receive zero reward and terminate at
+their original end. The optional ``rise`` mode reproduces the prior binary
+imitation reward (human transition 1, rollout transition 0). Source identity and
+the actor's condition are stored separately from critic rewards. Large arrays
+stay in their source HDF5 files through external links or prefix virtual
+datasets; shifted ``next_obs`` arrays are HDF5 virtual datasets.
 """
 
 from __future__ import annotations
@@ -35,6 +38,11 @@ DEFAULT_OUTPUT = (
 )
 REWARD_DEFINITIONS = {
     "task": "source_task_reward",
+    "terminal_success": (
+        "successful_episode: truncate_at_first_source_task_reward>0.5, "
+        "reward=1_and_done=1_there; failed_episode: reward=0, "
+        "done=1_at_source_end"
+    ),
     "rise": "expert_transition=1; non_expert_transition=0",
 }
 ACTOR_CONDITION_DEFINITIONS = {
@@ -47,6 +55,43 @@ SOURCE_IDENTITY_ATTRS = {
     "expert": "expert_source_identity",
     "non_expert": "non_expert_source_identity",
 }
+SUCCESS_SOURCES = frozenset(("expert", "non_expert_success"))
+FAILURE_SOURCES = frozenset(("non_expert_failure",))
+
+
+def terminal_success_layout(
+    source_rewards: h5py.Dataset | np.ndarray,
+    source_label: str,
+) -> tuple[int, int | None, int]:
+    """Return retained count, terminal-success index, and positive count.
+
+    Source labels define whether an episode is intended to be successful. A
+    positive source task reward is still required for every labeled success,
+    and forbidden for every labeled failure. This catches stale or overlapping
+    rollout masks instead of silently relabeling them.
+    """
+    rewards = np.asarray(source_rewards[:], dtype=np.float32).reshape(-1)
+    if rewards.size < 1:
+        raise ValueError("terminal-success canonicalization received no rewards")
+    if not np.isfinite(rewards).all():
+        raise ValueError("source task rewards contain non-finite values")
+    positive_indices = np.flatnonzero(rewards > 0.5)
+    if source_label in SUCCESS_SOURCES:
+        if positive_indices.size == 0:
+            raise ValueError(
+                f"source {source_label!r} is labeled successful but has no "
+                "task reward > 0.5"
+            )
+        terminal_index = int(positive_indices[0])
+        return terminal_index + 1, terminal_index, int(positive_indices.size)
+    if source_label in FAILURE_SOURCES:
+        if positive_indices.size:
+            raise ValueError(
+                f"source {source_label!r} is labeled failed but has "
+                f"{positive_indices.size} task rewards > 0.5"
+            )
+        return int(rewards.size), None, 0
+    raise ValueError(f"unsupported source label: {source_label!r}")
 
 
 def actor_condition_value(source_label: str, mode: str) -> bool:
@@ -333,6 +378,30 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
         source_object: str,
         location: str,
     ) -> None:
+        if args.reward_mode == "terminal_success" and key in {
+            "actions", "obs", "task_rewards"
+        }:
+            try:
+                child = episode[key]
+            except (KeyError, OSError, RuntimeError, ValueError) as exc:
+                errors.append(f"{location}/{key} is inaccessible: {exc}")
+                return
+            datasets = (
+                list(child.values())
+                if isinstance(child, h5py.Group)
+                else [child]
+            )
+            if not datasets:
+                errors.append(f"{location}/{key} contains no virtual datasets")
+                return
+            for dataset in datasets:
+                if not isinstance(dataset, h5py.Dataset) or not dataset.is_virtual:
+                    errors.append(
+                        f"{location}/{key} is not a virtual prefix of "
+                        f"{source_object}"
+                    )
+                    return
+            return
         try:
             link = episode.get(key, getlink=True)
         except (KeyError, OSError, RuntimeError, ValueError) as exc:
@@ -533,6 +602,18 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
                 expected_count,
                 f"{source_location}/obs",
             )
+            source_count = expected_count
+            terminal_success_index = None
+            if args.reward_mode == "terminal_success" and source_rewards is not None:
+                try:
+                    (
+                        expected_count,
+                        terminal_success_index,
+                        _,
+                    ) = terminal_success_layout(source_rewards, source)
+                except ValueError as exc:
+                    errors.append(f"{source_location}: {exc}")
+
             if source == "expert":
                 transition_counts["expert"] += expected_count
             else:
@@ -571,6 +652,23 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
                     f"{location} num_samples={actual_count}, expected "
                     f"{expected_count} from data/{source_key}"
                 )
+            if args.reward_mode == "terminal_success":
+                expected_attrs = {
+                    "source_num_samples": source_count,
+                    "truncated_transition_count": source_count - expected_count,
+                    "terminal_success_index": (
+                        -1
+                        if terminal_success_index is None
+                        else terminal_success_index
+                    ),
+                }
+                for attr_key, expected_value in expected_attrs.items():
+                    actual_value = int(episode.attrs.get(attr_key, -2))
+                    if actual_value != int(expected_value):
+                        errors.append(
+                            f"{location} {attr_key}={actual_value}, expected "
+                            f"{expected_value}"
+                        )
 
             source_base = f"/data/{source_key}"
             target_actions = required_child(
@@ -657,7 +755,41 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
                     f"{source_base}/rewards",
                     location,
                 )
+            if target_task_rewards is not None and source_rewards is not None:
+                actual_task_rewards = np.asarray(target_task_rewards[:])
+                expected_task_rewards = np.asarray(source_rewards[:expected_count])
+                if not np.array_equal(actual_task_rewards, expected_task_rewards):
+                    errors.append(
+                        f"{location}/task_rewards does not preserve the retained "
+                        "source reward prefix"
+                    )
+            if target_rewards is not None:
+                actual_rewards = np.asarray(target_rewards[:], dtype=np.float32)
+                if args.reward_mode == "task" and source_rewards is not None:
+                    expected_rewards = np.asarray(
+                        source_rewards[:expected_count], dtype=np.float32
+                    )
+                elif args.reward_mode == "terminal_success":
+                    expected_rewards = np.zeros(expected_count, dtype=np.float32)
+                    if source in SUCCESS_SOURCES:
+                        expected_rewards[-1] = 1.0
+                else:
+                    expected_rewards = np.full(
+                        expected_count,
+                        1.0 if source == "expert" else 0.0,
+                        dtype=np.float32,
+                    )
+                if not np.array_equal(actual_rewards, expected_rewards):
+                    errors.append(f"{location}/rewards has incorrect {args.reward_mode} values")
+            if target_dones is not None:
+                actual_dones = np.asarray(target_dones[:], dtype=np.float32)
+                expected_dones = np.zeros(expected_count, dtype=np.float32)
+                expected_dones[-1] = 1.0
+                if not np.array_equal(actual_dones, expected_dones):
 
+                    errors.append(
+                        f"{location}/dones must be zero except at the end"
+                    )
             expected_expert = source == "expert"
             expected_condition = actor_condition_value(
                 source, args.actor_condition_mode
@@ -748,10 +880,37 @@ def copy_attrs(source: h5py.AttributeManager, target: h5py.AttributeManager) -> 
         target[key] = value
 
 
+def create_virtual_prefix_dataset(
+    target_group: h5py.Group,
+    key: str,
+    source_path: Path,
+    source_dataset: h5py.Dataset,
+    count: int,
+) -> h5py.Dataset:
+    """Create a zero-copy virtual view of the first ``count`` source rows."""
+    if source_dataset.ndim < 1 or int(source_dataset.shape[0]) < int(count):
+        raise ValueError(
+            f"cannot retain {count} rows from source dataset "
+            f"{source_dataset.name} with shape {source_dataset.shape}"
+        )
+    source = h5py.VirtualSource(
+        str(source_path),
+        source_dataset.name,
+        shape=source_dataset.shape,
+    )
+    shape = (int(count), *source_dataset.shape[1:])
+    layout = h5py.VirtualLayout(shape=shape, dtype=source_dataset.dtype)
+    layout[...] = source[:count]
+    target = target_group.create_virtual_dataset(key, layout)
+    copy_attrs(source_dataset.attrs, target.attrs)
+    return target
+
+
 def create_shifted_next_obs(
     target_group: h5py.Group,
     source_path: Path,
     source_obs: h5py.Group,
+    count: int,
 ) -> None:
     next_obs = target_group.create_group("next_obs")
     for key, dataset in source_obs.items():
@@ -764,10 +923,15 @@ def create_shifted_next_obs(
             dataset.name,
             shape=dataset.shape,
         )
-        layout = h5py.VirtualLayout(shape=dataset.shape, dtype=dataset.dtype)
-        if dataset.shape[0] > 1:
-            layout[:-1] = source[1:]
-        layout[-1:] = source[-1:]
+        shape = (int(count), *dataset.shape[1:])
+        layout = h5py.VirtualLayout(shape=shape, dtype=dataset.dtype)
+        if int(count) < int(dataset.shape[0]):
+            layout[...] = source[1 : count + 1]
+        elif int(count) > 1:
+            layout[:-1] = source[1:count]
+            layout[-1:] = source[count - 1 : count]
+        else:
+            layout[...] = source[:1]
         next_obs.create_virtual_dataset(key, layout)
 
 
@@ -779,23 +943,44 @@ def add_episode(
     source_label: str,
     reward_mode: str,
     actor_condition_mode: str,
-) -> int:
+) -> dict[str, Any]:
     with h5py.File(source_path, "r") as source_file:
         source_group = source_file[f"data/{source_key}"]
-        count = int(source_group.attrs.get("num_samples", len(source_group["actions"])))
-        if count < 1:
+        source_count = int(
+            source_group.attrs.get("num_samples", len(source_group["actions"]))
+        )
+        if source_count < 1:
             raise ValueError(f"empty episode data/{source_key} in {source_path}")
         if "rewards" not in source_group:
             raise KeyError(f"data/{source_key} has no task rewards in {source_path}")
-        if len(source_group["rewards"]) != count:
+        if len(source_group["rewards"]) != source_count:
             raise ValueError(
                 f"data/{source_key} has {len(source_group['rewards'])} rewards "
-                f"for {count} actions in {source_path}"
+                f"for {source_count} actions in {source_path}"
             )
+        source_rewards = np.asarray(
+            source_group["rewards"][:], dtype=np.float32
+        ).reshape(-1)
+        if not np.isfinite(source_rewards).all():
+            raise ValueError(f"data/{source_key} has non-finite task rewards")
+        source_positive_count = int(np.count_nonzero(source_rewards > 0.5))
+        terminal_success_index = None
+        count = source_count
+        if reward_mode == "terminal_success":
+            (
+                count,
+                terminal_success_index,
+                source_positive_count,
+            ) = terminal_success_layout(source_rewards, source_label)
 
         target = output_data.create_group(output_key)
         copy_attrs(source_group.attrs, target.attrs)
         target.attrs["num_samples"] = count
+        target.attrs["source_num_samples"] = source_count
+        target.attrs["truncated_transition_count"] = source_count - count
+        target.attrs["terminal_success_index"] = (
+            -1 if terminal_success_index is None else terminal_success_index
+        )
         target.attrs["rise_source"] = source_label
         target.attrs["rise_source_demo"] = source_key
         target.attrs["rise_source_file"] = str(source_path)
@@ -803,22 +988,63 @@ def add_episode(
         for key in source_group.keys():
             if key in {"obs", "next_obs", "rewards", "dones"}:
                 continue
-            target[key] = h5py.ExternalLink(
-                str(source_path),
-                f"/data/{source_key}/{key}",
+            child = source_group[key]
+            if reward_mode == "terminal_success":
+                if not isinstance(child, h5py.Dataset):
+                    raise TypeError(f"unsupported nested source group {child.name}")
+                create_virtual_prefix_dataset(
+                    target,
+                    key,
+                    source_path,
+                    child,
+                    count,
+                )
+            else:
+                target[key] = h5py.ExternalLink(
+                    str(source_path),
+                    f"/data/{source_key}/{key}",
+                )
+        if reward_mode == "terminal_success":
+            observations = target.create_group("obs")
+            copy_attrs(source_group["obs"].attrs, observations.attrs)
+            for obs_key, dataset in source_group["obs"].items():
+                if not isinstance(dataset, h5py.Dataset):
+                    continue
+                create_virtual_prefix_dataset(
+                    observations,
+                    obs_key,
+                    source_path,
+                    dataset,
+                    count,
+                )
+            create_virtual_prefix_dataset(
+                target,
+                "task_rewards",
+                source_path,
+                source_group["rewards"],
+                count,
             )
-        target["obs"] = h5py.ExternalLink(
-            str(source_path),
-            f"/data/{source_key}/obs",
-        )
-        target["task_rewards"] = h5py.ExternalLink(
-            str(source_path),
-            f"/data/{source_key}/rewards",
-        )
+        else:
+            target["obs"] = h5py.ExternalLink(
+                str(source_path),
+                f"/data/{source_key}/obs",
+            )
+            target["task_rewards"] = h5py.ExternalLink(
+                str(source_path),
+                f"/data/{source_key}/rewards",
+            )
         if reward_mode == "task":
             target["rewards"] = h5py.ExternalLink(
                 str(source_path),
                 f"/data/{source_key}/rewards",
+            )
+        elif reward_mode == "terminal_success":
+            rewards = np.zeros(count, dtype=np.float32)
+            if source_label in SUCCESS_SOURCES:
+                rewards[-1] = 1.0
+            target.create_dataset(
+                "rewards",
+                data=rewards,
             )
         elif reward_mode == "rise":
             reward = 1.0 if source_label == "expert" else 0.0
@@ -843,8 +1069,30 @@ def add_episode(
         dones = np.zeros(count, dtype=np.float32)
         dones[-1] = 1.0
         target.create_dataset("dones", data=dones)
-        create_shifted_next_obs(target, source_path, source_group["obs"])
-    return count
+        create_shifted_next_obs(target, source_path, source_group["obs"], count)
+
+    if reward_mode == "task":
+        critic_positive_count = source_positive_count
+        critic_reward_sum = float(source_rewards.sum())
+    elif reward_mode == "terminal_success":
+        critic_positive_count = int(source_label in SUCCESS_SOURCES)
+        critic_reward_sum = float(critic_positive_count)
+    else:
+        critic_positive_count = count if source_label == "expert" else 0
+        critic_reward_sum = float(critic_positive_count)
+    retained_source_positive_count = int(
+        np.count_nonzero(source_rewards[:count] > 0.5)
+    )
+    return {
+        "count": int(count),
+        "source_count": int(source_count),
+        "removed_transition_count": int(source_count - count),
+        "source_positive_count": int(source_positive_count),
+        "retained_source_positive_count": retained_source_positive_count,
+        "critic_positive_count": int(critic_positive_count),
+        "source_reward_sum": float(source_rewards.sum()),
+        "critic_reward_sum": float(critic_reward_sum),
+    }
 
 
 def write_mask(group: h5py.Group, key: str, demos: list[str]) -> None:
@@ -909,6 +1157,22 @@ def build(args: argparse.Namespace) -> dict:
         "non_expert_failure": [],
     }
     transition_counts = {key: 0 for key in episode_keys}
+    reward_statistics = {
+        source: {
+            "episodes": 0,
+            "original_transitions": 0,
+            "retained_transitions": 0,
+            "removed_post_success_transitions": 0,
+            "source_positive_transitions": 0,
+            "retained_source_positive_transitions": 0,
+            "critic_positive_transitions": 0,
+            "source_reward_sum": 0.0,
+            "critic_reward_sum": 0.0,
+        }
+        for source in (
+            "expert", "non_expert_success", "non_expert_failure"
+        )
+    }
 
     with (
         atomic_output_path(args) as staged_output,
@@ -918,7 +1182,7 @@ def build(args: argparse.Namespace) -> dict:
         mask = output.create_group("mask")
         for index, (source, source_path, source_key) in enumerate(records):
             output_key = f"demo_{index}"
-            count = add_episode(
+            stats = add_episode(
                 data,
                 output_key,
                 source_path,
@@ -927,6 +1191,23 @@ def build(args: argparse.Namespace) -> dict:
                 args.reward_mode,
                 args.actor_condition_mode,
             )
+            count = int(stats["count"])
+            source_stats = reward_statistics[source]
+            source_stats["episodes"] += 1
+            for target_key, stats_key in (
+                ("original_transitions", "source_count"),
+                ("retained_transitions", "count"),
+                ("removed_post_success_transitions", "removed_transition_count"),
+                ("source_positive_transitions", "source_positive_count"),
+                (
+                    "retained_source_positive_transitions",
+                    "retained_source_positive_count",
+                ),
+                ("critic_positive_transitions", "critic_positive_count"),
+                ("source_reward_sum", "source_reward_sum"),
+                ("critic_reward_sum", "critic_reward_sum"),
+            ):
+                source_stats[target_key] += stats[stats_key]
             if source == "expert":
                 episode_keys["expert"].append(output_key)
                 transition_counts["expert"] += count
@@ -946,6 +1227,12 @@ def build(args: argparse.Namespace) -> dict:
         data.attrs["env_args"] = env_args
         output.attrs["reward_mode"] = str(args.reward_mode)
         output.attrs["reward_definition"] = REWARD_DEFINITIONS[args.reward_mode]
+        output.attrs["critic_reward_key"] = "rewards"
+        output.attrs["preserved_source_task_reward_key"] = "task_rewards"
+        output.attrs["terminal_policy"] = (
+            "first_positive_truncation"
+            if args.reward_mode == "terminal_success" else "source_episode_end"
+        )
         output.attrs["source_label_definition"] = (
             "source_is_expert=1 for human demo; 0 for deployment rollout"
         )
@@ -970,11 +1257,23 @@ def build(args: argparse.Namespace) -> dict:
         output.flush()
 
     total_transitions = transition_counts["expert"] + transition_counts["non_expert"]
+    reward_statistics["total"] = {
+        key: sum(source_stats[key] for source_stats in reward_statistics.values())
+        for key in next(iter(reward_statistics.values()))
+    }
+
     summary = {
         "output": str(args.output),
         "task": str(args.task),
         "reward_mode": str(args.reward_mode),
         "reward_definition": REWARD_DEFINITIONS[args.reward_mode],
+        "critic_reward_key": "rewards",
+        "preserved_source_task_reward_key": "task_rewards",
+        "terminal_policy": (
+            "first_positive_truncation"
+            if args.reward_mode == "terminal_success" else "source_episode_end"
+        ),
+        "reward_statistics": reward_statistics,
         "source_label_definition": (
             "source_is_expert=1 for human demo; 0 for deployment rollout"
         ),
@@ -1006,7 +1305,11 @@ def build(args: argparse.Namespace) -> dict:
         "total_transitions": total_transitions,
         "selection_seed": int(args.seed),
         "source_identities": source_identities,
-        "storage": "HDF5 external links plus virtual next_obs datasets",
+        "storage": (
+            "HDF5 virtual retained-prefix and shifted-next_obs datasets"
+            if args.reward_mode == "terminal_success"
+            else "HDF5 external links plus virtual next_obs datasets"
+        ),
     }
     summary_path = args.output.with_suffix(".summary.json")
     summary_path.write_text(json.dumps(summary, indent=2))
@@ -1035,8 +1338,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=tuple(REWARD_DEFINITIONS),
         default="task",
         help=(
-            "task keeps source environment rewards (default); rise assigns "
-            "human transition=1 and rollout transition=0"
+            "task keeps source environment rewards (default); "
+            "terminal_success truncates each success at its first positive "
+            "task reward and emits one terminal reward; rise assigns human "
+            "transition=1 and rollout transition=0"
         ),
     )
     parser.add_argument(

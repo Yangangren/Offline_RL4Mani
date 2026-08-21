@@ -26,6 +26,7 @@ STAGE=${1:-train_chunk_idql_resilient}
 ROUND2_CHUNK_TRAINING=0
 TASK_SOURCE_CHUNK_IDQL_CHECKPOINT=
 TASK_CHUNK_CONDITION_HIDDEN_DIM=256
+TASK_DEFAULT_IDQL_REWARD_MODE=task
 
 case "$TASK" in
   square)
@@ -123,6 +124,7 @@ case "$TASK" in
     TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition_epoch200_actor
     TASK_EVAL_HORIZON=700
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
+    TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     ;;
   *)
     echo "Unsupported TASK=$TASK. Use square, can, transport, or tool_hang." >&2
@@ -197,7 +199,7 @@ fi
 DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
 EXPERT_DATASET=${EXPERT_DATASET:-$TASK_EXPERT_DATASET}
 ROLLOUT_DATASET=${ROLLOUT_DATASET:-$TASK_ROLLOUT_DATASET}
-IDQL_REWARD_MODE=${IDQL_REWARD_MODE:-task}
+IDQL_REWARD_MODE=${IDQL_REWARD_MODE:-$TASK_DEFAULT_IDQL_REWARD_MODE}
 CHUNK_ACTOR_CONDITION_MODE=${CHUNK_ACTOR_CONDITION_MODE:-human_only} # human_success
 
 case "$IDQL_REWARD_MODE" in
@@ -208,6 +210,13 @@ case "$IDQL_REWARD_MODE" in
     DEFAULT_CHUNK_EVAL_OUTPUT=${TASK_CHUNK_EVAL_OUTPUT}_task_reward
     DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${TASK_COMPOSED_CHUNK_EVAL_OUTPUT}_task_reward
     ;;
+  terminal_success)
+    DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_terminal_success_reward.hdf5
+    DEFAULT_IDQL_OUTPUT_DIR=${TASK_IDQL_OUTPUT_DIR}_terminal_success_reward
+    DEFAULT_CHUNK_IDQL_OUTPUT_DIR=${TASK_CHUNK_IDQL_OUTPUT_DIR}_terminal_success_reward
+    DEFAULT_CHUNK_EVAL_OUTPUT=${TASK_CHUNK_EVAL_OUTPUT}_terminal_success_reward
+    DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${TASK_COMPOSED_CHUNK_EVAL_OUTPUT}_terminal_success_reward
+    ;;
   rise)
     DEFAULT_IDQL_DATASET=$TASK_IDQL_DATASET
     DEFAULT_IDQL_OUTPUT_DIR=$TASK_IDQL_OUTPUT_DIR
@@ -216,7 +225,7 @@ case "$IDQL_REWARD_MODE" in
     DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${TASK_COMPOSED_CHUNK_EVAL_OUTPUT}
     ;;
   *)
-    echo "Unsupported IDQL_REWARD_MODE=$IDQL_REWARD_MODE. Use task or rise." >&2
+    echo "Unsupported IDQL_REWARD_MODE=$IDQL_REWARD_MODE. Use task, terminal_success, or rise." >&2
     exit 2
     ;;
 esac
@@ -224,6 +233,8 @@ if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "human_success" ]]; then
   condition_path_tag=human_success_condition
   if [[ "$IDQL_REWARD_MODE" == "task" ]]; then
     DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_${condition_path_tag}_task_reward.hdf5
+  elif [[ "$IDQL_REWARD_MODE" == "terminal_success" ]]; then
+    DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_${condition_path_tag}_terminal_success_reward.hdf5
   else
     DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_${condition_path_tag}.hdf5
   fi
@@ -244,10 +255,12 @@ if [[ "$CHUNK_CRITIC_ARCHITECTURE" == "wcm_shared_temporal_v1" ]]; then
   CHUNK_CRITIC_OBSERVATION_HORIZON=${CHUNK_CRITIC_OBSERVATION_HORIZON:-2}
   DEFAULT_CHUNK_DYNAMICS_WEIGHT=1.0
   DEFAULT_CHUNK_DYNAMICS_COSINE_WEIGHT=0.0
+  DEFAULT_DYNAMICS_TARGET_SYNC_INTERVAL=500
 else
   CHUNK_CRITIC_OBSERVATION_HORIZON=${CHUNK_CRITIC_OBSERVATION_HORIZON:-1}
   DEFAULT_CHUNK_DYNAMICS_WEIGHT=0.0
   DEFAULT_CHUNK_DYNAMICS_COSINE_WEIGHT=0.1
+  DEFAULT_DYNAMICS_TARGET_SYNC_INTERVAL=1000
 fi
 CHUNK_CRITIC_Q_USE_PREDICTED_NEXT_LATENT=${CHUNK_CRITIC_Q_USE_PREDICTED_NEXT_LATENT:-0}
 if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
@@ -777,7 +790,7 @@ run_chunk_train() {
     --discount "${DISCOUNT:-0.99}" \
     --expectile "${EXPECTILE:-0.9}" \
     --target-tau "${TARGET_TAU:-0.01}" \
-    --dynamics-target-sync-interval "${DYNAMICS_TARGET_SYNC_INTERVAL:-1000}" \
+    --dynamics-target-sync-interval "${DYNAMICS_TARGET_SYNC_INTERVAL:-$DEFAULT_DYNAMICS_TARGET_SYNC_INTERVAL}" \
     --actor-adapter-lr "${CHUNK_ACTOR_ADAPTER_LR:-1e-4}" \
     --actor-unet-lr "${CHUNK_ACTOR_UNET_LR:-1e-4}" \
     --actor-obs-encoder-lr "${CHUNK_ACTOR_OBS_ENCODER_LR:-1e-4}" \

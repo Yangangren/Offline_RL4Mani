@@ -67,6 +67,11 @@ DEFAULT_OUTPUT = (
 )
 REWARD_DEFINITIONS = {
     "task": "source_task_reward",
+    "terminal_success": (
+        "successful_episode: truncate_at_first_source_task_reward>0.5, "
+        "reward=1_and_done=1_there; failed_episode: reward=0, "
+        "done=1_at_source_end"
+    ),
     "rise": "expert_transition=1; non_expert_transition=0",
 }
 
@@ -604,11 +609,12 @@ def parameter_count(module: nn.Module) -> int:
 
 
 def rise_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
-    reward_alignment = (
-        "source_environment_task_reward"
-        if args.reward_mode == "task"
-        else "expert_transition_reward_1_non_expert_transition_reward_0"
-    )
+    if args.reward_mode == "task":
+        reward_alignment = "source_environment_task_reward"
+    elif args.reward_mode == "terminal_success":
+        reward_alignment = "canonical_first_success_terminal_reward_with_truncation"
+    else:
+        reward_alignment = "expert_transition_reward_1_non_expert_transition_reward_0"
     return {
         "matched": [
             "one uniformly shuffled mixed SequenceDataset",
@@ -895,7 +901,7 @@ def dataset_audit(
                 f"train with --reward-mode {reward_mode}"
             )
         task_reward_audit = None
-        if reward_mode == "task":
+        if reward_mode in ("task", "terminal_success"):
             missing_source_labels = [
                 key
                 for key, episode in handle["data"].items()
@@ -903,7 +909,7 @@ def dataset_audit(
             ]
             if missing_source_labels:
                 raise ValueError(
-                    "task-reward dataset is missing source_is_expert labels for "
+                    f"{reward_mode}-reward dataset is missing source_is_expert labels for "
                     f"episodes={missing_source_labels[:8]}; rebuild it"
                 )
             task_reward_audit = {}
@@ -918,20 +924,63 @@ def dataset_audit(
                     episode["task_rewards"][:],
                     dtype=np.float32,
                 )
-                if not np.array_equal(rewards, task_rewards):
-                    raise ValueError(
-                        f"task-reward dataset data/{episode_key} rewards do not "
-                        "match the preserved source task_rewards"
-                    )
-                if not np.isfinite(rewards).all():
-                    raise ValueError(
-                        f"task-reward dataset data/{episode_key} contains "
-                        "non-finite rewards"
-                    )
                 source = episode.attrs.get("rise_source", "unknown")
                 if isinstance(source, bytes):
                     source = source.decode("utf-8")
                 source = str(source)
+                if reward_mode == "task" and not np.array_equal(
+                    rewards, task_rewards
+                ):
+                    raise ValueError(
+                        f"task-reward dataset data/{episode_key} rewards do not "
+                        "match the preserved source task_rewards"
+                    )
+                if not np.isfinite(rewards).all() or not np.isfinite(task_rewards).all():
+                    raise ValueError(
+                        f"task-reward dataset data/{episode_key} contains "
+                        "non-finite rewards"
+                    )
+                if reward_mode == "terminal_success":
+                    if source not in {"expert", "non_expert_success", "non_expert_failure"}:
+                        raise ValueError(f"unsupported terminal-success source={source!r}")
+                    expected_rewards = np.zeros_like(rewards)
+                    if source in {"expert", "non_expert_success"}:
+                        expected_rewards[-1] = 1.0
+                        task_positive = np.flatnonzero(task_rewards > 0.5)
+                        if not (task_positive.size == 1 and task_positive[0] == rewards.size - 1):
+                            raise ValueError(
+                                f"terminal-success data/{episode_key} must end "
+                                "at its first positive source task reward"
+                            )
+                    elif np.any(task_rewards > 0.5):
+                        raise ValueError(
+                            f"terminal-success failure data/{episode_key} has a "
+                            "positive source task reward"
+                        )
+                    if not np.array_equal(rewards, expected_rewards):
+                        raise ValueError(
+                            f"terminal-success data/{episode_key} has incorrect "
+                            "canonical critic rewards"
+                        )
+                    if "dones" not in episode:
+                        raise ValueError(f"data/{episode_key} is missing dones")
+                    dones = np.asarray(episode["dones"][:], dtype=np.float32)
+                    expected_dones = np.zeros_like(rewards)
+                    expected_dones[-1] = 1.0
+                    if not np.array_equal(dones, expected_dones):
+                        raise ValueError(f"data/{episode_key} has invalid terminal dones")
+                    source_count = int(episode.attrs.get("source_num_samples", -1))
+                    if source_count < rewards.size:
+                        raise ValueError(
+                            f"data/{episode_key} source_num_samples={source_count} "
+                            f"is shorter than retained length={rewards.size}"
+                        )
+                    if int(
+                        episode.attrs.get("truncated_transition_count", -1)
+                    ) != source_count - rewards.size:
+                        raise ValueError(
+                            f"data/{episode_key} has inconsistent truncation metadata"
+                        )
                 source_stats = task_reward_audit.setdefault(
                     source,
                     {
@@ -940,6 +989,8 @@ def dataset_audit(
                         "positive_reward_episodes": 0,
                         "positive_reward_transitions": 0,
                         "reward_sum": 0.0,
+                        "source_positive_reward_transitions": 0,
+                        "source_reward_sum": 0.0,
                     },
                 )
                 source_stats["episodes"] += 1
@@ -951,6 +1002,10 @@ def dataset_audit(
                     np.count_nonzero(rewards > 0.5)
                 )
                 source_stats["reward_sum"] += float(rewards.sum())
+                source_stats["source_positive_reward_transitions"] += int(
+                    np.count_nonzero(task_rewards > 0.5)
+                )
+                source_stats["source_reward_sum"] += float(task_rewards.sum())
         masks = {
             key: int(len(value))
             for key, value in handle.get("mask", {}).items()
@@ -1088,11 +1143,15 @@ def checkpoint_payload(
         "critic_training_objective": (
             "task_reward_one_step_iql"
             if args.reward_mode == "task"
+            else "terminal_success_reward_one_step_iql"
+            if args.reward_mode == "terminal_success"
             else "rise_one_step_iql"
         ),
         "critic_reward_source": (
             "rewards=source_environment_task_reward"
             if args.reward_mode == "task"
+            else "rewards=canonical_first_success_terminal_reward"
+            if args.reward_mode == "terminal_success"
             else "rewards=expert_1_non_expert_0"
         ),
         "critic_input_mode": "independent_raw_observation_encoders",

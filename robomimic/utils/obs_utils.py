@@ -569,7 +569,13 @@ def repeat_and_stack_observation(obs_dict, n):
     return TU.repeat_by_expand_at(obs_dict, repeats=n, dim=0)
 
 
-def crop_image_from_indices(images, crop_indices, crop_height, crop_width):
+def crop_image_from_indices(
+    images,
+    crop_indices,
+    crop_height,
+    crop_width,
+    validate_indices=True,
+):
     """
     Crops images at the locations specified by @crop_indices. Crops will be 
     taken across all channels.
@@ -590,6 +596,10 @@ def crop_image_from_indices(images, crop_indices, crop_height, crop_width):
         crop_height (int): height of crop to take
 
         crop_width (int): width of crop to take
+
+        validate_indices (bool): check crop bounds before gathering. Internal
+            callers with coordinates constructed from validated geometry may
+            disable this to avoid synchronizing CUDA tensors with the host.
 
     Returns:
         crops (torch.Tesnor): cropped images of shape [..., C, @crop_height, @crop_width]
@@ -615,10 +625,11 @@ def crop_image_from_indices(images, crop_indices, crop_height, crop_width):
     num_crops = crop_indices.shape[-2]
 
     # make sure @crop_indices are in valid range
-    assert (crop_indices[..., 0] >= 0).all().item()
-    assert (crop_indices[..., 0] < (image_h - crop_height)).all().item()
-    assert (crop_indices[..., 1] >= 0).all().item()
-    assert (crop_indices[..., 1] < (image_w - crop_width)).all().item()
+    if validate_indices:
+        assert (crop_indices[..., 0] >= 0).all().item()
+        assert (crop_indices[..., 0] < (image_h - crop_height)).all().item()
+        assert (crop_indices[..., 1] >= 0).all().item()
+        assert (crop_indices[..., 1] < (image_w - crop_width)).all().item()
 
     # convert each crop index (ch, cw) into a list of pixel indices that correspond to the entire window.
 
