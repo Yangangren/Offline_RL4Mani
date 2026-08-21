@@ -388,6 +388,8 @@ RECAP_VALUE_OUTPUT_DIR=${RECAP_VALUE_OUTPUT_DIR:-$RECAP_OUTPUT_ROOT/value}
 RECAP_VALUE_CHECKPOINT=${RECAP_VALUE_CHECKPOINT:-$RECAP_VALUE_OUTPUT_DIR/best.pt}
 RECAP_LABELS=${RECAP_LABELS:-$RECAP_OUTPUT_ROOT/labels.pt}
 RECAP_ACTOR_OUTPUT_DIR=${RECAP_ACTOR_OUTPUT_DIR:-$RECAP_OUTPUT_ROOT/actor}
+RECAP_ACTOR_CHECKPOINT=${RECAP_ACTOR_CHECKPOINT:-$RECAP_ACTOR_OUTPUT_DIR/last.pth}
+RECAP_ACTOR_EVAL_OUTPUT=${RECAP_ACTOR_EVAL_OUTPUT:-rollouts/${TASK}_rgb_dp/recap/${RECAP_DATASET_LINEAGE}/${RECAP_RUN_TAG}/actor_condition1_N1}
 
 RECAP_GAMMA=${RECAP_GAMMA:-0.99}
 RECAP_CHUNK_HORIZON=${RECAP_CHUNK_HORIZON:-${CHUNK_HORIZON:-8}}
@@ -892,7 +894,7 @@ run_recap_value_train() {
     --output-dir "$RECAP_VALUE_OUTPUT_DIR" \
     --gamma "$RECAP_GAMMA" \
     --chunk-horizon "$RECAP_CHUNK_HORIZON" \
-    --epochs "${RECAP_VALUE_EPOCHS:-50}" \
+    --epochs "${RECAP_VALUE_EPOCHS:-15}" \
     --batch-size "${RECAP_VALUE_BATCH_SIZE:-100}" \
     --num-workers "${RECAP_VALUE_NUM_WORKERS:-6}" \
     --device "${DEVICE:-cuda}" \
@@ -1044,6 +1046,29 @@ case "$STAGE" in
     run_recap_actor_train
     ;;
 
+  eval_recap_actor_grid_resilient)
+    require_recap_artifact "$RECAP_ACTOR_CHECKPOINT" "actor checkpoint"
+    read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
+    "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
+      --dp-checkpoint "$RECAP_ACTOR_CHECKPOINT" \
+      --expected-task "$TASK" \
+      --output-dir "$RECAP_ACTOR_EVAL_OUTPUT" \
+      --device "${DEVICE:-cuda}" \
+      "${EVAL_GPU_ARGS[@]}" \
+      --actor-source plain_dp \
+      --n-rollouts "${N_ROLLOUTS:-50}" \
+      --horizon "$EVAL_HORIZON" \
+      --num-candidates 1 \
+      --seeds "${seed_args[@]}" \
+      --rollouts-per-chunk "${ROLLOUTS_PER_CHUNK:-25}" \
+      --inter-chunk-sleep "${EVAL_INTER_CHUNK_SLEEP:-0}" \
+      --max-retries "${EVAL_MAX_RETRIES:-5}" \
+      --execution-horizon "${EXECUTION_HORIZON:-8}" \
+      --require-success-condition-adapter \
+      --inference-success-condition 1.0 \
+      --inference-condition-mask 1.0
+    ;;
+
   eval_chunk_grid_resilient)
     require_chunk_checkpoint
     read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-4 8 12 16}"
@@ -1176,7 +1201,7 @@ case "$STAGE" in
     ;;
 
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_recap_actor_grid_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
     exit 2
     ;;
 esac
