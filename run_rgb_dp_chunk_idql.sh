@@ -377,6 +377,39 @@ if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
   fi
 fi
 
+# RECAP uses immutable sidecars and isolated model outputs. Derive the lineage
+# only after all task and round-2 overrides have resolved the final mixed HDF5.
+recap_dataset_name=${IDQL_DATASET##*/}
+RECAP_DATASET_LINEAGE=${RECAP_DATASET_LINEAGE:-${recap_dataset_name%.hdf5}}
+RECAP_RUN_TAG=${RECAP_RUN_TAG:-mc_value_advantage_v1}
+RECAP_OUTPUT_ROOT=${RECAP_OUTPUT_ROOT:-trained_models/${TASK}_rgb_dp/recap/${RECAP_DATASET_LINEAGE}/${RECAP_RUN_TAG}}
+RECAP_TARGETS=${RECAP_TARGETS:-$RECAP_OUTPUT_ROOT/targets.pt}
+RECAP_VALUE_OUTPUT_DIR=${RECAP_VALUE_OUTPUT_DIR:-$RECAP_OUTPUT_ROOT/value}
+RECAP_VALUE_CHECKPOINT=${RECAP_VALUE_CHECKPOINT:-$RECAP_VALUE_OUTPUT_DIR/best.pt}
+RECAP_LABELS=${RECAP_LABELS:-$RECAP_OUTPUT_ROOT/labels.pt}
+RECAP_ACTOR_OUTPUT_DIR=${RECAP_ACTOR_OUTPUT_DIR:-$RECAP_OUTPUT_ROOT/actor}
+
+RECAP_GAMMA=${RECAP_GAMMA:-0.99}
+RECAP_CHUNK_HORIZON=${RECAP_CHUNK_HORIZON:-${CHUNK_HORIZON:-8}}
+RECAP_TASK_HORIZON=${RECAP_TASK_HORIZON:-$TASK_EVAL_HORIZON}
+RECAP_FAILURE_PENALTY=${RECAP_FAILURE_PENALTY:-$RECAP_TASK_HORIZON}
+RECAP_RETURN_SCALE=${RECAP_RETURN_SCALE:-$((2 * RECAP_TASK_HORIZON))}
+RECAP_VALID_FRACTION=${RECAP_VALID_FRACTION:-0.1}
+RECAP_SEED=${RECAP_SEED:-${SEED:-0}}
+RECAP_THRESHOLD_MODE=${RECAP_THRESHOLD_MODE:-target_positive_fraction}
+RECAP_ADVANTAGE_THRESHOLD=${RECAP_ADVANTAGE_THRESHOLD:-0.0}
+RECAP_ROLLOUT_QUANTILE=${RECAP_ROLLOUT_QUANTILE:-0.6}
+RECAP_TARGET_POSITIVE_FRACTION=${RECAP_TARGET_POSITIVE_FRACTION:-0.4}
+RECAP_CONDITION_DROPOUT=${RECAP_CONDITION_DROPOUT:-0.3}
+RECAP_DYNAMICS_WEIGHT=${RECAP_DYNAMICS_WEIGHT:-0.0}
+RECAP_SIGREG_WEIGHT=${RECAP_SIGREG_WEIGHT:-0.0}
+RECAP_DYNAMICS_PREDICTION_OFFSETS=${RECAP_DYNAMICS_PREDICTION_OFFSETS:-"2 4 6 8"}
+RECAP_DYNAMICS_TARGET_TAU=${RECAP_DYNAMICS_TARGET_TAU:-0.01}
+RECAP_SIGREG_KNOTS=${RECAP_SIGREG_KNOTS:-17}
+RECAP_SIGREG_NUM_PROJECTIONS=${RECAP_SIGREG_NUM_PROJECTIONS:-1024}
+RECAP_VALUE_ARCHITECTURE=${RECAP_VALUE_ARCHITECTURE:-wcm_shared_temporal_v1}
+RECAP_VALUE_OBSERVATION_HORIZON=${RECAP_VALUE_OBSERVATION_HORIZON:-2}
+
 resolve_existing_chunk_checkpoint() {
   local output_dir=$1
   local requested_epoch=${CHUNK_EPOCHS:-$TASK_CHUNK_EPOCHS}
@@ -787,6 +820,112 @@ run_chunk_train() {
     --snapshot-every-epochs "${CHUNK_SNAPSHOT_EVERY_EPOCHS:-5}"
 }
 
+ensure_recap_parent_dir() {
+  local path=$1
+  local parent=${path%/*}
+  if [[ "$parent" != "$path" ]]; then
+    mkdir -p "$parent"
+  fi
+}
+
+require_recap_artifact() {
+  local path=$1
+  local description=$2
+  if [[ ! -f "$path" || ! -s "$path" ]]; then
+    echo "[rgb_dp_chunk_idql RECAP] missing $description: $path" >&2
+    exit 1
+  fi
+}
+
+prepare_recap_targets() {
+  ensure_recap_parent_dir "$RECAP_TARGETS"
+  "$PYTHON" -B scripts/train_rgb_dp_chunk_recap.py prepare-targets \
+    --dataset "$IDQL_DATASET" \
+    --output "$RECAP_TARGETS" \
+    --gamma "$RECAP_GAMMA" \
+    --chunk-horizon "$RECAP_CHUNK_HORIZON" \
+    --failure-penalty "$RECAP_FAILURE_PENALTY" \
+    --return-scale "$RECAP_RETURN_SCALE" \
+    --valid-fraction "$RECAP_VALID_FRACTION" \
+    --seed "$RECAP_SEED"
+}
+
+run_recap_value_train() {
+  require_recap_artifact "$RECAP_TARGETS" "prepared target sidecar"
+  mkdir -p "$RECAP_VALUE_OUTPUT_DIR"
+  read -r -a recap_dynamics_offset_args <<< "$RECAP_DYNAMICS_PREDICTION_OFFSETS"
+  "$PYTHON" -B scripts/train_rgb_dp_chunk_recap.py train-value \
+    --dataset "$IDQL_DATASET" \
+    --targets "$RECAP_TARGETS" \
+    --checkpoint "$DP_CHECKPOINT" \
+    --output-dir "$RECAP_VALUE_OUTPUT_DIR" \
+    --gamma "$RECAP_GAMMA" \
+    --chunk-horizon "$RECAP_CHUNK_HORIZON" \
+    --epochs "${RECAP_VALUE_EPOCHS:-50}" \
+    --batch-size "${RECAP_VALUE_BATCH_SIZE:-100}" \
+    --num-workers "${RECAP_VALUE_NUM_WORKERS:-6}" \
+    --seed "$RECAP_SEED" \
+    --value-lr "${RECAP_VALUE_LR:-1e-4}" \
+    --value-architecture "$RECAP_VALUE_ARCHITECTURE" \
+    --observation-horizon "$RECAP_VALUE_OBSERVATION_HORIZON" \
+    --late-fusion-key "$CRITIC_LATE_FUSION_KEY" \
+    --dynamics-weight "$RECAP_DYNAMICS_WEIGHT" \
+    --dynamics-prediction-offsets "${recap_dynamics_offset_args[@]}" \
+    --target-tau "$RECAP_DYNAMICS_TARGET_TAU" \
+    --sigreg-weight "$RECAP_SIGREG_WEIGHT" \
+    --sigreg-knots "$RECAP_SIGREG_KNOTS" \
+    --sigreg-num-projections "$RECAP_SIGREG_NUM_PROJECTIONS"
+}
+
+label_recap_chunks() {
+  require_recap_artifact "$RECAP_TARGETS" "prepared target sidecar"
+  require_recap_artifact "$RECAP_VALUE_CHECKPOINT" "value checkpoint"
+  ensure_recap_parent_dir "$RECAP_LABELS"
+  local -a recap_threshold_args
+  case "$RECAP_THRESHOLD_MODE" in
+    fixed)
+      recap_threshold_args=(--fixed-threshold "$RECAP_ADVANTAGE_THRESHOLD")
+      ;;
+    rollout_quantile)
+      recap_threshold_args=(--rollout-quantile "$RECAP_ROLLOUT_QUANTILE")
+      ;;
+    target_positive_fraction)
+      recap_threshold_args=(--target-positive-fraction "$RECAP_TARGET_POSITIVE_FRACTION")
+      ;;
+    *)
+      echo "[rgb_dp_chunk_idql RECAP] unsupported RECAP_THRESHOLD_MODE=$RECAP_THRESHOLD_MODE" >&2
+      exit 1
+      ;;
+  esac
+  "$PYTHON" -B scripts/label_rgb_dp_chunk_recap.py \
+    --dataset "$IDQL_DATASET" \
+    --targets "$RECAP_TARGETS" \
+    --value-checkpoint "$RECAP_VALUE_CHECKPOINT" \
+    --output "$RECAP_LABELS" \
+    --checkpoint "$DP_CHECKPOINT" \
+    --seed "$RECAP_SEED" \
+    --threshold-mode "$RECAP_THRESHOLD_MODE" \
+    "${recap_threshold_args[@]}"
+}
+
+run_recap_actor_train() {
+  require_recap_artifact "$RECAP_LABELS" "advantage-label sidecar"
+  mkdir -p "$RECAP_ACTOR_OUTPUT_DIR"
+  "$PYTHON" -B scripts/train_rgb_dp_chunk_recap.py train-actor \
+    --dataset "$IDQL_DATASET" \
+    --labels "$RECAP_LABELS" \
+    --checkpoint "$DP_CHECKPOINT" \
+    --output-dir "$RECAP_ACTOR_OUTPUT_DIR" \
+    --epochs "${RECAP_ACTOR_EPOCHS:-50}" \
+    --batch-size "${RECAP_ACTOR_BATCH_SIZE:-100}" \
+    --num-workers "${RECAP_ACTOR_NUM_WORKERS:-6}" \
+    --seed "$RECAP_SEED" \
+    --condition-dropout "$RECAP_CONDITION_DROPOUT" \
+    --actor-adapter-lr "${RECAP_ACTOR_ADAPTER_LR:-1e-4}" \
+    --actor-unet-lr "${RECAP_ACTOR_UNET_LR:-1e-4}" \
+    --actor-obs-encoder-lr "${RECAP_ACTOR_OBS_ENCODER_LR:-1e-4}"
+}
+
 case "$STAGE" in
   build_dataset)
     build_dataset
@@ -834,6 +973,35 @@ case "$STAGE" in
     done
     echo "[rgb_dp_chunk_idql] exhausted $max_restarts attempts" >&2
     exit 1
+    ;;
+
+  prepare_recap_targets)
+    ensure_dataset
+    prepare_recap_targets
+    ;;
+
+  train_recap_value)
+    ensure_dataset
+    run_recap_value_train
+    ;;
+
+  label_recap)
+    ensure_dataset
+    label_recap_chunks
+    ;;
+
+  train_recap_actor)
+    ensure_dataset
+    run_recap_actor_train
+    ;;
+
+  train_recap_all)
+    ensure_dataset
+    prepare_recap_targets
+    run_recap_value_train
+    require_recap_artifact "$RECAP_VALUE_CHECKPOINT" "value checkpoint"
+    label_recap_chunks
+    run_recap_actor_train
     ;;
 
   eval_chunk_grid_resilient)
@@ -968,7 +1136,7 @@ case "$STAGE" in
     ;;
 
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
     exit 2
     ;;
 esac
