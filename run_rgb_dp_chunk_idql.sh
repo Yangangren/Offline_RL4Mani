@@ -409,6 +409,10 @@ RECAP_SIGREG_KNOTS=${RECAP_SIGREG_KNOTS:-17}
 RECAP_SIGREG_NUM_PROJECTIONS=${RECAP_SIGREG_NUM_PROJECTIONS:-1024}
 RECAP_VALUE_ARCHITECTURE=${RECAP_VALUE_ARCHITECTURE:-wcm_shared_temporal_v1}
 RECAP_VALUE_OBSERVATION_HORIZON=${RECAP_VALUE_OBSERVATION_HORIZON:-2}
+RECAP_NUM_GPUS=${RECAP_NUM_GPUS:-1}
+RECAP_DISTRIBUTED_BACKEND=${RECAP_DISTRIBUTED_BACKEND:-auto}
+RECAP_GRADIENT_BUCKET_CAP_MB=${RECAP_GRADIENT_BUCKET_CAP_MB:-100}
+RECAP_ACTOR_SCHEDULE_REFERENCE_BATCH_SIZE=${RECAP_ACTOR_SCHEDULE_REFERENCE_BATCH_SIZE:-100}
 
 resolve_existing_chunk_checkpoint() {
   local output_dir=$1
@@ -837,6 +841,32 @@ require_recap_artifact() {
   fi
 }
 
+run_recap_training_command() {
+  local phase=$1
+  local per_rank_batch_size=$2
+  shift 2
+
+  if ! [[ "$RECAP_NUM_GPUS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[rgb_dp_chunk_idql RECAP] RECAP_NUM_GPUS must be a positive integer; got $RECAP_NUM_GPUS" >&2
+    return 2
+  fi
+  if (( RECAP_NUM_GPUS > 1 )); then
+    if [[ "${DEVICE:-cuda}" != "cuda" ]]; then
+      echo "[rgb_dp_chunk_idql RECAP] RECAP_NUM_GPUS>1 requires DEVICE=cuda." >&2
+      return 2
+    fi
+    export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
+    echo "[rgb_dp_chunk_idql RECAP] distributed $phase training: GPUs=$RECAP_NUM_GPUS per-rank-batch=$per_rank_batch_size" >&2
+    "$PYTHON" -B -m torch.distributed.run \
+      --standalone \
+      --nnodes=1 \
+      "--nproc-per-node=$RECAP_NUM_GPUS" \
+      "$@"
+  else
+    "$PYTHON" -B "$@"
+  fi
+}
+
 prepare_recap_targets() {
   ensure_recap_parent_dir "$RECAP_TARGETS"
   "$PYTHON" -B scripts/train_rgb_dp_chunk_recap.py prepare-targets \
@@ -854,7 +884,8 @@ run_recap_value_train() {
   require_recap_artifact "$RECAP_TARGETS" "prepared target sidecar"
   mkdir -p "$RECAP_VALUE_OUTPUT_DIR"
   read -r -a recap_dynamics_offset_args <<< "$RECAP_DYNAMICS_PREDICTION_OFFSETS"
-  "$PYTHON" -B scripts/train_rgb_dp_chunk_recap.py train-value \
+  run_recap_training_command value "${RECAP_VALUE_BATCH_SIZE:-100}" \
+    scripts/train_rgb_dp_chunk_recap.py train-value \
     --dataset "$IDQL_DATASET" \
     --targets "$RECAP_TARGETS" \
     --checkpoint "$DP_CHECKPOINT" \
@@ -864,7 +895,10 @@ run_recap_value_train() {
     --epochs "${RECAP_VALUE_EPOCHS:-50}" \
     --batch-size "${RECAP_VALUE_BATCH_SIZE:-100}" \
     --num-workers "${RECAP_VALUE_NUM_WORKERS:-6}" \
+    --device "${DEVICE:-cuda}" \
     --seed "$RECAP_SEED" \
+    --distributed-backend "$RECAP_DISTRIBUTED_BACKEND" \
+    --gradient-bucket-cap-mb "$RECAP_GRADIENT_BUCKET_CAP_MB" \
     --value-lr "${RECAP_VALUE_LR:-1e-4}" \
     --value-architecture "$RECAP_VALUE_ARCHITECTURE" \
     --observation-horizon "$RECAP_VALUE_OBSERVATION_HORIZON" \
@@ -903,6 +937,7 @@ label_recap_chunks() {
     --value-checkpoint "$RECAP_VALUE_CHECKPOINT" \
     --output "$RECAP_LABELS" \
     --checkpoint "$DP_CHECKPOINT" \
+    --device "${DEVICE:-cuda}" \
     --seed "$RECAP_SEED" \
     --threshold-mode "$RECAP_THRESHOLD_MODE" \
     "${recap_threshold_args[@]}"
@@ -911,7 +946,8 @@ label_recap_chunks() {
 run_recap_actor_train() {
   require_recap_artifact "$RECAP_LABELS" "advantage-label sidecar"
   mkdir -p "$RECAP_ACTOR_OUTPUT_DIR"
-  "$PYTHON" -B scripts/train_rgb_dp_chunk_recap.py train-actor \
+  run_recap_training_command actor "${RECAP_ACTOR_BATCH_SIZE:-100}" \
+    scripts/train_rgb_dp_chunk_recap.py train-actor \
     --dataset "$IDQL_DATASET" \
     --labels "$RECAP_LABELS" \
     --checkpoint "$DP_CHECKPOINT" \
@@ -919,7 +955,11 @@ run_recap_actor_train() {
     --epochs "${RECAP_ACTOR_EPOCHS:-50}" \
     --batch-size "${RECAP_ACTOR_BATCH_SIZE:-100}" \
     --num-workers "${RECAP_ACTOR_NUM_WORKERS:-6}" \
+    --device "${DEVICE:-cuda}" \
     --seed "$RECAP_SEED" \
+    --distributed-backend "$RECAP_DISTRIBUTED_BACKEND" \
+    --gradient-bucket-cap-mb "$RECAP_GRADIENT_BUCKET_CAP_MB" \
+    --schedule-reference-batch-size "$RECAP_ACTOR_SCHEDULE_REFERENCE_BATCH_SIZE" \
     --condition-dropout "$RECAP_CONDITION_DROPOUT" \
     --actor-adapter-lr "${RECAP_ACTOR_ADAPTER_LR:-1e-4}" \
     --actor-unet-lr "${RECAP_ACTOR_UNET_LR:-1e-4}" \

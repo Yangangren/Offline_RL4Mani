@@ -20,6 +20,7 @@ from typing import Any
 import h5py
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 import robomimic.utils.file_utils as FileUtils
@@ -27,6 +28,16 @@ import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.train_utils as TrainUtils
 
 from rgb_dp_chunk_recap import build_canonical_episode_targets
+from rgb_dp_distributed import (
+    DistributedContext,
+    all_reduce_gradients,
+    broadcast_module_buffers,
+    broadcast_module_state,
+    initialize_distributed,
+    mean_distributed_scalars,
+    modules_have_mutable_batch_norm,
+    seed_process,
+)
 from train_rgb_dp_chunk_idql import (
     WCM_CRITIC_ARCHITECTURE,
     add_actor_condition,
@@ -48,9 +59,9 @@ from train_rgb_dp_idql import (
     actor_train_step,
     atomic_torch_save,
     build_single_loader,
+    configure_batch_semantics as configure_actor_batch_semantics,
     initialize_actor_from_deployed_ema,
     jsonable,
-    mean_metrics,
 )
 
 
@@ -382,8 +393,10 @@ def _loader_namespace(
         chunk_horizon=int(args.chunk_horizon),
         critic_observation_horizon=int(getattr(args, "observation_horizon", 1)),
         dynamics_prediction_offsets=tuple(dynamics_prediction_offsets),
-        distributed_world_size=1,
-        distributed_rank=0,
+        distributed_world_size=int(
+            getattr(args, "distributed_world_size", 1)
+        ),
+        distributed_rank=int(getattr(args, "distributed_rank", 0)),
         seed=int(args.seed),
         prefetch_factor=int(args.prefetch_factor),
         persistent_workers=bool(args.persistent_workers),
@@ -415,8 +428,32 @@ def build_recap_dataset(
     return dataset, generator, config
 
 
-def make_loader(dataset, args: argparse.Namespace, *, shuffle: bool):
-    generator = torch.Generator().manual_seed(int(args.seed))
+def make_loader(
+    dataset,
+    args: argparse.Namespace,
+    *,
+    shuffle: bool,
+    distributed_context: DistributedContext | None = None,
+    indices: torch.Tensor | list[int] | None = None,
+):
+    if indices is not None:
+        indices = torch.as_tensor(indices, dtype=torch.long).reshape(-1).tolist()
+        dataset = torch.utils.data.Subset(dataset, indices)
+    distributed_enabled = bool(
+        distributed_context is not None and distributed_context.enabled
+    )
+    rank = int(distributed_context.rank) if distributed_enabled else 0
+    sampler = None
+    if distributed_enabled:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=int(distributed_context.world_size),
+            rank=rank,
+            shuffle=bool(shuffle),
+            seed=int(args.seed),
+            drop_last=False,
+        )
+    generator = torch.Generator().manual_seed(int(args.seed) + rank)
     kwargs: dict[str, Any] = {}
     if int(args.num_workers) > 0:
         kwargs["prefetch_factor"] = int(args.prefetch_factor)
@@ -424,13 +461,113 @@ def make_loader(dataset, args: argparse.Namespace, *, shuffle: bool):
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=int(args.batch_size),
-        shuffle=bool(shuffle),
+        shuffle=bool(shuffle and sampler is None),
+        sampler=sampler,
         drop_last=False,
         num_workers=int(args.num_workers),
         pin_memory=bool(args.pin_memory and str(args.device) == "cuda"),
         generator=generator,
         **kwargs,
     )
+
+
+def value_split_indices(
+    targets: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return stable global indices for MC training and validation rows."""
+    value_valid = torch.as_tensor(targets["fields"]["value_valid"]).bool()
+    is_validation = torch.as_tensor(targets["fields"]["is_validation"]).bool()
+    if value_valid.ndim != 1 or is_validation.shape != value_valid.shape:
+        raise ValueError("value-valid and validation sidecar fields must be 1-D peers")
+    train_indices = torch.nonzero(
+        value_valid & ~is_validation, as_tuple=False
+    ).reshape(-1)
+    validation_indices = torch.nonzero(
+        value_valid & is_validation, as_tuple=False
+    ).reshape(-1)
+    if train_indices.numel() == 0:
+        raise ValueError("RECAP target sidecar contains no MC-value training rows")
+    return train_indices, validation_indices
+
+
+def _initialize_training_context(
+    args: argparse.Namespace,
+) -> DistributedContext:
+    if float(args.gradient_bucket_cap_mb) <= 0.0:
+        raise ValueError("gradient_bucket_cap_mb must be positive")
+    context = initialize_distributed(args)
+    args.distributed = bool(context.enabled)
+    args.distributed_rank = int(context.rank)
+    args.distributed_local_rank = int(context.local_rank)
+    args.distributed_world_size = int(context.world_size)
+    args.effective_global_batch_size = int(args.batch_size) * int(
+        context.world_size
+    )
+    return context
+
+
+def _distributed_metadata(
+    args: argparse.Namespace,
+    context: DistributedContext,
+) -> dict[str, Any]:
+    metadata = {
+        "enabled": bool(context.enabled),
+        "world_size": int(context.world_size),
+        "backend": str(context.backend),
+        "launcher": "torchrun" if context.enabled else "python",
+        "sampler": (
+            "DistributedSampler" if context.enabled else "RandomSampler"
+        ),
+        "gradient_sync": (
+            "bounded_async_bucketed_mean_all_reduce"
+            if context.enabled
+            else "none"
+        ),
+        "gradient_bucket_cap_mb": float(args.gradient_bucket_cap_mb),
+        "batch_size_control": "per_rank",
+        "batch_size_per_rank": int(args.batch_size),
+        "effective_global_batch_size": int(args.effective_global_batch_size),
+        "num_workers_per_rank": int(args.num_workers),
+        "learning_rates_automatically_scaled": False,
+        "rank_zero_writes_only": True,
+    }
+    if hasattr(args, "schedule_reference_batch_size"):
+        metadata["schedule_reference_batch_size"] = int(
+            args.schedule_reference_batch_size
+        )
+        metadata["lr_warmup_steps"] = int(args.lr_warmup_steps)
+        metadata["resolved_lr_warmup_steps"] = int(
+            args.resolved_lr_warmup_steps
+        )
+    return metadata
+
+
+def _mean_scalar_records(
+    records: list[dict[str, Any]],
+) -> dict[str, float | torch.Tensor]:
+    """Average detached scalars without forcing per-step CUDA synchronization."""
+    keys = sorted({key for record in records for key in record})
+    means: dict[str, float | torch.Tensor] = {}
+    for key in keys:
+        values = [record[key] for record in records if key in record]
+        tensor_value = next(
+            (value for value in values if isinstance(value, torch.Tensor)),
+            None,
+        )
+        if tensor_value is None:
+            means[key] = float(np.mean(values))
+            continue
+        device = tensor_value.device
+        tensors = [
+            (
+                value.detach().reshape(()).to(device=device, dtype=torch.float32)
+                if isinstance(value, torch.Tensor)
+                else torch.as_tensor(value, device=device, dtype=torch.float32)
+            )
+            for value in values
+        ]
+        means[key] = torch.stack(tensors).mean()
+    return means
 
 
 def _architecture_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -481,6 +618,7 @@ def compute_mc_value_loss(
     sigreg_knots: int,
     sigreg_num_projections: int,
     global_step: int,
+    distributed_context: DistributedContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute MC MSE plus auxiliaries, without touching either Q path."""
     state = system.encode_state(batch["obs"], batch.get("goal_obs"))
@@ -518,6 +656,7 @@ def compute_mc_value_loss(
             target_latent,
             dynamics_mask,
             state["current_frame_latent"],
+            distributed_context=distributed_context,
         )
         total = total + float(dynamics_weight) * dynamics_loss
         info["loss/dynamics"] = dynamics_loss.detach()
@@ -531,6 +670,7 @@ def compute_mc_value_loss(
             knots=int(sigreg_knots),
             num_projections=int(sigreg_num_projections),
             seed=int(global_step),
+            distributed_context=distributed_context,
         )
         total = total + float(sigreg_weight) * regularizer
         info["loss/sigreg"] = regularizer.detach()
@@ -598,6 +738,7 @@ def _value_checkpoint_payload(
     args: argparse.Namespace,
     system,
     *,
+    distributed_context: DistributedContext,
     dp_checkpoint: dict[str, Any],
     epoch: int,
     global_step: int,
@@ -660,6 +801,9 @@ def _value_checkpoint_payload(
         "critic_q_use_predicted_next_latent": False,
         "critic_q_head_inputs": architecture_q_head_inputs(WCM_CRITIC_ARCHITECTURE),
         "dynamics_prediction_consumed_by_q": False,
+        "distributed_training": _distributed_metadata(
+            args, distributed_context
+        ),
     }
 
 
@@ -715,6 +859,34 @@ def evaluate_value(
     }
 
 
+def _broadcast_validation_metrics(
+    validation: dict[str, float] | None,
+    context: DistributedContext,
+) -> dict[str, float]:
+    if not context.enabled:
+        if validation is None:
+            raise ValueError("serial validation metrics are missing")
+        return validation
+    if context.is_main_process:
+        if validation is None:
+            raise ValueError("rank zero validation metrics are missing")
+        values = (
+            float(validation["validation_mse"]),
+            float(validation["validation_mae"]),
+            float(validation["validation_rows"]),
+        )
+    else:
+        values = (float("nan"), float("nan"), 0.0)
+    tensor = torch.tensor(values, dtype=torch.float64, device=context.device)
+    dist.broadcast(tensor, src=0)
+    host = tensor.cpu().tolist()
+    return {
+        "validation_mse": float(host[0]),
+        "validation_mae": float(host[1]),
+        "validation_rows": int(host[2]),
+    }
+
+
 def train_value(args: argparse.Namespace) -> dict[str, Any]:
     args.dataset = args.dataset.expanduser().resolve()
     args.targets = args.targets.expanduser().resolve()
@@ -765,9 +937,15 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("dynamics offsets must be sorted, unique, nonempty, and <= chunk horizon")
     args.dynamics_prediction_offsets = offsets
 
-    _seed_everything(args.seed)
-    device = _resolve_device(args.device)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    distributed = _initialize_training_context(args)
+    device = distributed.device
+    if distributed.is_main_process:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed.enabled:
+        dist.barrier()
+    # All ranks construct the same initial model before switching to
+    # rank-specific stochastic training streams.
+    seed_process(args.seed, device)
     actor_policy, dp_checkpoint = FileUtils.policy_from_checkpoint(
         ckpt_path=str(args.checkpoint), device=device, verbose=False
     )
@@ -799,8 +977,24 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(
             f"dataset length={len(dataset)} differs from target rows={targets['num_samples']}"
         )
-    train_loader = make_loader(dataset, args, shuffle=True)
-    validation_loader = make_loader(dataset, args, shuffle=False)
+    train_indices, validation_indices = value_split_indices(targets)
+    train_loader = make_loader(
+        dataset,
+        args,
+        shuffle=True,
+        distributed_context=distributed,
+        indices=train_indices,
+    )
+    validation_loader = (
+        make_loader(
+            dataset,
+            args,
+            shuffle=False,
+            indices=validation_indices,
+        )
+        if distributed.is_main_process
+        else None
+    )
     obs_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
 
     system, target_system = make_wcm_chunk_value_system(
@@ -819,11 +1013,17 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
     optimizer = torch.optim.AdamW(
         trainable, lr=float(args.value_lr), weight_decay=float(args.weight_decay)
     )
+    broadcast_module_state([system, target_system], distributed)
+    synchronize_training_buffers = modules_have_mutable_batch_norm([system])
+    if distributed.enabled:
+        seed_process(int(args.seed) + int(distributed.rank), device)
 
     global_step = 0
     history: list[dict[str, Any]] = []
     best_validation_mse: float | None = None
     for epoch in range(1, int(args.epochs) + 1):
+        if distributed.enabled and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch)
         system.train()
         records: list[dict[str, float]] = []
         for batch_index, raw_batch in enumerate(train_loader):
@@ -849,8 +1049,13 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
                 indices,
                 dynamics_offsets=active_offsets,
             )
-            if not torch.any(train_mask):
-                continue
+            if not torch.all(train_mask):
+                raise RuntimeError(
+                    "the distributed MC-value training subset contains an "
+                    "invalid or validation row"
+                )
+            if synchronize_training_buffers:
+                broadcast_module_buffers([system], distributed)
             optimizer.zero_grad(set_to_none=True)
             loss, info = compute_mc_value_loss(
                 system,
@@ -863,8 +1068,14 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
                 sigreg_knots=int(args.sigreg_knots),
                 sigreg_num_projections=int(args.sigreg_num_projections),
                 global_step=global_step,
+                distributed_context=distributed,
             )
             loss.backward()
+            all_reduce_gradients(
+                trainable,
+                distributed,
+                bucket_cap_mb=float(args.gradient_bucket_cap_mb),
+            )
             if float(args.max_gradient_norm) > 0.0:
                 torch.nn.utils.clip_grad_norm_(trainable, float(args.max_gradient_norm))
             optimizer.step()
@@ -879,20 +1090,39 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError("a Q action encoder received gradients during MC-value training")
             records.append(
                 {
-                    key: float(value.detach().cpu().item())
+                    key: (
+                        value.detach()
+                        if isinstance(value, torch.Tensor)
+                        else float(value)
+                    )
                     for key, value in info.items()
                     if torch.as_tensor(value).numel() == 1
                 }
             )
             global_step += 1
 
-        validation = evaluate_value(
-            system, validation_loader, actor_algo, obs_stats, targets, args
+        train_metrics = mean_distributed_scalars(
+            _mean_scalar_records(records), distributed
+        )
+        local_validation = (
+            evaluate_value(
+                system,
+                validation_loader,
+                actor_algo,
+                obs_stats,
+                targets,
+                args,
+            )
+            if distributed.is_main_process
+            else None
+        )
+        validation = _broadcast_validation_metrics(
+            local_validation, distributed
         )
         epoch_record = {
             "epoch": epoch,
             "global_step": global_step,
-            **mean_metrics(records),
+            **train_metrics,
             **validation,
         }
         history.append(epoch_record)
@@ -902,22 +1132,27 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
         )
         if improved:
             best_validation_mse = validation_mse
-        payload = _value_checkpoint_payload(
-            args,
-            system,
-            dp_checkpoint=dp_checkpoint,
-            epoch=epoch,
-            global_step=global_step,
-            best_validation_mse=best_validation_mse,
-            history=history,
-        )
-        atomic_torch_save(payload, args.output_dir / "last.pt")
-        # With a deliberately zero validation fraction, retain a deterministic
-        # first-epoch fallback so the staged launcher still has a labelable
-        # checkpoint. Any later finite validation improvement replaces it.
-        if improved or (epoch == 1 and best_validation_mse is None):
-            atomic_torch_save(payload, args.output_dir / "best.pt")
-        print(json.dumps(jsonable(epoch_record), indent=2), flush=True)
+        if distributed.is_main_process:
+            payload = _value_checkpoint_payload(
+                args,
+                system,
+                distributed_context=distributed,
+                dp_checkpoint=dp_checkpoint,
+                epoch=epoch,
+                global_step=global_step,
+                best_validation_mse=best_validation_mse,
+                history=history,
+            )
+            atomic_torch_save(payload, args.output_dir / "last.pt")
+            # With a deliberately zero validation fraction, retain a
+            # deterministic first-epoch fallback so the staged launcher still
+            # has a labelable checkpoint. Any later finite validation
+            # improvement replaces it.
+            if improved or (epoch == 1 and best_validation_mse is None):
+                atomic_torch_save(payload, args.output_dir / "best.pt")
+            print(json.dumps(jsonable(epoch_record), indent=2), flush=True)
+        if distributed.enabled:
+            dist.barrier()
 
     summary = {
         "kind": VALUE_FORMAT,
@@ -931,10 +1166,14 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
         "encoder_initialization": encoder_audit,
         "dynamics_enabled": float(args.dynamics_weight) > 0.0,
         "sigreg_enabled": float(args.sigreg_weight) > 0.0,
+        "distributed_training": _distributed_metadata(args, distributed),
         "history": history,
     }
-    atomic_write_json(args.output_dir / "summary.json", summary)
-    return summary
+    if distributed.is_main_process:
+        atomic_write_json(args.output_dir / "summary.json", summary)
+    if distributed.enabled:
+        dist.barrier()
+    return summary if distributed.is_main_process else {}
 
 
 def _save_recap_actor_checkpoint(
@@ -943,6 +1182,8 @@ def _save_recap_actor_checkpoint(
     actor_config,
     dp_checkpoint: dict[str, Any],
     *,
+    args: argparse.Namespace,
+    distributed_context: DistributedContext,
     epoch: int,
     global_step: int,
     labels: Path,
@@ -959,6 +1200,9 @@ def _save_recap_actor_checkpoint(
         "inference_success_condition": 1.0,
         "inference_success_condition_mask": 1.0,
         "positive_only": False,
+        "distributed_training": _distributed_metadata(
+            args, distributed_context
+        ),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_config = copy.deepcopy(actor_config)
@@ -1003,9 +1247,16 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
     if not torch.all(conditions[source_is_expert] == 1):
         raise ValueError("all human demonstration conditions must equal one")
 
-    _seed_everything(args.seed)
-    device = _resolve_device(args.device)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    distributed = _initialize_training_context(args)
+    configure_actor_batch_semantics(args, distributed.world_size)
+    device = distributed.device
+    if distributed.is_main_process:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed.enabled:
+        dist.barrier()
+    # Keep model initialization identical on every rank. Independent rank
+    # streams are installed after the initial state broadcast below.
+    seed_process(args.seed, device)
     actor_policy, dp_checkpoint = FileUtils.policy_from_checkpoint(
         ckpt_path=str(args.checkpoint), device=device, verbose=False
     )
@@ -1015,7 +1266,7 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("failed to initialize RECAP actor from deployed EMA")
     if not actor_matches_deployed_ema(actor_algo):
         raise RuntimeError("trainable actor differs from the deployed DP EMA")
-    if actor_algo.reference_policy_enabled:
+    if actor_algo.reference_policy_enabled or actor_algo.hazard_constraint_enabled:
         raise RuntimeError("RECAP actor training requires reference/hazard objectives disabled")
     condition_args = SimpleNamespace(
         conditioned_actor=True,
@@ -1043,7 +1294,12 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(
             f"dataset length={len(dataset)} differs from label rows={labels['num_samples']}"
         )
-    loader = make_loader(dataset, args, shuffle=True)
+    loader = make_loader(
+        dataset,
+        args,
+        shuffle=True,
+        distributed_context=distributed,
+    )
     updates_per_epoch = len(loader)
     if args.steps_per_epoch is not None:
         updates_per_epoch = min(updates_per_epoch, int(args.steps_per_epoch))
@@ -1054,14 +1310,36 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
         unet_lr=float(args.actor_unet_lr),
         obs_encoder_lr=float(args.actor_obs_encoder_lr),
         scheduler_type=str(args.lr_scheduler),
-        warmup_steps=int(args.lr_warmup_steps),
+        warmup_steps=int(args.resolved_lr_warmup_steps),
         total_steps=total_steps,
         num_cycles=float(args.lr_num_cycles),
     )
+    synchronized_modules = [actor_algo.nets]
+    if actor_algo.ema is not None:
+        synchronized_modules.append(actor_algo.ema.averaged_model)
+    broadcast_module_state(synchronized_modules, distributed)
+    synchronize_training_buffers = modules_have_mutable_batch_norm(
+        [actor_algo.nets]
+    )
+    actor_algo.gradient_sync_fn = (
+        (
+            lambda parameters: all_reduce_gradients(
+                parameters,
+                distributed,
+                bucket_cap_mb=float(args.gradient_bucket_cap_mb),
+            )
+        )
+        if distributed.enabled
+        else None
+    )
+    if distributed.enabled:
+        seed_process(int(args.seed) + int(distributed.rank), device)
     obs_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
     global_step = 0
     history: list[dict[str, Any]] = []
     for epoch in range(1, int(args.epochs) + 1):
+        if distributed.enabled and hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)
         actor_algo.set_train()
         records: list[dict[str, float]] = []
         for batch_index, raw_batch in enumerate(loader):
@@ -1079,35 +1357,45 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
             if not torch.all(batch_conditions[batch_expert.bool()] == 1):
                 raise RuntimeError("human condition invariant failed in actor batch")
             raw_batch = add_actor_condition(raw_batch, batch_conditions.float())
+            if synchronize_training_buffers:
+                broadcast_module_buffers([actor_algo.nets], distributed)
             record = actor_train_step(
                 actor_algo,
                 raw_batch,
                 epoch,
                 obs_stats,
-                defer_scalar_conversion=False,
+                defer_scalar_conversion=True,
             )
-            records.append({key: float(value) for key, value in record.items()})
+            records.append(record)
             global_step += 1
+        actor_metrics = mean_distributed_scalars(
+            _mean_scalar_records(records), distributed
+        )
         epoch_record = {
             "epoch": epoch,
             "global_step": global_step,
-            **mean_metrics(records),
+            **actor_metrics,
             "condition/positive_fraction": float(conditions.float().mean().item()),
             "condition/dropout": float(args.condition_dropout),
         }
         history.append(epoch_record)
-        _save_recap_actor_checkpoint(
-            args.output_dir / "last.pth",
-            actor_algo,
-            actor_config,
-            dp_checkpoint,
-            epoch=epoch,
-            global_step=global_step,
-            labels=args.labels,
-            condition_dropout=float(args.condition_dropout),
-            obs_normalization_stats=obs_stats,
-        )
-        print(json.dumps(jsonable(epoch_record), indent=2), flush=True)
+        if distributed.is_main_process:
+            _save_recap_actor_checkpoint(
+                args.output_dir / "last.pth",
+                actor_algo,
+                actor_config,
+                dp_checkpoint,
+                args=args,
+                distributed_context=distributed,
+                epoch=epoch,
+                global_step=global_step,
+                labels=args.labels,
+                condition_dropout=float(args.condition_dropout),
+                obs_normalization_stats=obs_stats,
+            )
+            print(json.dumps(jsonable(epoch_record), indent=2), flush=True)
+        if distributed.enabled:
+            dist.barrier()
 
     summary = {
         "kind": "rgb_dp_chunk_recap_actor_v1",
@@ -1119,10 +1407,14 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
         "condition_zero_rows_trained": True,
         "condition_dropout": float(args.condition_dropout),
         "inference_condition": {"success_condition": 1.0, "condition_mask": 1.0},
+        "distributed_training": _distributed_metadata(args, distributed),
         "history": history,
     }
-    atomic_write_json(args.output_dir / "summary.json", summary)
-    return summary
+    if distributed.is_main_process:
+        atomic_write_json(args.output_dir / "summary.json", summary)
+    if distributed.enabled:
+        dist.barrier()
+    return summary if distributed.is_main_process else {}
 
 
 def _add_loader_args(parser: argparse.ArgumentParser) -> None:
@@ -1138,6 +1430,35 @@ def _add_loader_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--seed", type=int, default=0)
+
+
+def _add_distributed_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--distributed",
+        action="store_true",
+        help=(
+            "Enable torchrun data-parallel training. WORLD_SIZE>1 enables "
+            "this automatically."
+        ),
+    )
+    parser.add_argument(
+        "--distributed-backend",
+        choices=("auto", "nccl", "gloo"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--gradient-bucket-cap-mb",
+        type=float,
+        default=100.0,
+        help="Maximum flat gradient all-reduce bucket size in MiB.",
+    )
+    parser.add_argument(
+        "--local-rank",
+        "--local_rank",
+        type=int,
+        default=None,
+        help="Local process rank supplied by torchrun; the environment wins.",
+    )
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -1197,6 +1518,7 @@ def make_parser() -> argparse.ArgumentParser:
         "--sparse-chunk-loader", action=argparse.BooleanOptionalAction, default=True
     )
     _add_loader_args(value)
+    _add_distributed_args(value)
     value.set_defaults(handler=train_value)
 
     actor = subparsers.add_parser("train-actor")
@@ -1212,9 +1534,21 @@ def make_parser() -> argparse.ArgumentParser:
     actor.add_argument("--actor-unet-lr", type=float, default=1e-4)
     actor.add_argument("--actor-obs-encoder-lr", type=float, default=1e-5)
     actor.add_argument("--lr-scheduler", choices=("constant", "cosine"), default="cosine")
-    actor.add_argument("--lr-warmup-steps", type=int, default=500)
+    actor.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=500,
+        help="Warmup steps expressed at --schedule-reference-batch-size.",
+    )
+    actor.add_argument(
+        "--schedule-reference-batch-size",
+        type=int,
+        default=100,
+        help="Reference global batch for sample-scaled actor warmup.",
+    )
     actor.add_argument("--lr-num-cycles", type=float, default=0.5)
     _add_loader_args(actor)
+    _add_distributed_args(actor)
     actor.set_defaults(handler=train_actor)
     return parser
 
@@ -1228,6 +1562,9 @@ def main() -> None:
         args.handler(args)
     except (ValueError, FileNotFoundError, FileExistsError, KeyError) as exc:
         parser.error(str(exc))
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
