@@ -35,9 +35,11 @@ from train_square_rgb_dp_one_step_idql import ChunkIQLCritic, OneStepDiffusionAc
 from train_rgb_dp_chunk_idql import (
     LEGACY_CRITIC_ARCHITECTURE,
     PREDICTED_NEXT_Q_NORMALIZATION,
+    RISE_V2_CRITIC_ARCHITECTURE,
     WCM_CRITIC_ARCHITECTURE,
+    architecture_q_head_inputs,
     checkpoint_critic_architecture,
-    critic_q_head_inputs,
+    make_rise_v2_system_from_checkpoint,
     make_wcm_system_from_checkpoint,
     make_rise_chunk_value_networks,
     match_encoder_normalization_to_checkpoint,
@@ -780,6 +782,7 @@ class RiseStyleRGBIDQLPolicy:
         self.vf = vf
         self.wcm_q_system = wcm_q_system
         self.wcm_value_system = wcm_value_system
+        self.critic_architecture = checkpoint_critic_architecture(checkpoint)
         if (self.wcm_q_system is None) != (self.wcm_value_system is None):
             raise ValueError("WCM evaluation requires both Q and value systems")
         self.checkpoint = checkpoint
@@ -963,6 +966,40 @@ class RiseStyleRGBIDQLPolicy:
                 v = self.wcm_value_system.value_from_state(
                     value_state
                 ).reshape(())
+            elif self.critic_architecture == RISE_V2_CRITIC_ARCHITECTURE:
+                if normalized_trajectories.shape[1] < self.critic_chunk_horizon:
+                    raise ValueError(
+                        "actor proposal is shorter than RISE-v2 chunk horizon: "
+                        f"proposal={normalized_trajectories.shape[1]}, "
+                        f"critic={self.critic_chunk_horizon}"
+                    )
+                critic_actions = normalized_trajectories[
+                    :, : self.critic_chunk_horizon
+                ]
+                action_mask = torch.ones(
+                    critic_actions.shape[:2],
+                    device=critic_actions.device,
+                    dtype=critic_actions.dtype,
+                )
+                q_predictions = []
+                for critic in self.critics:
+                    # Each independent RISE critic encodes the observation once;
+                    # only its compact temporal state is expanded across N actor
+                    # proposals. This keeps reranking cost independent of N for RGB.
+                    state = critic.encode_state(current_obs, None)
+                    q_predictions.append(
+                        critic.q_from_state(
+                            state,
+                            critic_actions,
+                            action_mask,
+                        )
+                    )
+                q = torch.cat(q_predictions, dim=1).min(dim=1).values
+                v = (
+                    self.vf(obs_dict=current_obs, goal_dict=None).reshape(())
+                    if self.vf is not None
+                    else q.new_zeros(())
+                )
             else:
                 obs_batch = repeat_obs(current_obs, self.num_candidates)
                 if self.critic_chunk_horizon == 1:
@@ -1562,6 +1599,7 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
         critic_architecture = checkpoint_critic_architecture(checkpoint)
         if critic_architecture not in (
             LEGACY_CRITIC_ARCHITECTURE,
+            RISE_V2_CRITIC_ARCHITECTURE,
             WCM_CRITIC_ARCHITECTURE,
         ):
             raise ValueError(
@@ -1579,8 +1617,9 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
                         False,
                     )
                 )
-                expected_q_inputs = critic_q_head_inputs(
-                    q_uses_predicted_next
+                expected_q_inputs = architecture_q_head_inputs(
+                    critic_architecture,
+                    q_uses_predicted_next,
                 )
                 saved_q_inputs = tuple(
                     checkpoint.get(
@@ -1604,37 +1643,46 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
                         "chunk checkpoint uses an unsupported predicted-next "
                         "Q normalization"
                     )
-                critics, critic_targets, vf = make_rise_chunk_value_networks(
-                    dp_policy.policy,
-                    chunk_horizon=int(checkpoint["critic_chunk_horizon"]),
-                    hidden_dims=tuple(
+                common_chunk_kwargs = {
+                    "chunk_horizon": int(checkpoint["critic_chunk_horizon"]),
+                    "hidden_dims": tuple(
                         int(value) for value in checkpoint["critic_hidden_dims"]
                     ),
-                    latent_dim=int(checkpoint.get("critic_latent_dim", 300)),
-                    action_hidden_dim=int(
+                    "latent_dim": int(checkpoint.get("critic_latent_dim", 300)),
+                    "action_hidden_dim": int(
                         checkpoint.get("critic_action_hidden_dim", 128)
                     ),
-                    num_attention_heads=int(
+                    "num_attention_heads": int(
                         checkpoint.get("critic_num_attention_heads", 4)
                     ),
-                    num_action_conv_layers=int(
+                    "num_action_conv_layers": int(
                         checkpoint.get("critic_num_action_conv_layers", 2)
                     ),
-                    dropout=float(checkpoint.get("critic_dropout", 0.0)),
-                    num_critics=int(checkpoint.get("num_critics", 2)),
-                    critic_group_norm=bool(
+                    "dropout": float(checkpoint.get("critic_dropout", 0.0)),
+                    "num_critics": int(checkpoint.get("num_critics", 2)),
+                    "critic_group_norm": bool(
                         checkpoint.get("critic_group_norm", False)
                     ),
-                    late_fusion_key=checkpoint.get(
+                    "late_fusion_key": checkpoint.get(
                         "critic_late_fusion_key", "robot0_gripper_qpos"
                     ),
-                    observation_horizon=int(
+                    "observation_horizon": int(
                         checkpoint.get("critic_observation_horizon", 1)
                     ),
-                    q_use_predicted_next_latent=(
-                        q_uses_predicted_next
-                    ),
-                )
+                }
+                if critic_architecture == RISE_V2_CRITIC_ARCHITECTURE:
+                    critics, critic_targets, vf = (
+                        make_rise_v2_system_from_checkpoint(
+                            dp_policy.policy,
+                            checkpoint,
+                        )
+                    )
+                else:
+                    critics, critic_targets, vf = make_rise_chunk_value_networks(
+                        dp_policy.policy,
+                        **common_chunk_kwargs,
+                        q_use_predicted_next_latent=q_uses_predicted_next,
+                    )
             elif bool(checkpoint.get("stacked_pretrained_dql_critic", False)):
                 critics, critic_targets, vf = make_dql_value_networks(
                     dp_policy.policy,
@@ -2160,6 +2208,10 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         ),
         "dynamics_prediction_consumed_by_q": bool(
             policy.checkpoint.get("dynamics_prediction_consumed_by_q", False)
+        ),
+        "rise_v2_fusion_mode": policy.checkpoint.get("rise_v2_fusion_mode"),
+        "rise_v2_dense_dynamics": policy.checkpoint.get(
+            "rise_v2_dense_dynamics"
         ),
         "sigreg_weight": float(policy.checkpoint.get("sigreg_weight", 0.0)),
         "sigreg_global_batch": bool(

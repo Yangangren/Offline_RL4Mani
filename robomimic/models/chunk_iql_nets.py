@@ -16,6 +16,7 @@ from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def make_mlp(
@@ -164,6 +165,326 @@ class SequentialActionChunkEncoder(nn.Module):
         attended = attended.squeeze(1)
         pooled = (tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
         return self.output_projection(torch.cat([attended, pooled], dim=-1))
+
+
+class CausalResidualTemporalConv(nn.Module):
+    """Causal, length-preserving residual block for action tokens."""
+
+    def __init__(self, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.conv = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=0)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.activation = nn.SiLU()
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        residual = tokens
+        # Left-only padding prevents an offset-k dynamics prediction from
+        # observing actions that occur after the requested prefix.
+        tokens = F.pad(tokens.transpose(1, 2), (2, 0))
+        tokens = self.conv(tokens).transpose(1, 2)
+        tokens = self.dropout(self.activation(self.norm(tokens)))
+        return residual + tokens
+
+
+class CausalSequentialActionChunkEncoder(nn.Module):
+    """RISE-v2 action encoder with reusable causal prefix representations.
+
+    The current temporal state modulates every action token before causal
+    temporal processing. The same tokens are summarized for full-chunk Q
+    prediction and for every requested dynamics prefix, ensuring that the
+    auxiliary objective trains the action representation consumed by Q.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        chunk_horizon: int,
+        context_dim: int,
+        hidden_dim: int = 128,
+        output_dim: int = 256,
+        num_heads: int = 4,
+        num_conv_layers: int = 2,
+        dropout: float = 0.05,
+    ):
+        super().__init__()
+        if int(hidden_dim) % int(num_heads) != 0:
+            raise ValueError("action hidden_dim must be divisible by num_heads")
+        self.action_dim = int(action_dim)
+        self.chunk_horizon = int(chunk_horizon)
+        self.context_dim = int(context_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.output_dim = int(output_dim)
+        self.step_projection = nn.Sequential(
+            nn.Linear(self.action_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.SiLU(),
+        )
+        self.position_embedding = nn.Parameter(
+            torch.empty(self.chunk_horizon, self.hidden_dim)
+        )
+        nn.init.normal_(self.position_embedding, mean=0.0, std=0.02)
+        self.context_modulation = nn.Linear(
+            self.context_dim,
+            2 * self.hidden_dim,
+        )
+        nn.init.zeros_(self.context_modulation.weight)
+        nn.init.zeros_(self.context_modulation.bias)
+        self.token_norm = nn.LayerNorm(self.hidden_dim)
+        self.temporal_blocks = nn.ModuleList(
+            [
+                CausalResidualTemporalConv(self.hidden_dim, float(dropout))
+                for _ in range(int(num_conv_layers))
+            ]
+        )
+        self.context_query = nn.Sequential(
+            nn.Linear(self.context_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.SiLU(),
+        )
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.output_projection = make_mlp(
+            2 * self.hidden_dim,
+            (self.output_dim,),
+            self.output_dim,
+            dropout=float(dropout),
+            final_layer_norm=True,
+        )
+
+    def _validate_inputs(
+        self,
+        context: torch.Tensor,
+        actions: torch.Tensor,
+        action_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if context.ndim != 2 or int(context.shape[-1]) != self.context_dim:
+            raise ValueError(
+                f"context must be [B,{self.context_dim}], got "
+                f"{tuple(context.shape)}"
+            )
+        if actions.ndim != 3 or tuple(actions.shape[1:]) != (
+            self.chunk_horizon,
+            self.action_dim,
+        ):
+            raise ValueError(
+                "action shape mismatch: expected "
+                f"[B,{self.chunk_horizon},{self.action_dim}], got "
+                f"{tuple(actions.shape)}"
+            )
+        if int(actions.shape[0]) != int(context.shape[0]):
+            raise ValueError("context and action batches must match")
+        if action_mask is None:
+            valid = torch.ones(
+                actions.shape[:2],
+                dtype=torch.bool,
+                device=actions.device,
+            )
+        else:
+            if tuple(action_mask.shape) != tuple(actions.shape[:2]):
+                raise ValueError(
+                    f"action_mask must be [B,H], got {tuple(action_mask.shape)}"
+                )
+            valid = action_mask.bool()
+        empty = valid.sum(dim=1) == 0
+        if torch.any(empty):
+            valid = valid.clone()
+            valid[empty, 0] = True
+        return valid
+
+    def _encode_tokens(
+        self,
+        context: torch.Tensor,
+        actions: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        weights = valid.to(dtype=actions.dtype).unsqueeze(-1)
+        tokens = self.step_projection(actions)
+        shift, scale = self.context_modulation(context).chunk(2, dim=-1)
+        tokens = (
+            self.token_norm(tokens) * (1.0 + torch.tanh(scale).unsqueeze(1))
+            + shift.unsqueeze(1)
+            + self.position_embedding.unsqueeze(0)
+        ) * weights
+        for block in self.temporal_blocks:
+            tokens = block(tokens) * weights
+        return tokens
+
+    def _summarize(
+        self,
+        context: torch.Tensor,
+        tokens: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        weights = valid.to(dtype=tokens.dtype).unsqueeze(-1)
+        query = self.context_query(context).unsqueeze(1)
+        attended, _ = self.cross_attention(
+            query=query,
+            key=tokens,
+            value=tokens,
+            key_padding_mask=~valid,
+            need_weights=False,
+        )
+        pooled = (tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        return self.output_projection(
+            torch.cat((attended.squeeze(1), pooled), dim=-1)
+        )
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        actions: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
+        *,
+        prefix_offsets: Sequence[int] = (),
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        valid = self._validate_inputs(context, actions, action_mask)
+        offsets = tuple(int(value) for value in prefix_offsets)
+        if offsets and (
+            tuple(sorted(set(offsets))) != offsets
+            or offsets[0] < 1
+            or offsets[-1] > self.chunk_horizon
+        ):
+            raise ValueError(
+                "prefix_offsets must be sorted, unique, positive, and <= "
+                f"chunk_horizon={self.chunk_horizon}; got {offsets}"
+            )
+        tokens = self._encode_tokens(context, actions, valid)
+        full_representation = self._summarize(context, tokens, valid)
+        if not offsets:
+            return full_representation, None
+
+        positions = torch.arange(
+            self.chunk_horizon,
+            device=actions.device,
+        ).unsqueeze(0)
+        prefix_representations = []
+        for offset in offsets:
+            prefix_valid = valid & (positions < int(offset))
+            prefix_representations.append(
+                self._summarize(context, tokens, prefix_valid)
+            )
+        return full_representation, torch.stack(prefix_representations, dim=1)
+
+
+class FiLMStateActionFusion(nn.Module):
+    """Direct state-action interaction used by RISE-v2 Q and dynamics heads."""
+
+    MODES = ("concat", "film")
+
+    def __init__(
+        self,
+        *,
+        latent_dim: int,
+        mode: str = "film",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.mode = str(mode)
+        if self.mode not in self.MODES:
+            raise ValueError(
+                f"unsupported state-action fusion mode {self.mode!r}; "
+                f"expected one of {self.MODES}"
+            )
+        if self.mode == "concat":
+            fusion_input_dim = 2 * self.latent_dim
+            self.modulation = None
+        else:
+            fusion_input_dim = 4 * self.latent_dim
+            self.modulation = nn.Linear(
+                self.latent_dim,
+                3 * self.latent_dim,
+            )
+            with torch.no_grad():
+                self.modulation.bias[2 * self.latent_dim :].fill_(-1.0)
+        self.candidate = make_mlp(
+            fusion_input_dim,
+            (self.latent_dim,),
+            self.latent_dim,
+            dropout=float(dropout),
+        )
+        self.output_norm = nn.LayerNorm(self.latent_dim)
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        if state.shape != action.shape or state.shape[-1] != self.latent_dim:
+            raise ValueError(
+                "state and action representations must share [...,D] shape; "
+                f"got {tuple(state.shape)} and {tuple(action.shape)}"
+            )
+        if self.mode == "concat":
+            candidate = self.candidate(torch.cat((state, action), dim=-1))
+            return self.output_norm(state + action + candidate)
+
+        shift, scale, gate = self.modulation(action).chunk(3, dim=-1)
+        conditioned_state = state * (1.0 + torch.tanh(scale)) + shift
+        interactions = torch.cat(
+            (
+                conditioned_state,
+                action,
+                conditioned_state * action,
+                torch.abs(conditioned_state - action),
+            ),
+            dim=-1,
+        )
+        candidate = self.candidate(interactions)
+        return self.output_norm(
+            state + action + torch.sigmoid(gate) * candidate
+        )
+
+
+class MultiHorizonLatentPredictor(nn.Module):
+    """Predict several future latents from shared prefix-fusion features."""
+
+    def __init__(
+        self,
+        *,
+        latent_dim: int,
+        target_dim: int,
+        prediction_offsets: Sequence[int],
+        hidden_dims: Sequence[int],
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.target_dim = int(target_dim)
+        self.prediction_offsets = tuple(int(value) for value in prediction_offsets)
+        if not self.prediction_offsets:
+            raise ValueError("multi-horizon predictor requires at least one offset")
+        if tuple(sorted(set(self.prediction_offsets))) != self.prediction_offsets:
+            raise ValueError("prediction offsets must be sorted and unique")
+        self.offset_embedding = nn.Parameter(
+            torch.empty(len(self.prediction_offsets), self.latent_dim)
+        )
+        nn.init.normal_(self.offset_embedding, mean=0.0, std=0.02)
+        self.input_norm = nn.LayerNorm(self.latent_dim)
+        self.predictor = make_mlp(
+            self.latent_dim,
+            hidden_dims,
+            self.target_dim,
+            dropout=float(dropout),
+        )
+
+    def forward(self, prefix_fusions: torch.Tensor) -> torch.Tensor:
+        expected = (len(self.prediction_offsets), self.latent_dim)
+        if prefix_fusions.ndim != 3 or tuple(prefix_fusions.shape[1:]) != expected:
+            raise ValueError(
+                f"prefix fusions must be [B,{expected[0]},{expected[1]}], "
+                f"got {tuple(prefix_fusions.shape)}"
+            )
+        conditioned = self.input_norm(
+            prefix_fusions + self.offset_embedding.unsqueeze(0)
+        )
+        return self.predictor(conditioned)
 
 
 class CausalTemporalStateTrunk(nn.Module):
@@ -524,4 +845,3 @@ class ChunkIQLDynamicsCritic(nn.Module):
             "q2": self.q2_head(q_input),
             "v": self.value_from_context(context),
         }
-
