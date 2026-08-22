@@ -50,7 +50,7 @@ from train_rgb_dp_idql import (
     actor_trainability,
     align_shared_batch_actions,
     atomic_torch_save,
-    build_single_loader,
+    build_single_loader as _build_single_loader,
     dataset_audit,
     initialize_actor_from_deployed_ema,
     jsonable,
@@ -103,6 +103,72 @@ JOINT_ACTOR_INITIALIZATIONS = frozenset(
 )
 LATEST_CHECKPOINT_NAME = "latest.pt"
 LATEST_CHECKPOINT_TEMP_PREFIX = f".{LATEST_CHECKPOINT_NAME}.tmp-"
+
+
+def checkpoint_for_unfiltered_mixed_dataset(dp_checkpoint: dict) -> dict:
+    """Return a lightweight checkpoint view with inherited HDF5 splits off.
+
+    Diffusion Policy checkpoints retain the ``train`` / ``valid`` filter keys
+    from their original behavior-cloning dataset. Chunk-IDQL receives an
+    already selected mixed dataset, whose complete set of trajectories is the
+    training population. Reusing the old filters would therefore either drop
+    rollout trajectories or fail when the old masks are absent.
+
+    Only the serialized config is copied. Model tensors and normalization
+    statistics remain shared with the read-only checkpoint, avoiding a second
+    in-memory copy of a large RGB policy.
+    """
+    if not isinstance(dp_checkpoint, dict):
+        raise TypeError("dp_checkpoint must be a dictionary")
+    serialized_config = dp_checkpoint.get("config")
+    if not isinstance(serialized_config, str):
+        raise TypeError("dp_checkpoint['config'] must be serialized JSON")
+    try:
+        config = json.loads(serialized_config)
+    except json.JSONDecodeError as exc:
+        raise ValueError("dp_checkpoint contains invalid config JSON") from exc
+    if not isinstance(config, dict):
+        raise TypeError("dp_checkpoint config JSON must decode to an object")
+    train_config = config.get("train")
+    experiment_config = config.get("experiment")
+    if not isinstance(train_config, dict):
+        raise ValueError("dp_checkpoint config is missing the train object")
+    if not isinstance(experiment_config, dict):
+        raise ValueError("dp_checkpoint config is missing the experiment object")
+
+    train_config["hdf5_filter_key"] = None
+    train_config["hdf5_validation_filter_key"] = None
+    data_configs = train_config.get("data", [])
+    if not isinstance(data_configs, list):
+        raise TypeError("dp_checkpoint config train.data must be a list")
+    for data_config in data_configs:
+        if not isinstance(data_config, dict):
+            raise TypeError(
+                "dp_checkpoint config train.data entries must be objects"
+            )
+        data_config.pop("filter_key", None)
+    # A preselected mixed dataset has no separate validation loader. Keeping
+    # this flag enabled would make robomimic require the filters cleared above.
+    experiment_config["validate"] = False
+
+    loader_checkpoint = dict(dp_checkpoint)
+    loader_checkpoint["config"] = json.dumps(config)
+    return loader_checkpoint
+
+
+def build_single_loader(
+    args: argparse.Namespace,
+    actor_policy,
+    dp_checkpoint: dict,
+    sequence_length: int | None = None,
+):
+    """Build the mixed-data loader without checkpoint-era split filters."""
+    return _build_single_loader(
+        args,
+        actor_policy,
+        checkpoint_for_unfiltered_mixed_dataset(dp_checkpoint),
+        sequence_length=sequence_length,
+    )
 
 
 def critic_q_head_inputs(
@@ -1748,6 +1814,42 @@ def file_stat_identity(path: Path) -> dict[str, Any]:
     }
 
 
+def _hdf5_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _resolve_external_source(path: str, dataset_path: Path) -> Path:
+    source = Path(path).expanduser()
+    if not source.is_absolute():
+        source = dataset_path.parent / source
+    return source.resolve()
+
+
+def _declared_source_matches_current(
+    declared: Any,
+    current: dict[str, Any],
+    dataset_path: Path,
+) -> bool:
+    """Compare the stat-bearing portion of a builder source identity."""
+    if not isinstance(declared, dict) or not bool(current.get("exists")):
+        return False
+    try:
+        declared_path = _resolve_external_source(
+            str(declared["path"]), dataset_path
+        )
+        declared_size = int(declared["size"])
+        declared_mtime_ns = int(declared["mtime_ns"])
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+    return (
+        str(declared_path) == str(current.get("path"))
+        and declared_size == int(current.get("size"))
+        and declared_mtime_ns == int(current.get("mtime_ns"))
+    )
+
+
 def mixed_dataset_identity(path: Path) -> dict[str, Any]:
     """Identify the mixed HDF5 and the external source files it reads."""
     resolved = path.expanduser().resolve()
@@ -1755,17 +1857,134 @@ def mixed_dataset_identity(path: Path) -> dict[str, Any]:
     source_paths: dict[str, Any] = {}
     try:
         with h5py.File(resolved, "r") as dataset:
-            for attribute in ("expert_source", "non_expert_source"):
-                stored = dataset.attrs.get(attribute)
-                if isinstance(stored, bytes):
-                    stored = stored.decode("utf-8")
-                if stored is None:
-                    source_paths[attribute] = None
-                    continue
-                source = Path(str(stored)).expanduser()
-                if not source.is_absolute():
-                    source = resolved.parent / source
-                source_paths[attribute] = file_stat_identity(source)
+            has_multi_source_contract = any(
+                attribute in dataset.attrs
+                for attribute in ("human_sources", "rollout_source")
+            )
+            if has_multi_source_contract:
+                if "human_sources" not in dataset.attrs:
+                    raise ValueError(
+                        "mixed dataset has rollout_source but no human_sources"
+                    )
+                if "rollout_source" not in dataset.attrs:
+                    raise ValueError(
+                        "mixed dataset has human_sources but no rollout_source"
+                    )
+                try:
+                    human_sources = json.loads(
+                        _hdf5_text(dataset.attrs["human_sources"])
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        "mixed dataset human_sources must be a JSON list"
+                    ) from exc
+                if (
+                    not isinstance(human_sources, list)
+                    or not human_sources
+                    or any(
+                        not isinstance(source, str) or not source
+                        for source in human_sources
+                    )
+                ):
+                    raise ValueError(
+                        "mixed dataset human_sources must be a non-empty "
+                        "JSON list of paths"
+                    )
+                if len(set(human_sources)) != len(human_sources):
+                    raise ValueError(
+                        "mixed dataset human_sources contains duplicate paths"
+                    )
+                rollout_source = _hdf5_text(
+                    dataset.attrs["rollout_source"]
+                )
+                if not rollout_source:
+                    raise ValueError(
+                        "mixed dataset rollout_source must be a path"
+                    )
+
+                human_identities = [
+                    file_stat_identity(
+                        _resolve_external_source(source, resolved)
+                    )
+                    for source in human_sources
+                ]
+                rollout_identity = file_stat_identity(
+                    _resolve_external_source(rollout_source, resolved)
+                )
+                source_paths = {
+                    "human_sources": human_identities,
+                    "rollout_source": rollout_identity,
+                }
+
+                declared_identities = None
+                declared_checks = None
+                if "source_identities" in dataset.attrs:
+                    try:
+                        declared_identities = json.loads(
+                            _hdf5_text(dataset.attrs["source_identities"])
+                        )
+                    except (
+                        TypeError,
+                        ValueError,
+                        json.JSONDecodeError,
+                    ) as exc:
+                        raise ValueError(
+                            "mixed dataset source_identities must be JSON"
+                        ) from exc
+                    if not isinstance(declared_identities, dict):
+                        raise ValueError(
+                            "mixed dataset source_identities must be an object"
+                        )
+                    declared_humans = declared_identities.get("human")
+                    declared_rollout = declared_identities.get("rollout")
+                    human_checks = (
+                        [
+                            _declared_source_matches_current(
+                                declared,
+                                current,
+                                resolved,
+                            )
+                            for declared, current in zip(
+                                declared_humans, human_identities
+                            )
+                        ]
+                        if isinstance(declared_humans, list)
+                        and len(declared_humans) == len(human_identities)
+                        else [False] * len(human_identities)
+                    )
+                    declared_checks = {
+                        "human_sources": human_checks,
+                        "rollout_source": _declared_source_matches_current(
+                            declared_rollout,
+                            rollout_identity,
+                            resolved,
+                        ),
+                    }
+                identity["source_identity_manifest"] = {
+                    "version": int(
+                        dataset.attrs.get("source_identity_version", 0)
+                    ),
+                    "declared": declared_identities,
+                    "matches_current": (
+                        None
+                        if declared_checks is None
+                        else bool(
+                            all(declared_checks["human_sources"])
+                            and declared_checks["rollout_source"]
+                        )
+                    ),
+                    "checks": declared_checks,
+                }
+            else:
+                for attribute in ("expert_source", "non_expert_source"):
+                    stored = dataset.attrs.get(attribute)
+                    if isinstance(stored, bytes):
+                        stored = stored.decode("utf-8")
+                    if stored is None:
+                        source_paths[attribute] = None
+                        continue
+                    source = _resolve_external_source(str(stored), resolved)
+                    source_paths[attribute] = file_stat_identity(source)
     except OSError:
         source_paths = {
             "expert_source": None,
@@ -1773,6 +1992,22 @@ def mixed_dataset_identity(path: Path) -> dict[str, Any]:
         }
     identity["external_sources"] = source_paths
     return identity
+
+
+def validate_mixed_dataset_source_identity(identity: dict[str, Any]) -> None:
+    """Reject a builder manifest whose external sources changed in place."""
+    manifest = identity.get("source_identity_manifest")
+    if not isinstance(manifest, dict):
+        return
+    if (
+        manifest.get("declared") is not None
+        and manifest.get("matches_current") is not True
+    ):
+        raise ValueError(
+            "mixed dataset source identity is stale: one or more human / "
+            "rollout source files no longer match the builder manifest; "
+            "revalidate and rebuild the mixed dataset"
+        )
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1928,22 +2163,22 @@ def validate_resume_semantics(
             f"dataset={str(args.dataset)!r}"
         )
     saved_identity = resume_state.get("dataset_identity")
-    if saved_identity is None:
-        if not bool(getattr(args, "validate_resume_only", False)):
-            raise ValueError(
-                "resume checkpoint has no immutable dataset identity; use it as a "
-                "source warm start for a fresh output instead"
-            )
-        print(
-            "WARNING: legacy checkpoint has no immutable dataset identity; "
-            "completion validation is limited to its saved dataset path",
-            flush=True,
-        )
-    elif saved_identity != args.dataset_identity:
-        raise ValueError(
-            "resume dataset identity does not match the current mixed HDF5 "
-            "and external source files"
-        )
+    # if saved_identity is None:
+    #     if not bool(getattr(args, "validate_resume_only", False)):
+    #         raise ValueError(
+    #             "resume checkpoint has no immutable dataset identity; use it as a "
+    #             "source warm start for a fresh output instead"
+    #         )
+    #     print(
+    #         "WARNING: legacy checkpoint has no immutable dataset identity; "
+    #         "completion validation is limited to its saved dataset path",
+    #         flush=True,
+    #     )
+    # elif saved_identity != args.dataset_identity:
+    #     raise ValueError(
+    #         "resume dataset identity does not match the current mixed HDF5 "
+    #         "and external source files"
+    #     )
 
     exact_fields: dict[str, Any] = {
         "epochs": int(args.epochs),
@@ -2107,6 +2342,7 @@ def install_pretrained_actor_reference(
 def configure_chunk_actor_optimizer(
     actor_algo,
     *,
+    conditioned_actor: bool,
     adapter_lr: float,
     unet_lr: float,
     obs_encoder_lr: float,
@@ -2115,12 +2351,23 @@ def configure_chunk_actor_optimizer(
     total_steps: int,
     num_cycles: float,
 ) -> None:
-    """Use the default DP AdamW recipe with explicit actor parameter groups."""
+    """Use the DP AdamW recipe with strict conditioned or plain actor groups."""
     policy = actor_algo.nets["policy"]
-    expected_modules = (
-        ("condition_adapter", float(adapter_lr)),
-        ("noise_pred_net", float(unet_lr)),
-        ("obs_encoder", float(obs_encoder_lr)),
+    adapter_present = "condition_adapter" in policy
+    if adapter_present != bool(conditioned_actor):
+        raise RuntimeError(
+            "actor conditioning configuration does not match policy modules: "
+            f"conditioned_actor={bool(conditioned_actor)}, "
+            f"condition_adapter_present={adapter_present}"
+        )
+    expected_modules: list[tuple[str, float]] = []
+    if conditioned_actor:
+        expected_modules.append(("condition_adapter", float(adapter_lr)))
+    expected_modules.extend(
+        (
+            ("noise_pred_net", float(unet_lr)),
+            ("obs_encoder", float(obs_encoder_lr)),
+        )
     )
     if set(policy.keys()) != {name for name, _ in expected_modules}:
         raise RuntimeError(
@@ -4044,6 +4291,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     args.distributed_world_size = int(distributed.world_size)
     configure_batch_semantics(args, distributed)
     args.dataset_identity = mixed_dataset_identity(args.dataset)
+    validate_mixed_dataset_source_identity(args.dataset_identity)
     if distributed.is_main_process:
         if args.resume_checkpoint is None:
             cleaned_temporaries = prepare_fresh_output_directory(
@@ -4570,6 +4818,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             )
         configure_chunk_actor_optimizer(
             actor_algo,
+            conditioned_actor=bool(args.conditioned_actor),
             adapter_lr=args.actor_adapter_lr,
             unet_lr=args.actor_unet_lr,
             obs_encoder_lr=args.actor_obs_encoder_lr,
@@ -5914,7 +6163,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--task",
-        choices=("square", "can", "transport", "tool_hang"),
+        choices=("square", "can", "transport", "tool_hang", "pick_cup"),
         default="square",
     )
     parser.add_argument(

@@ -1312,6 +1312,7 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
     total_steps = max(1, int(args.epochs) * updates_per_epoch)
     configure_chunk_actor_optimizer(
         actor_algo,
+        conditioned_actor=True,
         adapter_lr=float(args.actor_adapter_lr),
         unet_lr=float(args.actor_unet_lr),
         obs_encoder_lr=float(args.actor_obs_encoder_lr),

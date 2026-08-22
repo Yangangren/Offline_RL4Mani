@@ -128,3 +128,11 @@ robomimic/exps/
 figures/
 *.txt
 *.yml
+
+tests/*
+!tests/real_robot/
+tests/real_robot/*
+!tests/real_robot/test_build_stack_cup_dataset.py
+!tests/real_robot/test_validate_stack_cup_dataset.py
+!tests/real_robot/test_stack_cup_rgb_dp_baseline.py
+!tests/real_robot/test_eval_stack_cup_rgb_dp.py

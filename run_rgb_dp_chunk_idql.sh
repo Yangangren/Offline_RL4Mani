@@ -16,7 +16,7 @@ USER_FAILURE_COUNT_SET=${FAILURE_COUNT+x}
 first_arg=${1:-}
 first_arg=${first_arg,,}
 first_arg=${first_arg//-/_}
-if [[ "$first_arg" == "square" || "$first_arg" == "can" || "$first_arg" == "transport" || "$first_arg" == "tool_hang" ]]; then
+if [[ "$first_arg" == "square" || "$first_arg" == "can" || "$first_arg" == "transport" || "$first_arg" == "tool_hang" || "$first_arg" == "pick_cup" ]]; then
   TASK=$first_arg
   shift
 fi
@@ -126,8 +126,34 @@ case "$TASK" in
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
     TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     ;;
+  pick_cup)
+    TASK_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_200.pth
+    TASK_EXPERT_DATASET=datasets/real_robot/pick_cup/round1_rgb.hdf5
+    TASK_PICK_CUP_HUMAN_DATASETS="datasets/real_robot/pick_cup/round1_rgb.hdf5 datasets/real_robot/pick_cup/round2_rgb.hdf5"
+    TASK_ROLLOUT_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_epoch200_20hz_rollouts.hdf5
+    TASK_IDQL_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_65demo_23success_11failure_terminal_success.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/idql/65demo_23success_11failure_terminal_success
+    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/chunk_idql/65demo_23success_11failure_h8_dynamics_human_condition_terminal_success
+    TASK_EXPERT_MASK=train
+    TASK_EXPERT_COUNT=65
+    TASK_SUCCESS_MASK=success_train
+    TASK_SUCCESS_COUNT=23
+    TASK_FAILURE_MASK=failure_train
+    TASK_FAILURE_COUNT=11
+    TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
+    TASK_CHUNK_EPOCHS=50
+    TASK_CRITIC_GROUP_NORM=0
+    TASK_VF_ENCODER_FREEZE_STEPS=1000
+    TASK_ENCODER_FREEZE_STEPS=1000
+    TASK_CHUNK_EVAL_OUTPUT=rollouts/real_robot/pick_cup/chunk_idql/65demo_23success_11failure_h8_dynamics_human_condition_terminal_success
+    TASK_COMPOSED_DP_CHECKPOINT=$TASK_DP_CHECKPOINT
+    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/real_robot/pick_cup/chunk_idql/65demo_23success_11failure_h8_dynamics_human_condition_terminal_success_epoch200_actor
+    TASK_EVAL_HORIZON=400
+    TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
+    TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
+    ;;
   *)
-    echo "Unsupported TASK=$TASK. Use square, can, transport, or tool_hang." >&2
+    echo "Unsupported TASK=$TASK. Use square, can, transport, tool_hang, or pick_cup." >&2
     exit 2
     ;;
 esac
@@ -148,6 +174,14 @@ case "$TASK" in
   tool_hang)
     TASK_COLLECTION_CAMERA_NAMES="sideview robot0_eye_in_hand"
     TASK_COLLECTION_CAMERA_SIZE=240
+    TASK_COLLECTION_RGB_TAG=rgb2
+    ;;
+  pick_cup)
+    # These values only keep generic launcher defaults well-formed. Real-robot
+    # evaluation and collection use the dedicated deployment stack and are
+    # rejected below rather than entering the robomimic simulation pipeline.
+    TASK_COLLECTION_CAMERA_NAMES="main_image wrist_image"
+    TASK_COLLECTION_CAMERA_SIZE=96
     TASK_COLLECTION_RGB_TAG=rgb2
     ;;
 esac
@@ -199,6 +233,8 @@ fi
 DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
 EXPERT_DATASET=${EXPERT_DATASET:-$TASK_EXPERT_DATASET}
 ROLLOUT_DATASET=${ROLLOUT_DATASET:-$TASK_ROLLOUT_DATASET}
+PICK_CUP_HUMAN_DATASETS=${PICK_CUP_HUMAN_DATASETS:-${TASK_PICK_CUP_HUMAN_DATASETS:-}}
+PICK_CUP_ROLLOUT_SOURCE_ROOT=${PICK_CUP_ROLLOUT_SOURCE_ROOT:-/home/ryan/datasets/pick_cup/rollout}
 IDQL_REWARD_MODE=${IDQL_REWARD_MODE:-$TASK_DEFAULT_IDQL_REWARD_MODE}
 CHUNK_ACTOR_CONDITION_MODE=${CHUNK_ACTOR_CONDITION_MODE:-human_only} # human_success
 
@@ -229,6 +265,19 @@ case "$IDQL_REWARD_MODE" in
     exit 2
     ;;
 esac
+if [[ "$TASK" == "pick_cup" ]]; then
+  if [[ "$IDQL_REWARD_MODE" != "terminal_success" ]]; then
+    echo "TASK=pick_cup requires IDQL_REWARD_MODE=terminal_success." >&2
+    exit 2
+  fi
+  # The real-robot builder emits a fully named, preselected mixed dataset.
+  # Keep its lineage stable instead of applying the simulation suffix rules.
+  DEFAULT_IDQL_DATASET=$TASK_IDQL_DATASET
+  DEFAULT_IDQL_OUTPUT_DIR=$TASK_IDQL_OUTPUT_DIR
+  DEFAULT_CHUNK_IDQL_OUTPUT_DIR=$TASK_CHUNK_IDQL_OUTPUT_DIR
+  DEFAULT_CHUNK_EVAL_OUTPUT=$TASK_CHUNK_EVAL_OUTPUT
+  DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=$TASK_COMPOSED_CHUNK_EVAL_OUTPUT
+fi
 if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "human_success" ]]; then
   condition_path_tag=human_success_condition
   if [[ "$IDQL_REWARD_MODE" == "task" ]]; then
@@ -499,6 +548,15 @@ require_chunk_checkpoint() {
   echo "[rgb_dp_chunk_idql] resolved chunk checkpoint: $CHUNK_IDQL_CHECKPOINT" >&2
 }
 
+require_simulation_stage_task() {
+  local stage_name=$1
+  if [[ "$TASK" == "pick_cup" ]]; then
+    echo "[rgb_dp_chunk_idql task=pick_cup] stage '$stage_name' is simulation-only and cannot create or control the real robot." >&2
+    echo "Use scripts/real_robot_deploy for shadow evaluation or guarded real-robot execution." >&2
+    exit 2
+  fi
+}
+
 
 CHUNK_STEPS_PER_EPOCH=${CHUNK_STEPS_PER_EPOCH:-}
 CHUNK_STEPS_PER_EPOCH_ARGS=()
@@ -643,8 +701,77 @@ ensure_collection_rgb_dataset() {
 }
 
 
+ensure_pick_cup_rollout_dataset() {
+  if [[ -f "$ROLLOUT_DATASET" && -s "$ROLLOUT_DATASET" ]]; then
+    echo "[rgb_dp_chunk_idql task=pick_cup] validating converted rollout provenance: $ROLLOUT_DATASET" >&2
+    "$PYTHON" -B scripts/real_robot/build_pick_cup_rollout_hdf5.py \
+      --source-root "$PICK_CUP_ROLLOUT_SOURCE_ROOT" \
+      --output "$ROLLOUT_DATASET" \
+      --validate-only
+    return
+  fi
+  if [[ ! -d "$PICK_CUP_ROLLOUT_SOURCE_ROOT" ]]; then
+    echo "[rgb_dp_chunk_idql task=pick_cup] raw rollout root does not exist: $PICK_CUP_ROLLOUT_SOURCE_ROOT" >&2
+    echo "Set PICK_CUP_ROLLOUT_SOURCE_ROOT to the organized success/failure rollout directory." >&2
+    exit 1
+  fi
+  echo "[rgb_dp_chunk_idql task=pick_cup] converting real-robot rollouts: $ROLLOUT_DATASET" >&2
+  "$PYTHON" -B scripts/real_robot/build_pick_cup_rollout_hdf5.py \
+    --source-root "$PICK_CUP_ROLLOUT_SOURCE_ROOT" \
+    --output "$ROLLOUT_DATASET"
+  if [[ ! -f "$ROLLOUT_DATASET" || ! -s "$ROLLOUT_DATASET" ]]; then
+    echo "[rgb_dp_chunk_idql task=pick_cup] rollout conversion did not create a non-empty dataset: $ROLLOUT_DATASET" >&2
+    echo "Run scripts/real_robot/build_pick_cup_rollout_hdf5.py directly to inspect the conversion error." >&2
+    exit 1
+  fi
+}
+
+run_pick_cup_mixed_builder() {
+  local validation_only=${1:-0}
+  local -a human_datasets=()
+  local -a human_args=()
+  local -a mode_args=()
+  read -r -a human_datasets <<< "$PICK_CUP_HUMAN_DATASETS"
+  if (( ${#human_datasets[@]} == 0 )); then
+    echo "PICK_CUP_HUMAN_DATASETS must contain at least one human HDF5 path." >&2
+    exit 2
+  fi
+  for dataset_path in "${human_datasets[@]}"; do
+    if [[ ! -f "$dataset_path" || ! -s "$dataset_path" ]]; then
+      echo "[rgb_dp_chunk_idql task=pick_cup] human dataset does not exist or is empty: $dataset_path" >&2
+      exit 1
+    fi
+    human_args+=(--human-dataset "$dataset_path")
+  done
+  ensure_pick_cup_rollout_dataset
+  if [[ "$validation_only" == "1" || ( -f "$IDQL_DATASET" && "${OVERWRITE_DATASET:-0}" != "1" ) ]]; then
+    mode_args=(--validate-only)
+  elif [[ "${OVERWRITE_DATASET:-0}" == "1" ]]; then
+    mode_args=(--overwrite)
+  fi
+  "$PYTHON" -B scripts/real_robot/build_pick_cup_chunk_idql_dataset.py \
+    --task "$TASK" \
+    "${human_args[@]}" \
+    --rollout-dataset "$ROLLOUT_DATASET" \
+    --output "$IDQL_DATASET" \
+    --human-mask "$EXPERT_MASK" \
+    --human-count "$EXPERT_COUNT" \
+    --success-mask "$SUCCESS_MASK" \
+    --success-count "$SUCCESS_COUNT" \
+    --failure-mask "$FAILURE_MASK" \
+    --failure-count "$FAILURE_COUNT" \
+    --reward-mode "$IDQL_REWARD_MODE" \
+    --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+    --seed "${DATASET_SEED:-0}" \
+    "${mode_args[@]}"
+}
+
 build_dataset() {
   local overwrite_args=()
+  if [[ "$TASK" == "pick_cup" ]]; then
+    run_pick_cup_mixed_builder 0
+    return
+  fi
   if [[ ! -f "$EXPERT_DATASET" ]]; then
     echo "[rgb_dp_chunk_idql task=$TASK] expert dataset does not exist: $EXPERT_DATASET" >&2
     exit 1
@@ -686,21 +813,25 @@ ensure_dataset() {
     build_dataset
   else
     echo "[rgb_dp_chunk_idql] validating mixed dataset provenance: $IDQL_DATASET" >&2
-    "$PYTHON" -B scripts/build_rgb_dp_idql_dataset.py \
-      --task "$TASK" \
-      --expert-dataset "$EXPERT_DATASET" \
-      --rollout-dataset "$ROLLOUT_DATASET" \
-      --output "$IDQL_DATASET" \
-      --expert-mask "$EXPERT_MASK" \
-      --expert-count "$EXPERT_COUNT" \
-      --success-mask "$SUCCESS_MASK" \
-      --success-count "$SUCCESS_COUNT" \
-      --failure-mask "$FAILURE_MASK" \
-      --failure-count "$FAILURE_COUNT" \
-      --reward-mode "$IDQL_REWARD_MODE" \
-      --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
-      --seed "${DATASET_SEED:-0}" \
-      --validate-only
+    if [[ "$TASK" == "pick_cup" ]]; then
+      run_pick_cup_mixed_builder 1
+    else
+      "$PYTHON" -B scripts/build_rgb_dp_idql_dataset.py \
+        --task "$TASK" \
+        --expert-dataset "$EXPERT_DATASET" \
+        --rollout-dataset "$ROLLOUT_DATASET" \
+        --output "$IDQL_DATASET" \
+        --expert-mask "$EXPERT_MASK" \
+        --expert-count "$EXPERT_COUNT" \
+        --success-mask "$SUCCESS_MASK" \
+        --success-count "$SUCCESS_COUNT" \
+        --failure-mask "$FAILURE_MASK" \
+        --failure-count "$FAILURE_COUNT" \
+        --reward-mode "$IDQL_REWARD_MODE" \
+        --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+        --seed "${DATASET_SEED:-0}" \
+        --validate-only
+    fi
   fi
 }
 
@@ -1060,6 +1191,7 @@ case "$STAGE" in
     ;;
 
   eval_recap_actor_grid_resilient)
+    require_simulation_stage_task "$STAGE"
     require_recap_artifact "$RECAP_ACTOR_CHECKPOINT" "actor checkpoint"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
     "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
@@ -1083,6 +1215,7 @@ case "$STAGE" in
     ;;
 
   eval_chunk_grid_resilient)
+    require_simulation_stage_task "$STAGE"
     require_chunk_checkpoint
     read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-4 8 12 16}"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
@@ -1110,6 +1243,7 @@ case "$STAGE" in
     ;;
 
   collect_chunk_idql_rollouts_resilient)
+    require_simulation_stage_task "$STAGE"
     require_chunk_checkpoint
     echo "[rgb_dp_chunk_idql collection] task=$TASK N=$COLLECTION_NUM_CANDIDATES selection=$COLLECTION_SELECTION random_probability=$COLLECTION_RANDOM_SELECTION_PROBABILITY total_rollouts=$COLLECTION_TOTAL_ROLLOUTS rollouts_per_shard=$COLLECTION_ROLLOUTS_PER_SHARD seed_layout=$COLLECTION_SEED_LAYOUT_TAG policy_seeds=${COLLECTION_POLICY_SEEDS:-none} output=$COLLECTION_OUTPUT_DIR" >&2
     if (( COLLECTION_TOTAL_ROLLOUTS <= 0 || COLLECTION_ROLLOUTS_PER_SHARD <= 0 )); then
@@ -1187,6 +1321,7 @@ case "$STAGE" in
     ;;
 
   eval_composed_chunk_grid_resilient)
+    require_simulation_stage_task "$STAGE"
     require_chunk_checkpoint
     read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-4 8 12 16}"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
@@ -1214,7 +1349,7 @@ case "$STAGE" in
     ;;
 
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_recap_actor_grid_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang|pick_cup] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_recap_actor_grid_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
     exit 2
     ;;
 esac
