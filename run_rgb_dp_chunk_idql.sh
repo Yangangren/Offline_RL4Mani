@@ -458,22 +458,23 @@ fi
 # only after all task and round-2 overrides have resolved the final mixed HDF5.
 recap_dataset_name=${IDQL_DATASET##*/}
 RECAP_DATASET_LINEAGE=${RECAP_DATASET_LINEAGE:-${recap_dataset_name%.hdf5}}
-RECAP_RUN_TAG=${RECAP_RUN_TAG:-mc_value_advantage_v1}
+RECAP_RUN_TAG=${RECAP_RUN_TAG:-mc_value_advantage_oof_v2}
 RECAP_OUTPUT_ROOT=${RECAP_OUTPUT_ROOT:-trained_models/${TASK}_rgb_dp/recap/${RECAP_DATASET_LINEAGE}/${RECAP_RUN_TAG}}
 RECAP_TARGETS=${RECAP_TARGETS:-$RECAP_OUTPUT_ROOT/targets.pt}
 RECAP_VALUE_OUTPUT_DIR=${RECAP_VALUE_OUTPUT_DIR:-$RECAP_OUTPUT_ROOT/value}
-RECAP_VALUE_CHECKPOINT=${RECAP_VALUE_CHECKPOINT:-$RECAP_VALUE_OUTPUT_DIR/best.pt}
 RECAP_LABELS=${RECAP_LABELS:-$RECAP_OUTPUT_ROOT/labels.pt}
 RECAP_ACTOR_OUTPUT_DIR=${RECAP_ACTOR_OUTPUT_DIR:-$RECAP_OUTPUT_ROOT/actor}
 RECAP_ACTOR_CHECKPOINT=${RECAP_ACTOR_CHECKPOINT:-$RECAP_ACTOR_OUTPUT_DIR/last.pth}
 RECAP_ACTOR_EVAL_OUTPUT=${RECAP_ACTOR_EVAL_OUTPUT:-rollouts/${TASK}_rgb_dp/recap/${RECAP_DATASET_LINEAGE}/${RECAP_RUN_TAG}/actor_condition1_N1}
 
-RECAP_GAMMA=${RECAP_GAMMA:-0.99}
+RECAP_GAMMA=${RECAP_GAMMA:-1.0}
 RECAP_CHUNK_HORIZON=${RECAP_CHUNK_HORIZON:-${CHUNK_HORIZON:-8}}
 RECAP_TASK_HORIZON=${RECAP_TASK_HORIZON:-$TASK_EVAL_HORIZON}
 RECAP_FAILURE_PENALTY=${RECAP_FAILURE_PENALTY:-$RECAP_TASK_HORIZON}
 RECAP_RETURN_SCALE=${RECAP_RETURN_SCALE:-$((2 * RECAP_TASK_HORIZON))}
 RECAP_VALID_FRACTION=${RECAP_VALID_FRACTION:-0.1}
+RECAP_NUM_FOLDS=${RECAP_NUM_FOLDS:-5}
+RECAP_VALUE_FOLDS=${RECAP_VALUE_FOLDS:-}
 RECAP_SEED=${RECAP_SEED:-${SEED:-0}}
 RECAP_THRESHOLD_MODE=${RECAP_THRESHOLD_MODE:-target_positive_fraction}
 RECAP_ADVANTAGE_THRESHOLD=${RECAP_ADVANTAGE_THRESHOLD:-0.0}
@@ -492,6 +493,13 @@ RECAP_NUM_GPUS=${RECAP_NUM_GPUS:-1}
 RECAP_DISTRIBUTED_BACKEND=${RECAP_DISTRIBUTED_BACKEND:-auto}
 RECAP_GRADIENT_BUCKET_CAP_MB=${RECAP_GRADIENT_BUCKET_CAP_MB:-100}
 RECAP_ACTOR_SCHEDULE_REFERENCE_BATCH_SIZE=${RECAP_ACTOR_SCHEDULE_REFERENCE_BATCH_SIZE:-100}
+RECAP_VALUE_GLOBAL_BATCH_SIZE=${RECAP_VALUE_GLOBAL_BATCH_SIZE:-100}
+RECAP_ACTOR_GLOBAL_BATCH_SIZE=${RECAP_ACTOR_GLOBAL_BATCH_SIZE:-100}
+RECAP_VALUE_SNAPSHOT_EVERY_EPOCHS=${RECAP_VALUE_SNAPSHOT_EVERY_EPOCHS:-5}
+RECAP_ACTOR_SNAPSHOT_EVERY_EPOCHS=${RECAP_ACTOR_SNAPSHOT_EVERY_EPOCHS:-5}
+RECAP_BASE_LOSS_WEIGHT=${RECAP_BASE_LOSS_WEIGHT:-0.3}
+RECAP_CONDITIONAL_LOSS_WEIGHT=${RECAP_CONDITIONAL_LOSS_WEIGHT:-0.7}
+RECAP_ACTOR_ABLATION_EVAL_ROOT=${RECAP_ACTOR_ABLATION_EVAL_ROOT:-rollouts/${TASK}_rgb_dp/recap/${RECAP_DATASET_LINEAGE}/${RECAP_RUN_TAG}/condition_ablation_N1}
 
 resolve_existing_chunk_checkpoint() {
   local output_dir=$1
@@ -1026,6 +1034,40 @@ require_recap_artifact() {
   fi
 }
 
+resolve_recap_per_rank_batch() {
+  local phase=$1
+  local requested_global=$2
+  local legacy_per_rank=${3:-}
+  local per_rank
+  local actual_global
+  if ! [[ "$RECAP_NUM_GPUS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[rgb_dp_chunk_idql RECAP] RECAP_NUM_GPUS must be a positive integer; got $RECAP_NUM_GPUS" >&2
+    return 2
+  fi
+  if [[ -n "$legacy_per_rank" ]]; then
+    if ! [[ "$legacy_per_rank" =~ ^[1-9][0-9]*$ ]]; then
+      echo "[rgb_dp_chunk_idql RECAP] legacy per-rank $phase batch must be positive; got $legacy_per_rank" >&2
+      return 2
+    fi
+    per_rank=$legacy_per_rank
+    actual_global=$((per_rank * RECAP_NUM_GPUS))
+    echo "[rgb_dp_chunk_idql RECAP] $phase uses explicit legacy per-rank batch=$per_rank, actual-global=$actual_global" >&2
+  else
+    if ! [[ "$requested_global" =~ ^[1-9][0-9]*$ ]]; then
+      echo "[rgb_dp_chunk_idql RECAP] requested $phase global batch must be positive; got $requested_global" >&2
+      return 2
+    fi
+    per_rank=$((requested_global / RECAP_NUM_GPUS))
+    if (( per_rank < 1 )); then
+      echo "[rgb_dp_chunk_idql RECAP] requested $phase global batch=$requested_global is smaller than GPU count=$RECAP_NUM_GPUS" >&2
+      return 2
+    fi
+    actual_global=$((per_rank * RECAP_NUM_GPUS))
+    echo "[rgb_dp_chunk_idql RECAP] $phase requested-global=$requested_global resolved per-rank=$per_rank actual-global=$actual_global GPUs=$RECAP_NUM_GPUS" >&2
+  fi
+  printf "%s\n" "$per_rank"
+}
+
 run_recap_training_command() {
   local phase=$1
   local per_rank_batch_size=$2
@@ -1041,7 +1083,7 @@ run_recap_training_command() {
       return 2
     fi
     export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
-    echo "[rgb_dp_chunk_idql RECAP] distributed $phase training: GPUs=$RECAP_NUM_GPUS per-rank-batch=$per_rank_batch_size" >&2
+    echo "[rgb_dp_chunk_idql RECAP] distributed $phase training: GPUs=$RECAP_NUM_GPUS per-rank-batch=$per_rank_batch_size actual-global-batch=$((per_rank_batch_size * RECAP_NUM_GPUS))" >&2
     "$PYTHON" -B -m torch.distributed.run \
       --standalone \
       --nnodes=1 \
@@ -1062,45 +1104,81 @@ prepare_recap_targets() {
     --failure-penalty "$RECAP_FAILURE_PENALTY" \
     --return-scale "$RECAP_RETURN_SCALE" \
     --valid-fraction "$RECAP_VALID_FRACTION" \
+    --num-folds "$RECAP_NUM_FOLDS" \
     --seed "$RECAP_SEED"
 }
 
 run_recap_value_train() {
   require_recap_artifact "$RECAP_TARGETS" "prepared target sidecar"
   mkdir -p "$RECAP_VALUE_OUTPUT_DIR"
+  local per_rank_batch_size
+  per_rank_batch_size=$(resolve_recap_per_rank_batch value "$RECAP_VALUE_GLOBAL_BATCH_SIZE" "${RECAP_VALUE_BATCH_SIZE:-}") || return
+  local -a folds_to_train=()
+  local fold
+  local fold_output_dir
+  local -a recap_dynamics_offset_args
   read -r -a recap_dynamics_offset_args <<< "$RECAP_DYNAMICS_PREDICTION_OFFSETS"
-  run_recap_training_command value "${RECAP_VALUE_BATCH_SIZE:-100}" \
-    scripts/train_rgb_dp_chunk_recap.py train-value \
-    --dataset "$IDQL_DATASET" \
-    --targets "$RECAP_TARGETS" \
-    --checkpoint "$DP_CHECKPOINT" \
-    --output-dir "$RECAP_VALUE_OUTPUT_DIR" \
-    --gamma "$RECAP_GAMMA" \
-    --chunk-horizon "$RECAP_CHUNK_HORIZON" \
-    --epochs "${RECAP_VALUE_EPOCHS:-15}" \
-    --batch-size "${RECAP_VALUE_BATCH_SIZE:-100}" \
-    --num-workers "${RECAP_VALUE_NUM_WORKERS:-6}" \
-    --device "${DEVICE:-cuda}" \
-    --seed "$RECAP_SEED" \
-    --distributed-backend "$RECAP_DISTRIBUTED_BACKEND" \
-    --gradient-bucket-cap-mb "$RECAP_GRADIENT_BUCKET_CAP_MB" \
-    --value-lr "${RECAP_VALUE_LR:-1e-4}" \
-    --value-architecture "$RECAP_VALUE_ARCHITECTURE" \
-    --observation-horizon "$RECAP_VALUE_OBSERVATION_HORIZON" \
-    --late-fusion-key "$CRITIC_LATE_FUSION_KEY" \
-    --dynamics-weight "$RECAP_DYNAMICS_WEIGHT" \
-    --dynamics-prediction-offsets "${recap_dynamics_offset_args[@]}" \
-    --target-tau "$RECAP_DYNAMICS_TARGET_TAU" \
-    --sigreg-weight "$RECAP_SIGREG_WEIGHT" \
-    --sigreg-knots "$RECAP_SIGREG_KNOTS" \
-    --sigreg-num-projections "$RECAP_SIGREG_NUM_PROJECTIONS"
+  if [[ -n "${RECAP_VALUE_FOLDS//[[:space:]]/}" ]]; then
+    read -r -a folds_to_train <<< "$RECAP_VALUE_FOLDS"
+  else
+    for ((fold = 0; fold < RECAP_NUM_FOLDS; fold++)); do
+      folds_to_train+=("$fold")
+    done
+  fi
+  if (( ${#folds_to_train[@]} == 0 )); then
+    echo "[rgb_dp_chunk_idql RECAP] no value folds selected" >&2
+    return 2
+  fi
+  for fold in "${folds_to_train[@]}"; do
+    if ! [[ "$fold" =~ ^[0-9]+$ ]] || (( fold >= RECAP_NUM_FOLDS )); then
+      echo "[rgb_dp_chunk_idql RECAP] invalid RECAP_VALUE_FOLDS entry=$fold for RECAP_NUM_FOLDS=$RECAP_NUM_FOLDS" >&2
+      return 2
+    fi
+    fold_output_dir="$RECAP_VALUE_OUTPUT_DIR/fold_${fold}"
+    mkdir -p "$fold_output_dir"
+    echo "[rgb_dp_chunk_idql RECAP] training OOF value fold=$fold/$RECAP_NUM_FOLDS output=$fold_output_dir" >&2
+    run_recap_training_command "value-fold-$fold" "$per_rank_batch_size" \
+      scripts/train_rgb_dp_chunk_recap.py train-value \
+      --dataset "$IDQL_DATASET" \
+      --targets "$RECAP_TARGETS" \
+      --checkpoint "$DP_CHECKPOINT" \
+      --output-dir "$fold_output_dir" \
+      --heldout-fold "$fold" \
+      --expected-num-folds "$RECAP_NUM_FOLDS" \
+      --gamma "$RECAP_GAMMA" \
+      --chunk-horizon "$RECAP_CHUNK_HORIZON" \
+      --epochs "${RECAP_VALUE_EPOCHS:-15}" \
+      --snapshot-every-epochs "$RECAP_VALUE_SNAPSHOT_EVERY_EPOCHS" \
+      --batch-size "$per_rank_batch_size" \
+      --num-workers "${RECAP_VALUE_NUM_WORKERS:-6}" \
+      --device "${DEVICE:-cuda}" \
+      --seed "$RECAP_SEED" \
+      --distributed-backend "$RECAP_DISTRIBUTED_BACKEND" \
+      --gradient-bucket-cap-mb "$RECAP_GRADIENT_BUCKET_CAP_MB" \
+      --value-lr "${RECAP_VALUE_LR:-1e-4}" \
+      --value-architecture "$RECAP_VALUE_ARCHITECTURE" \
+      --observation-horizon "$RECAP_VALUE_OBSERVATION_HORIZON" \
+      --late-fusion-key "$CRITIC_LATE_FUSION_KEY" \
+      --dynamics-weight "$RECAP_DYNAMICS_WEIGHT" \
+      --dynamics-prediction-offsets "${recap_dynamics_offset_args[@]}" \
+      --target-tau "$RECAP_DYNAMICS_TARGET_TAU" \
+      --sigreg-weight "$RECAP_SIGREG_WEIGHT" \
+      --sigreg-knots "$RECAP_SIGREG_KNOTS" \
+      --sigreg-num-projections "$RECAP_SIGREG_NUM_PROJECTIONS" || return
+  done
 }
-
 label_recap_chunks() {
   require_recap_artifact "$RECAP_TARGETS" "prepared target sidecar"
-  require_recap_artifact "$RECAP_VALUE_CHECKPOINT" "value checkpoint"
   ensure_recap_parent_dir "$RECAP_LABELS"
+  local fold
+  local value_checkpoint
+  local -a recap_value_checkpoint_args=()
   local -a recap_threshold_args
+  for ((fold = 0; fold < RECAP_NUM_FOLDS; fold++)); do
+    value_checkpoint="$RECAP_VALUE_OUTPUT_DIR/fold_${fold}/${RECAP_VALUE_CHECKPOINT_NAME:-best.pt}"
+    require_recap_artifact "$value_checkpoint" "OOF value checkpoint for fold $fold"
+    recap_value_checkpoint_args+=(--value-checkpoint "$value_checkpoint")
+  done
   case "$RECAP_THRESHOLD_MODE" in
     fixed)
       recap_threshold_args=(--fixed-threshold "$RECAP_ADVANTAGE_THRESHOLD")
@@ -1119,7 +1197,8 @@ label_recap_chunks() {
   "$PYTHON" -B scripts/label_rgb_dp_chunk_recap.py \
     --dataset "$IDQL_DATASET" \
     --targets "$RECAP_TARGETS" \
-    --value-checkpoint "$RECAP_VALUE_CHECKPOINT" \
+    "${recap_value_checkpoint_args[@]}" \
+    --expected-num-folds "$RECAP_NUM_FOLDS" \
     --output "$RECAP_LABELS" \
     --checkpoint "$DP_CHECKPOINT" \
     --device "${DEVICE:-cuda}" \
@@ -1131,14 +1210,17 @@ label_recap_chunks() {
 run_recap_actor_train() {
   require_recap_artifact "$RECAP_LABELS" "advantage-label sidecar"
   mkdir -p "$RECAP_ACTOR_OUTPUT_DIR"
-  run_recap_training_command actor "${RECAP_ACTOR_BATCH_SIZE:-100}" \
+  local per_rank_batch_size
+  per_rank_batch_size=$(resolve_recap_per_rank_batch actor "$RECAP_ACTOR_GLOBAL_BATCH_SIZE" "${RECAP_ACTOR_BATCH_SIZE:-}") || return
+  run_recap_training_command actor "$per_rank_batch_size" \
     scripts/train_rgb_dp_chunk_recap.py train-actor \
     --dataset "$IDQL_DATASET" \
     --labels "$RECAP_LABELS" \
     --checkpoint "$DP_CHECKPOINT" \
     --output-dir "$RECAP_ACTOR_OUTPUT_DIR" \
     --epochs "${RECAP_ACTOR_EPOCHS:-50}" \
-    --batch-size "${RECAP_ACTOR_BATCH_SIZE:-100}" \
+    --snapshot-every-epochs "$RECAP_ACTOR_SNAPSHOT_EVERY_EPOCHS" \
+    --batch-size "$per_rank_batch_size" \
     --num-workers "${RECAP_ACTOR_NUM_WORKERS:-6}" \
     --device "${DEVICE:-cuda}" \
     --seed "$RECAP_SEED" \
@@ -1146,9 +1228,37 @@ run_recap_actor_train() {
     --gradient-bucket-cap-mb "$RECAP_GRADIENT_BUCKET_CAP_MB" \
     --schedule-reference-batch-size "$RECAP_ACTOR_SCHEDULE_REFERENCE_BATCH_SIZE" \
     --condition-dropout "$RECAP_CONDITION_DROPOUT" \
+    --base-loss-weight "$RECAP_BASE_LOSS_WEIGHT" \
+    --conditional-loss-weight "$RECAP_CONDITIONAL_LOSS_WEIGHT" \
     --actor-adapter-lr "${RECAP_ACTOR_ADAPTER_LR:-1e-4}" \
     --actor-unet-lr "${RECAP_ACTOR_UNET_LR:-1e-4}" \
-    --actor-obs-encoder-lr "${RECAP_ACTOR_OBS_ENCODER_LR:-1e-4}"
+    --actor-obs-encoder-lr "${RECAP_ACTOR_OBS_ENCODER_LR:-1e-5}"
+}
+
+run_recap_actor_eval() {
+  local success_condition=$1
+  local condition_mask=$2
+  local output_dir=$3
+  local -a recap_eval_seed_args
+  read -r -a recap_eval_seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
+  "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
+    --dp-checkpoint "$RECAP_ACTOR_CHECKPOINT" \
+    --expected-task "$TASK" \
+    --output-dir "$output_dir" \
+    --device "${DEVICE:-cuda}" \
+    "${EVAL_GPU_ARGS[@]}" \
+    --actor-source plain_dp \
+    --n-rollouts "${N_ROLLOUTS:-50}" \
+    --horizon "$EVAL_HORIZON" \
+    --num-candidates 1 \
+    --seeds "${recap_eval_seed_args[@]}" \
+    --rollouts-per-chunk "${ROLLOUTS_PER_CHUNK:-25}" \
+    --inter-chunk-sleep "${EVAL_INTER_CHUNK_SLEEP:-0}" \
+    --max-retries "${EVAL_MAX_RETRIES:-5}" \
+    --execution-horizon "${EXECUTION_HORIZON:-8}" \
+    --require-success-condition-adapter \
+    --inference-success-condition "$success_condition" \
+    --inference-condition-mask "$condition_mask"
 }
 
 case "$STAGE" in
@@ -1224,7 +1334,6 @@ case "$STAGE" in
     ensure_dataset
     prepare_recap_targets
     run_recap_value_train
-    require_recap_artifact "$RECAP_VALUE_CHECKPOINT" "value checkpoint"
     label_recap_chunks
     run_recap_actor_train
     ;;
@@ -1232,25 +1341,15 @@ case "$STAGE" in
   eval_recap_actor_grid_resilient)
     require_simulation_stage_task "$STAGE"
     require_recap_artifact "$RECAP_ACTOR_CHECKPOINT" "actor checkpoint"
-    read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
-    "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
-      --dp-checkpoint "$RECAP_ACTOR_CHECKPOINT" \
-      --expected-task "$TASK" \
-      --output-dir "$RECAP_ACTOR_EVAL_OUTPUT" \
-      --device "${DEVICE:-cuda}" \
-      "${EVAL_GPU_ARGS[@]}" \
-      --actor-source plain_dp \
-      --n-rollouts "${N_ROLLOUTS:-50}" \
-      --horizon "$EVAL_HORIZON" \
-      --num-candidates 1 \
-      --seeds "${seed_args[@]}" \
-      --rollouts-per-chunk "${ROLLOUTS_PER_CHUNK:-25}" \
-      --inter-chunk-sleep "${EVAL_INTER_CHUNK_SLEEP:-0}" \
-      --max-retries "${EVAL_MAX_RETRIES:-5}" \
-      --execution-horizon "${EXECUTION_HORIZON:-8}" \
-      --require-success-condition-adapter \
-      --inference-success-condition 1.0 \
-      --inference-condition-mask 1.0
+    run_recap_actor_eval 1.0 1.0 "$RECAP_ACTOR_EVAL_OUTPUT"
+    ;;
+
+  eval_recap_condition_ablation_grid_resilient)
+    require_simulation_stage_task "$STAGE"
+    require_recap_artifact "$RECAP_ACTOR_CHECKPOINT" "actor checkpoint"
+    run_recap_actor_eval 1.0 1.0 "$RECAP_ACTOR_ABLATION_EVAL_ROOT/condition_1_mask_1"
+    run_recap_actor_eval 0.0 1.0 "$RECAP_ACTOR_ABLATION_EVAL_ROOT/condition_0_mask_1"
+    run_recap_actor_eval 0.0 0.0 "$RECAP_ACTOR_ABLATION_EVAL_ROOT/unconditional_mask_0"
     ;;
 
   eval_chunk_grid_resilient)
@@ -1388,7 +1487,7 @@ case "$STAGE" in
     ;;
 
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang|pick_cup] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_recap_actor_grid_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang|pick_cup] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_recap_actor_grid_resilient|eval_recap_condition_ablation_grid_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
     exit 2
     ;;
 esac

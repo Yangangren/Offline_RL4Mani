@@ -4,6 +4,7 @@ Implementation of Diffusion Policy https://diffusion-policy.cs.columbia.edu/ by 
 from typing import Callable, Union
 from copy import deepcopy
 from collections import OrderedDict, deque
+import math
 from packaging.version import parse as parse_version
 import torch
 import torch.nn as nn
@@ -190,6 +191,14 @@ class DiffusionPolicyUNet(PolicyAlgo):
         self.success_condition_dropout = 0.0
         self.inference_success_condition = 1.0
         self.inference_success_condition_mask = 1.0
+        # Opt-in RECAP objective. The explicit paired passes are intentionally
+        # disabled by default so existing conditioned-DP training keeps its
+        # stochastic condition-dropout objective exactly as before.
+        self.recap_paired_loss_enabled = False
+        self.recap_base_loss_weight = 0.3
+        self.recap_conditional_loss_weight = 0.7
+        self.recap_conditional_action_start = None
+        self.recap_conditional_action_horizon = None
 
         if self.reference_margin_enabled and self.hazard_constraint_enabled:
             raise ValueError(
@@ -501,6 +510,185 @@ class DiffusionPolicyUNet(PolicyAlgo):
             "failure_condition_fraction": ((success_condition < 0.5) & (condition_mask > 0.5)).float().mean(),
         }
         return conditioned, stats
+
+    def _recap_paired_loss_config(
+        self,
+        prediction_horizon,
+        observation_horizon,
+        action_horizon,
+    ):
+        """Validate and resolve the explicit RECAP paired-loss configuration."""
+        base_weight = float(getattr(self, "recap_base_loss_weight", 0.3))
+        conditional_weight = float(
+            getattr(self, "recap_conditional_loss_weight", 0.7)
+        )
+        if not math.isfinite(base_weight) or base_weight < 0.0:
+            raise ValueError("recap_base_loss_weight must be finite and non-negative")
+        if not math.isfinite(conditional_weight) or conditional_weight < 0.0:
+            raise ValueError(
+                "recap_conditional_loss_weight must be finite and non-negative"
+            )
+        if base_weight == 0.0 and conditional_weight == 0.0:
+            raise ValueError("at least one RECAP paired-loss weight must be positive")
+
+        configured_start = getattr(self, "recap_conditional_action_start", None)
+        start = (
+            int(observation_horizon) - 1
+            if configured_start is None
+            else int(configured_start)
+        )
+        configured_horizon = getattr(
+            self, "recap_conditional_action_horizon", None
+        )
+        horizon = (
+            int(action_horizon)
+            if configured_horizon is None
+            else int(configured_horizon)
+        )
+        end = start + horizon
+        if start < 0 or horizon <= 0 or end > int(prediction_horizon):
+            raise ValueError(
+                "invalid RECAP conditional action slice: "
+                f"start={start}, horizon={horizon}, "
+                f"prediction_horizon={prediction_horizon}"
+            )
+        return {
+            "base_weight": base_weight,
+            "conditional_weight": conditional_weight,
+            "action_start": start,
+            "action_horizon": horizon,
+            "action_end": end,
+        }
+
+    def _validate_recap_paired_objective_compatibility(
+        self,
+        *,
+        reference_distillation_enabled,
+    ):
+        if "condition_adapter" not in self.nets["policy"]:
+            raise RuntimeError(
+                "RECAP paired loss requires an installed success-condition adapter"
+            )
+        if self.reference_margin_enabled or self.hazard_constraint_enabled:
+            raise RuntimeError(
+                "RECAP paired loss cannot be combined with reference-margin "
+                "or hazard objectives"
+            )
+        if reference_distillation_enabled:
+            raise RuntimeError(
+                "RECAP paired loss cannot be combined with reference distillation"
+            )
+
+    def _compute_recap_paired_losses(
+        self,
+        *,
+        base_noise_pred,
+        conditional_noise_pred,
+        noise,
+        success_condition,
+        config,
+    ):
+        """Compute full-horizon base and executed-slice conditional losses."""
+        if base_noise_pred.shape != noise.shape:
+            raise ValueError(
+                "RECAP base noise prediction shape does not match sampled noise: "
+                f"{tuple(base_noise_pred.shape)} != {tuple(noise.shape)}"
+            )
+        if conditional_noise_pred.shape != noise.shape:
+            raise ValueError(
+                "RECAP conditional noise prediction shape does not match sampled noise: "
+                f"{tuple(conditional_noise_pred.shape)} != {tuple(noise.shape)}"
+            )
+        action_start = int(config["action_start"])
+        action_end = int(config["action_end"])
+        if action_start < 0 or action_end <= action_start or action_end > noise.shape[1]:
+            raise ValueError(
+                "RECAP conditional action slice is outside the noise horizon: "
+                f"start={action_start}, end={action_end}, horizon={noise.shape[1]}"
+            )
+
+        success_condition = success_condition.to(
+            device=noise.device,
+            dtype=torch.float32,
+        ).view(-1)
+        if success_condition.shape[0] != noise.shape[0]:
+            raise ValueError(
+                "RECAP success condition batch does not match sampled noise: "
+                f"{success_condition.shape[0]} != {noise.shape[0]}"
+            )
+        if not torch.isfinite(success_condition).all():
+            raise ValueError("RECAP success conditions must be finite binary values")
+        condition_zero = torch.isclose(
+            success_condition,
+            torch.zeros_like(success_condition),
+        )
+        condition_one = torch.isclose(
+            success_condition,
+            torch.ones_like(success_condition),
+        )
+        if not torch.all(condition_zero | condition_one):
+            raise ValueError("RECAP success conditions must be binary (0 or 1)")
+
+        base_per_sample = F.mse_loss(
+            base_noise_pred,
+            noise,
+            reduction="none",
+        ).flatten(start_dim=1).mean(dim=1)
+        action_slice = slice(action_start, action_end)
+        conditional_per_sample = F.mse_loss(
+            conditional_noise_pred[:, action_slice],
+            noise[:, action_slice],
+            reduction="none",
+        ).flatten(start_dim=1).mean(dim=1)
+
+        zero = conditional_per_sample.sum() * 0.0
+        base_loss = base_per_sample.mean()
+        conditional_loss = conditional_per_sample.mean()
+        condition_one_loss = (
+            conditional_per_sample[condition_one].mean()
+            if condition_one.any()
+            else zero
+        )
+        condition_zero_loss = (
+            conditional_per_sample[condition_zero].mean()
+            if condition_zero.any()
+            else zero
+        )
+        total_loss = (
+            config["base_weight"] * base_loss
+            + config["conditional_weight"] * conditional_loss
+        )
+        losses = {
+            "recap_base_loss": base_loss,
+            "recap_conditional_loss": conditional_loss,
+            "recap_condition_one_loss": condition_one_loss,
+            "recap_condition_zero_loss": condition_zero_loss,
+            "recap_base_weight": torch.as_tensor(
+                config["base_weight"], device=noise.device
+            ),
+            "recap_conditional_weight": torch.as_tensor(
+                config["conditional_weight"], device=noise.device
+            ),
+            "recap_conditional_action_start": torch.as_tensor(
+                config["action_start"], device=noise.device
+            ),
+            "recap_conditional_action_horizon": torch.as_tensor(
+                config["action_horizon"], device=noise.device
+            ),
+        }
+        stats = {
+            "condition_one_fraction": condition_one.float().mean(),
+            "condition_zero_fraction": condition_zero.float().mean(),
+            "base_condition_mask_mean": torch.zeros((), device=noise.device),
+            "conditional_condition_mask_mean": torch.ones(
+                (), device=noise.device
+            ),
+            "conditional_action_fraction": torch.as_tensor(
+                float(config["action_horizon"]) / float(noise.shape[1]),
+                device=noise.device,
+            ),
+        }
+        return total_loss, losses, stats
     
     def process_batch_for_training(self, batch):
         """
@@ -669,6 +857,19 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 float(getattr(self, "reference_distillation_weight", 0.0))
                 > 0.0
             )
+            recap_paired_loss_enabled = bool(
+                getattr(self, "recap_paired_loss_enabled", False)
+            )
+            recap_paired_config = None
+            if recap_paired_loss_enabled:
+                self._validate_recap_paired_objective_compatibility(
+                    reference_distillation_enabled=reference_distillation_enabled,
+                )
+                recap_paired_config = self._recap_paired_loss_config(
+                    prediction_horizon=Tp,
+                    observation_horizon=To,
+                    action_horizon=Ta,
+                )
             if self.reference_policy_enabled or reference_distillation_enabled:
                 if self.reference_nets is None:
                     if reference_distillation_enabled:
@@ -681,12 +882,36 @@ class DiffusionPolicyUNet(PolicyAlgo):
             else:
                 obs_cond = self._encode_obs(inputs, self.nets)
             unconditioned_obs_cond = obs_cond
-            obs_cond, condition_stats = self._apply_success_condition(
-                obs_cond,
-                nets=self.nets,
-                batch=batch,
-                validate=validate,
-            )
+            recap_success_condition = None
+            base_obs_cond = None
+            if recap_paired_loss_enabled:
+                recap_success_condition, _ = self._success_condition_inputs(
+                    B,
+                    batch=batch,
+                    condition_mask=torch.ones(B, device=self.device),
+                    validate=True,
+                )
+                base_obs_cond, _ = self._apply_success_condition(
+                    unconditioned_obs_cond,
+                    nets=self.nets,
+                    success_condition=torch.zeros(B, device=self.device),
+                    condition_mask=torch.zeros(B, device=self.device),
+                    validate=True,
+                )
+                obs_cond, condition_stats = self._apply_success_condition(
+                    unconditioned_obs_cond,
+                    nets=self.nets,
+                    success_condition=recap_success_condition,
+                    condition_mask=torch.ones(B, device=self.device),
+                    validate=True,
+                )
+            else:
+                obs_cond, condition_stats = self._apply_success_condition(
+                    obs_cond,
+                    nets=self.nets,
+                    batch=batch,
+                    validate=validate,
+                )
             
             # sample noise to add to actions
             noise = torch.randn(actions.shape, device=self.device)
@@ -702,7 +927,15 @@ class DiffusionPolicyUNet(PolicyAlgo):
             noisy_actions = self.noise_scheduler.add_noise(
                 actions, noise, timesteps)
             
-            # predict the noise residual
+            # Predict the noise residual. RECAP paired mode intentionally reuses
+            # this exact noisy action tensor and timestep tensor for both passes.
+            base_noise_pred = None
+            if recap_paired_loss_enabled:
+                base_noise_pred = self.nets["policy"]["noise_pred_net"](
+                    noisy_actions,
+                    timesteps,
+                    global_cond=base_obs_cond,
+                )
             noise_pred = self.nets["policy"]["noise_pred_net"](
                 noisy_actions, timesteps, global_cond=obs_cond)
             
@@ -766,7 +999,19 @@ class DiffusionPolicyUNet(PolicyAlgo):
                     * reference_distillation_loss
                 )
 
-            if self.reference_margin_enabled:
+            recap_paired_losses = None
+            if recap_paired_loss_enabled:
+                loss, recap_paired_losses, recap_condition_stats = (
+                    self._compute_recap_paired_losses(
+                        base_noise_pred=base_noise_pred,
+                        conditional_noise_pred=noise_pred,
+                        noise=noise,
+                        success_condition=recap_success_condition,
+                        config=recap_paired_config,
+                    )
+                )
+                condition_stats.update(recap_condition_stats)
+            elif self.reference_margin_enabled:
                 anti_failure = batch["anti_failure"].flatten() > 0.5
                 positive = ~anti_failure
                 zero = per_sample_energy.sum() * 0.0
@@ -948,6 +1193,8 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 "l2_loss": loss,
                 "total_loss": loss,
             }
+            if recap_paired_losses is not None:
+                losses.update(recap_paired_losses)
             if reference_distillation_loss is not None:
                 losses.update(
                     {
@@ -1060,6 +1307,21 @@ class DiffusionPolicyUNet(PolicyAlgo):
         log["Loss"] = scalar(
             info["losses"].get("total_loss", info["losses"]["l2_loss"])
         )
+        for key, name in (
+            ("recap_base_loss", "RECAP/BaseLoss"),
+            ("recap_conditional_loss", "RECAP/ConditionalLoss"),
+            ("recap_condition_one_loss", "RECAP/Condition1Loss"),
+            ("recap_condition_zero_loss", "RECAP/Condition0Loss"),
+            ("recap_base_weight", "RECAP/BaseWeight"),
+            ("recap_conditional_weight", "RECAP/ConditionalWeight"),
+            ("recap_conditional_action_start", "RECAP/ConditionalActionStart"),
+            (
+                "recap_conditional_action_horizon",
+                "RECAP/ConditionalActionHorizon",
+            ),
+        ):
+            if key in info["losses"]:
+                log[name] = scalar(info["losses"][key])
         for key, name in (
             ("diffusion_bc_loss", "ReferenceDistillation/BCLoss"),
             ("reference_distillation_loss", "ReferenceDistillation/RawLoss"),

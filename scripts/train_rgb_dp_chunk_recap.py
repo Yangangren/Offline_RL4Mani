@@ -27,7 +27,11 @@ import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.train_utils as TrainUtils
 
-from rgb_dp_chunk_recap import build_canonical_episode_targets
+from rgb_dp_chunk_recap import (
+    assign_stratified_episode_folds,
+    build_canonical_episode_targets,
+    validate_episode_fold_assignment,
+)
 from rgb_dp_distributed import (
     DistributedContext,
     all_reduce_gradients,
@@ -62,13 +66,15 @@ from train_rgb_dp_idql import (
     configure_batch_semantics as configure_actor_batch_semantics,
     initialize_actor_from_deployed_ema,
     jsonable,
+    make_tensorboard_writer,
+    replace_with_hardlink,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET_FORMAT = "rgb_dp_chunk_recap_targets_v1"
-VALUE_FORMAT = "rgb_dp_chunk_recap_mc_value_v1"
-LABEL_FORMAT = "rgb_dp_chunk_recap_labels_v1"
+TARGET_FORMAT = "rgb_dp_chunk_recap_targets_v2"
+VALUE_FORMAT = "rgb_dp_chunk_recap_mc_value_v2"
+LABEL_FORMAT = "rgb_dp_chunk_recap_labels_v2"
 SOURCE_CODES = {
     "non_expert_failure": 0,
     "non_expert_success": 1,
@@ -193,6 +199,7 @@ def _stratified_episode_validation_split(
 def prepare_targets(args: argparse.Namespace) -> dict[str, Any]:
     dataset = args.dataset.expanduser().resolve()
     output = args.output.expanduser().resolve()
+    args.num_folds = int(getattr(args, "num_folds", 5))
     if not dataset.is_file():
         raise FileNotFoundError(dataset)
     if not 0.0 < float(args.gamma) <= 1.0:
@@ -201,6 +208,9 @@ def prepare_targets(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("chunk_horizon must be positive")
     if float(args.failure_penalty) <= 0.0 or float(args.return_scale) <= 0.0:
         raise ValueError("failure_penalty and return_scale must be positive")
+
+    if int(args.num_folds) < 2:
+        raise ValueError("num_folds must be at least two for out-of-fold labels")
 
     episode_records: list[dict[str, Any]] = []
     episode_sources: list[str] = []
@@ -268,6 +278,18 @@ def prepare_targets(args: argparse.Namespace) -> dict[str, Any]:
             )
             episode_sources.append(source)
 
+    episode_folds = assign_stratified_episode_folds(
+        np.arange(len(episode_records), dtype=np.int64),
+        np.asarray(episode_sources),
+        num_folds=int(args.num_folds),
+        seed=int(args.seed),
+    )
+    fold_audit = validate_episode_fold_assignment(
+        np.arange(len(episode_records), dtype=np.int64),
+        episode_folds,
+        num_folds=int(args.num_folds),
+        source=np.asarray(episode_sources),
+    )
     validation_episodes = _stratified_episode_validation_split(
         episode_sources, float(args.valid_fraction), int(args.seed)
     )
@@ -284,6 +306,7 @@ def prepare_targets(args: argparse.Namespace) -> dict[str, Any]:
             "source_is_expert",
             "is_validation",
             "episode_index",
+            "fold_index",
         )
     }
     summaries = []
@@ -312,12 +335,16 @@ def prepare_targets(args: argparse.Namespace) -> dict[str, Any]:
         field_lists["episode_index"].append(
             torch.full((length,), episode_index, dtype=torch.int32)
         )
+        field_lists["fold_index"].append(
+            torch.full((length,), int(episode_folds[episode_index]), dtype=torch.int16)
+        )
         summaries.append(
             {
                 "demo_key": record["demo_key"],
                 "source": source,
                 "num_samples": length,
                 "validation": episode_index in validation_episodes,
+                "fold_index": int(episode_folds[episode_index]),
                 "value_valid_samples": int(
                     torch.as_tensor(targets["value_valid"]).sum().item()
                 ),
@@ -328,7 +355,7 @@ def prepare_targets(args: argparse.Namespace) -> dict[str, Any]:
     num_samples = int(fields["mc_return"].shape[0])
     payload = {
         "kind": TARGET_FORMAT,
-        "version": 1,
+        "version": 2,
         "dataset_identity": mixed_dataset_identity(dataset),
         "dataset": str(dataset),
         "num_samples": num_samples,
@@ -346,10 +373,14 @@ def prepare_targets(args: argparse.Namespace) -> dict[str, Any]:
             "valid_fraction": float(args.valid_fraction),
             "split_seed": int(args.seed),
             "source_reward_mode": source_reward_mode,
+            "num_folds": int(args.num_folds),
+            "fold_seed": int(args.seed),
+            "fold_assignment": "episode_level_source_stratified_round_robin",
         },
         "source_codes": dict(SOURCE_CODES),
         "fields": fields,
         "episodes": summaries,
+        "fold_audit": fold_audit,
     }
     if output.exists() and not bool(args.overwrite):
         existing = load_sidecar(output, expected_kind=TARGET_FORMAT)
@@ -369,6 +400,7 @@ def prepare_targets(args: argparse.Namespace) -> dict[str, Any]:
         "episodes": len(summaries),
         "value_valid_samples": int(fields["value_valid"].sum().item()),
         "validation_samples": int(fields["is_validation"].sum().item()),
+        "fold_audit": fold_audit,
         "source_samples": {
             source: int((fields["source_code"] == code).sum().item())
             for source, code in SOURCE_CODES.items()
@@ -479,21 +511,45 @@ def make_loader(
 
 def value_split_indices(
     targets: dict[str, Any],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return stable global indices for MC training and validation rows."""
-    value_valid = torch.as_tensor(targets["fields"]["value_valid"]).bool()
-    is_validation = torch.as_tensor(targets["fields"]["is_validation"]).bool()
+    heldout_fold: int | None = None,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """Return legacy train/validation rows or strict v2 OOF split rows."""
+    fields = targets["fields"]
+    value_valid = torch.as_tensor(fields["value_valid"]).bool()
+    is_validation = torch.as_tensor(fields["is_validation"]).bool()
     if value_valid.ndim != 1 or is_validation.shape != value_valid.shape:
         raise ValueError("value-valid and validation sidecar fields must be 1-D peers")
-    train_indices = torch.nonzero(
-        value_valid & ~is_validation, as_tuple=False
-    ).reshape(-1)
-    validation_indices = torch.nonzero(
-        value_valid & is_validation, as_tuple=False
-    ).reshape(-1)
-    if train_indices.numel() == 0:
-        raise ValueError("RECAP target sidecar contains no MC-value training rows")
-    return train_indices, validation_indices
+    fold_index = torch.as_tensor(fields.get("fold_index", [])).long()
+    num_folds = int(targets.get("config", {}).get("num_folds", 0))
+    if fold_index.shape != value_valid.shape or num_folds < 2:
+        if heldout_fold is not None:
+            raise ValueError("RECAP v2 targets require row-aligned episode fold indices")
+        train_indices = torch.nonzero(
+            value_valid & ~is_validation, as_tuple=False
+        ).reshape(-1)
+        validation_indices = torch.nonzero(
+            value_valid & is_validation, as_tuple=False
+        ).reshape(-1)
+        if train_indices.numel() == 0:
+            raise ValueError("RECAP target sidecar contains no MC-value training rows")
+        return train_indices, validation_indices
+    if heldout_fold is None or not 0 <= int(heldout_fold) < num_folds:
+        raise ValueError(f"heldout_fold must be in [0, {num_folds})")
+    heldout_mask = fold_index == int(heldout_fold)
+    train_mask = value_valid & ~is_validation & ~heldout_mask
+    validation_mask = value_valid & is_validation & ~heldout_mask
+    heldout_mask &= value_valid
+    train_indices = torch.nonzero(train_mask, as_tuple=False).reshape(-1)
+    validation_indices = torch.nonzero(validation_mask, as_tuple=False).reshape(-1)
+    heldout_indices = torch.nonzero(heldout_mask, as_tuple=False).reshape(-1)
+    if train_indices.numel() == 0 or validation_indices.numel() == 0:
+        raise ValueError("each OOF value model requires nonempty inner train and validation rows")
+    if heldout_indices.numel() == 0:
+        raise ValueError("selected OOF fold contains no eligible held-out rows")
+    return train_indices, validation_indices, heldout_indices
 
 
 def _initialize_training_context(
@@ -574,6 +630,29 @@ def _mean_scalar_records(
         ]
         means[key] = torch.stack(tensors).mean()
     return means
+
+
+def _serialized_cli_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        key: jsonable(value)
+        for key, value in vars(args).items()
+        if key != "handler" and not callable(value)
+    }
+
+
+def _write_tensorboard_scalars(writer, metrics: dict[str, Any], step: int) -> None:
+    if writer is None:
+        return
+    for key, value in metrics.items():
+        if key in {"epoch", "global_step"}:
+            continue
+        try:
+            scalar = float(torch.as_tensor(value).detach().cpu().reshape(()).item())
+        except (TypeError, ValueError, RuntimeError):
+            continue
+        if np.isfinite(scalar):
+            writer.add_scalar(str(key), scalar, int(step))
+    writer.flush()
 
 
 def _architecture_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -699,7 +778,6 @@ def _apply_canonical_chunk_fields(
         chunk_return,
         terminal,
         valid_length,
-        is_validation,
     ) = sidecar_rows(
         target_sidecar,
         indices,
@@ -708,7 +786,6 @@ def _apply_canonical_chunk_fields(
         "chunk_return",
         "terminal",
         "valid_length",
-        "is_validation",
     )
     device = batch["actions"].device
     dtype = batch["actions"].dtype
@@ -733,10 +810,7 @@ def _apply_canonical_chunk_fields(
             dynamics_valid & availability
         ).to(dtype=dtype)
     mc_return = mc_return.to(device=device, dtype=dtype)
-    train_mask = (
-        value_valid.to(device=device, dtype=torch.bool)
-        & ~is_validation.to(device=device, dtype=torch.bool)
-    )
+    train_mask = value_valid.to(device=device, dtype=torch.bool)
     return mc_return, train_mask
 
 
@@ -767,7 +841,16 @@ def _value_checkpoint_payload(
     }
     return {
         "kind": VALUE_FORMAT,
-        "version": 1,
+        "version": 2,
+        "heldout_fold": int(args.heldout_fold),
+        "num_folds": int(args.num_folds),
+        "heldout_episode_indices": list(args.heldout_episode_indices),
+        "training_episode_indices": list(args.training_episode_indices),
+        "inner_validation_episode_indices": list(
+            args.inner_validation_episode_indices
+        ),
+        "heldout_rows": int(args.heldout_rows),
+        "checkpoint_selection_uses_heldout_targets": False,
         "rgb_dp_chunk_recap_value": True,
         "q_trained": False,
         "value_objective": "mse_to_canonical_discounted_monte_carlo_return",
@@ -825,6 +908,8 @@ def evaluate_value(
     system.eval()
     squared_sum = 0.0
     absolute_sum = 0.0
+    target_sum = 0.0
+    target_squared_sum = 0.0
     count = 0
     for batch_index, raw_batch in enumerate(loader):
         if (
@@ -843,27 +928,39 @@ def evaluate_value(
             critic_observation_horizon=int(args.observation_horizon),
             dynamics_prediction_offsets=(),
         )
-        mc_return, value_valid, is_validation = sidecar_rows(
-            targets, indices, "mc_return", "value_valid", "is_validation"
+        mc_return, value_valid = sidecar_rows(
+            targets, indices, "mc_return", "value_valid"
         )
-        mask = value_valid.bool() & is_validation.bool()
+        mask = value_valid.bool()
         if not torch.any(mask):
             continue
         prediction = system.value_from_state(
             system.encode_state(batch["obs"], batch.get("goal_obs"))
         ).reshape(-1).detach().cpu()
-        error = prediction[mask] - mc_return.float()[mask]
+        target = mc_return.float()[mask]
+        error = prediction[mask] - target
         squared_sum += float(error.square().sum().item())
         absolute_sum += float(error.abs().sum().item())
+        target_sum += float(target.sum().item())
+        target_squared_sum += float(target.square().sum().item())
         count += int(mask.sum().item())
     if count == 0:
-        return {"validation_mse": float("nan"), "validation_mae": float("nan"), "validation_rows": 0}
+        return {
+            "validation_mse": float("nan"),
+            "validation_mae": float("nan"),
+            "validation_r2": float("nan"),
+            "validation_rows": 0,
+        }
+    centered_sum = target_squared_sum - target_sum * target_sum / count
+    validation_r2 = (
+        1.0 - squared_sum / centered_sum if centered_sum > 0.0 else float("nan")
+    )
     return {
         "validation_mse": squared_sum / count,
         "validation_mae": absolute_sum / count,
+        "validation_r2": validation_r2,
         "validation_rows": count,
     }
-
 
 def _broadcast_validation_metrics(
     validation: dict[str, float] | None,
@@ -879,17 +976,19 @@ def _broadcast_validation_metrics(
         values = (
             float(validation["validation_mse"]),
             float(validation["validation_mae"]),
+            float(validation["validation_r2"]),
             float(validation["validation_rows"]),
         )
     else:
-        values = (float("nan"), float("nan"), 0.0)
+        values = (float("nan"), float("nan"), float("nan"), 0.0)
     tensor = torch.tensor(values, dtype=torch.float64, device=context.device)
     dist.broadcast(tensor, src=0)
     host = tensor.cpu().tolist()
     return {
         "validation_mse": float(host[0]),
         "validation_mae": float(host[1]),
-        "validation_rows": int(host[2]),
+        "validation_r2": float(host[2]),
+        "validation_rows": int(host[3]),
     }
 
 
@@ -904,6 +1003,8 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
         raise FileNotFoundError("dataset and pretrained DP checkpoint must exist")
     if int(args.epochs) < 1 or int(args.batch_size) < 1:
         raise ValueError("epochs and batch_size must be positive")
+    if int(args.snapshot_every_epochs) < 1:
+        raise ValueError("snapshot_every_epochs must be positive")
     if args.steps_per_epoch is not None and int(args.steps_per_epoch) < 1:
         raise ValueError("steps_per_epoch must be positive when provided")
     if args.validation_batches is not None and int(args.validation_batches) < 0:
@@ -933,6 +1034,21 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
         )
     args.chunk_horizon = target_chunk_horizon
     args.gamma = target_gamma
+    args.num_folds = int(targets["config"].get("num_folds", 0))
+    if args.num_folds < 2:
+        raise ValueError("RECAP v2 targets must define at least two folds")
+    expected_num_folds = getattr(args, "expected_num_folds", None)
+    if (
+        expected_num_folds is not None
+        and int(expected_num_folds) != args.num_folds
+    ):
+        raise ValueError(
+            f"requested num_folds={int(expected_num_folds)} differs from "
+            f"prepared targets={args.num_folds}"
+        )
+    if args.heldout_fold is None or not 0 <= int(args.heldout_fold) < args.num_folds:
+        raise ValueError(f"heldout_fold must be in [0, {args.num_folds})")
+    args.heldout_fold = int(args.heldout_fold)
     offsets = tuple(int(value) for value in args.dynamics_prediction_offsets)
     if (
         not offsets
@@ -983,7 +1099,25 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(
             f"dataset length={len(dataset)} differs from target rows={targets['num_samples']}"
         )
-    train_indices, validation_indices = value_split_indices(targets)
+    train_indices, validation_indices, heldout_indices = value_split_indices(
+        targets, args.heldout_fold
+    )
+    episode_index = torch.as_tensor(targets["fields"]["episode_index"]).long()
+    args.heldout_episode_indices = sorted(
+        int(value)
+        for value in torch.unique(episode_index.index_select(0, heldout_indices)).tolist()
+    )
+    args.heldout_rows = int(heldout_indices.numel())
+    all_episode_indices = {int(value) for value in torch.unique(episode_index).tolist()}
+    args.training_episode_indices = sorted(
+        all_episode_indices - set(args.heldout_episode_indices)
+    )
+    args.inner_validation_episode_indices = sorted(
+        int(value)
+        for value in torch.unique(
+            episode_index.index_select(0, validation_indices)
+        ).tolist()
+    )
     train_loader = make_loader(
         dataset,
         args,
@@ -1001,6 +1135,26 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
         if distributed.is_main_process
         else None
     )
+    writer = None
+    if distributed.is_main_process:
+        training_config = {
+            "kind": VALUE_FORMAT,
+            "complete": False,
+            "args": _serialized_cli_args(args),
+            "dataset_identity": mixed_dataset_identity(args.dataset),
+            "targets_identity": file_stat_identity(args.targets),
+            "pretrained_dp_identity": file_stat_identity(args.checkpoint),
+            "heldout_fold": int(args.heldout_fold),
+            "num_folds": int(args.num_folds),
+            "split_rows": {
+                "train": int(train_indices.numel()),
+                "inner_validation": int(validation_indices.numel()),
+                "heldout": int(heldout_indices.numel()),
+            },
+            "distributed_training": _distributed_metadata(args, distributed),
+        }
+        atomic_write_json(args.output_dir / "training_config.json", training_config)
+        writer = make_tensorboard_writer(args.output_dir)
     obs_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
 
     system, target_system = make_wcm_chunk_value_system(
@@ -1024,6 +1178,9 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
     if distributed.enabled:
         seed_process(int(args.seed) + int(distributed.rank), device)
 
+    updates_per_epoch = len(train_loader)
+    if args.steps_per_epoch is not None:
+        updates_per_epoch = min(updates_per_epoch, int(args.steps_per_epoch))
     global_step = 0
     history: list[dict[str, Any]] = []
     best_validation_mse: float | None = None
@@ -1149,19 +1306,44 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
                 best_validation_mse=best_validation_mse,
                 history=history,
             )
-            atomic_torch_save(payload, args.output_dir / "last.pt")
-            # With a deliberately zero validation fraction, retain a
-            # deterministic first-epoch fallback so the staged launcher still
-            # has a labelable checkpoint. Any later finite validation
-            # improvement replaces it.
+            last_path = args.output_dir / "last.pt"
+            atomic_torch_save(payload, last_path)
             if improved or (epoch == 1 and best_validation_mse is None):
                 atomic_torch_save(payload, args.output_dir / "best.pt")
+            if epoch % int(args.snapshot_every_epochs) == 0 or epoch == int(args.epochs):
+                replace_with_hardlink(
+                    last_path, args.output_dir / "models" / f"model_epoch_{epoch}.pt"
+                )
+            partial_summary = {
+                "kind": VALUE_FORMAT,
+                "complete": False,
+                "heldout_fold": int(args.heldout_fold),
+                "global_step": int(global_step),
+                "nominal_global_samples_seen": int(
+                    global_step * args.effective_global_batch_size
+                ),
+                "best_validation_mse": best_validation_mse,
+                "last_epoch": epoch_record,
+                "history": history,
+            }
+            atomic_write_json(args.output_dir / "partial_summary.json", partial_summary)
+            _write_tensorboard_scalars(writer, epoch_record, epoch)
             print(json.dumps(jsonable(epoch_record), indent=2), flush=True)
         if distributed.enabled:
             dist.barrier()
 
     summary = {
         "kind": VALUE_FORMAT,
+        "complete": True,
+        "heldout_fold": int(args.heldout_fold),
+        "num_folds": int(args.num_folds),
+        "checkpoint_selection_uses_heldout_targets": False,
+        "global_step": int(global_step),
+        "updates_per_epoch": int(updates_per_epoch),
+        "nominal_global_samples_seen": int(
+            global_step * args.effective_global_batch_size
+        ),
+        "last_epoch": history[-1] if history else None,
         "checkpoint": str(args.output_dir / "last.pt"),
         "best_checkpoint": (
             str(args.output_dir / "best.pt")
@@ -1176,7 +1358,12 @@ def train_value(args: argparse.Namespace) -> dict[str, Any]:
         "history": history,
     }
     if distributed.is_main_process:
+        training_config["complete"] = True
+        training_config["completed_global_step"] = int(global_step)
+        atomic_write_json(args.output_dir / "training_config.json", training_config)
         atomic_write_json(args.output_dir / "summary.json", summary)
+        if writer is not None:
+            writer.close()
     if distributed.enabled:
         dist.barrier()
     return summary if distributed.is_main_process else {}
@@ -1203,6 +1390,13 @@ def _save_recap_actor_checkpoint(
         "rgb_dp_chunk_recap_actor": True,
         "condition_label_sidecar": str(labels),
         "condition_dropout": float(condition_dropout),
+        "stochastic_condition_dropout_applied": False,
+        "recap_paired_loss_enabled": True,
+        "recap_base_loss_weight": float(args.base_loss_weight),
+        "recap_conditional_loss_weight": float(args.conditional_loss_weight),
+        "recap_conditional_action_start": int(args.observation_horizon) - 1,
+        "recap_conditional_action_horizon": int(args.chunk_horizon),
+        "recap_shared_noise_and_timestep": True,
         "inference_success_condition": 1.0,
         "inference_success_condition_mask": 1.0,
         "positive_only": False,
@@ -1236,13 +1430,25 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
         raise FileNotFoundError("dataset and pretrained DP checkpoint must exist")
     if not 0.0 <= float(args.condition_dropout) < 1.0:
         raise ValueError("condition_dropout must be in [0, 1)")
+    if int(args.snapshot_every_epochs) < 1:
+        raise ValueError("snapshot_every_epochs must be positive")
+    paired_weights = (
+        float(args.base_loss_weight), float(args.conditional_loss_weight)
+    )
+    if any(not np.isfinite(value) or value < 0.0 for value in paired_weights):
+        raise ValueError("paired actor loss weights must be finite and non-negative")
+    if sum(paired_weights) <= 0.0:
+        raise ValueError("at least one paired actor loss weight must be positive")
     if int(args.epochs) < 1 or int(args.batch_size) < 1:
         raise ValueError("epochs and batch_size must be positive")
     if args.steps_per_epoch is not None and int(args.steps_per_epoch) < 1:
         raise ValueError("steps_per_epoch must be positive when provided")
     labels = load_sidecar(args.labels, expected_kind=LABEL_FORMAT)
     validate_sidecar_dataset(labels, args.dataset, sidecar_name="RECAP label sidecar")
-    if labels.get("targets_identity") is None or labels.get("value_checkpoint_identity") is None:
+    value_provenance = labels.get("value_checkpoint_identities")
+    if labels.get("targets_identity") is None or not isinstance(
+        value_provenance, (list, tuple)
+    ) or not value_provenance:
         raise ValueError("RECAP labels lack target/value provenance")
     if labels.get("pretrained_dp_identity") != file_stat_identity(args.checkpoint):
         raise ValueError("RECAP labels were produced with a different pretrained DP")
@@ -1280,6 +1486,11 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
         condition_dropout=float(args.condition_dropout),
     )
     configure_conditioned_actor(actor_algo, condition_args)
+    actor_algo.recap_paired_loss_enabled = True
+    actor_algo.recap_base_loss_weight = float(args.base_loss_weight)
+    actor_algo.recap_conditional_loss_weight = float(args.conditional_loss_weight)
+    actor_algo.recap_conditional_action_start = None
+    actor_algo.recap_conditional_action_horizon = None
     prediction_horizon = int(actor_algo.algo_config.horizon.prediction_horizon)
     args.chunk_horizon = int(actor_algo.algo_config.horizon.action_horizon)
     if int(labels.get("config", {}).get("chunk_horizon", -1)) != int(
@@ -1341,6 +1552,29 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
     )
     if distributed.enabled:
         seed_process(int(args.seed) + int(distributed.rank), device)
+    writer = None
+    if distributed.is_main_process:
+        training_config = {
+            "kind": "rgb_dp_chunk_recap_actor_v2",
+            "complete": False,
+            "args": _serialized_cli_args(args),
+            "dataset_identity": mixed_dataset_identity(args.dataset),
+            "labels_identity": file_stat_identity(args.labels),
+            "label_summary": labels.get("summary"),
+            "pretrained_dp_identity": file_stat_identity(args.checkpoint),
+            "paired_objective": {
+                "base_weight": float(args.base_loss_weight),
+                "conditional_weight": float(args.conditional_loss_weight),
+                "base_horizon": int(prediction_horizon),
+                "conditional_action_start": int(args.observation_horizon) - 1,
+                "conditional_action_horizon": int(args.chunk_horizon),
+                "shared_noise_and_timestep": True,
+                "condition_zero_rows_trained": True,
+            },
+            "distributed_training": _distributed_metadata(args, distributed),
+        }
+        atomic_write_json(args.output_dir / "training_config.json", training_config)
+        writer = make_tensorboard_writer(args.output_dir)
     obs_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
     global_step = 0
     history: list[dict[str, Any]] = []
@@ -1383,12 +1617,19 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
             "global_step": global_step,
             **actor_metrics,
             "condition/positive_fraction": float(conditions.float().mean().item()),
-            "condition/dropout": float(args.condition_dropout),
+            "condition/configured_dropout": float(args.condition_dropout),
+            "condition/stochastic_dropout_applied": 0.0,
+            "objective/base_weight": float(args.base_loss_weight),
+            "objective/conditional_weight": float(args.conditional_loss_weight),
+            "objective/conditional_action_start": int(args.observation_horizon) - 1,
+            "objective/conditional_action_horizon": int(args.chunk_horizon),
+            "data/effective_global_batch_size": int(args.effective_global_batch_size),
         }
         history.append(epoch_record)
         if distributed.is_main_process:
+            last_path = args.output_dir / "last.pth"
             _save_recap_actor_checkpoint(
-                args.output_dir / "last.pth",
+                last_path,
                 actor_algo,
                 actor_config,
                 dp_checkpoint,
@@ -1400,25 +1641,63 @@ def train_actor(args: argparse.Namespace) -> dict[str, Any]:
                 condition_dropout=float(args.condition_dropout),
                 obs_normalization_stats=obs_stats,
             )
+            if epoch % int(args.snapshot_every_epochs) == 0 or epoch == int(args.epochs):
+                replace_with_hardlink(
+                    last_path, args.output_dir / "models" / f"model_epoch_{epoch}.pth"
+                )
+            partial_summary = {
+                "kind": "rgb_dp_chunk_recap_actor_v2",
+                "complete": False,
+                "global_step": int(global_step),
+                "nominal_global_samples_seen": int(
+                    global_step * args.effective_global_batch_size
+                ),
+                "last_epoch": epoch_record,
+                "history": history,
+            }
+            atomic_write_json(args.output_dir / "partial_summary.json", partial_summary)
+            _write_tensorboard_scalars(writer, epoch_record, epoch)
             print(json.dumps(jsonable(epoch_record), indent=2), flush=True)
         if distributed.enabled:
             dist.barrier()
 
     summary = {
-        "kind": "rgb_dp_chunk_recap_actor_v1",
+        "kind": "rgb_dp_chunk_recap_actor_v2",
+        "complete": True,
+        "global_step": int(global_step),
+        "updates_per_epoch": int(updates_per_epoch),
+        "nominal_global_samples_seen": int(
+            global_step * args.effective_global_batch_size
+        ),
+        "last_epoch": history[-1] if history else None,
+        "paired_objective": {
+            "base_weight": float(args.base_loss_weight),
+            "conditional_weight": float(args.conditional_loss_weight),
+            "base_horizon": int(prediction_horizon),
+            "conditional_action_start": int(args.observation_horizon) - 1,
+            "conditional_action_horizon": int(args.chunk_horizon),
+            "shared_noise_and_timestep": True,
+        },
         "checkpoint": str(args.output_dir / "last.pth"),
         "pretrained_dp_identity": file_stat_identity(args.checkpoint),
         "dataset_identity": mixed_dataset_identity(args.dataset),
         "labels_identity": file_stat_identity(args.labels),
+        "label_summary": labels.get("summary"),
         "positive_only": False,
         "condition_zero_rows_trained": True,
         "condition_dropout": float(args.condition_dropout),
+        "stochastic_condition_dropout_applied": False,
         "inference_condition": {"success_condition": 1.0, "condition_mask": 1.0},
         "distributed_training": _distributed_metadata(args, distributed),
         "history": history,
     }
     if distributed.is_main_process:
+        training_config["complete"] = True
+        training_config["completed_global_step"] = int(global_step)
+        atomic_write_json(args.output_dir / "training_config.json", training_config)
         atomic_write_json(args.output_dir / "summary.json", summary)
+        if writer is not None:
+            writer.close()
     if distributed.enabled:
         dist.barrier()
     return summary if distributed.is_main_process else {}
@@ -1475,11 +1754,12 @@ def make_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser("prepare-targets")
     prepare.add_argument("--dataset", type=Path, required=True)
     prepare.add_argument("--output", type=Path, required=True)
-    prepare.add_argument("--gamma", type=float, default=0.99)
+    prepare.add_argument("--gamma", type=float, default=1.0)
     prepare.add_argument("--chunk-horizon", type=int, default=8)
     prepare.add_argument("--failure-penalty", type=float, default=400.0)
     prepare.add_argument("--return-scale", type=float, default=800.0)
     prepare.add_argument("--valid-fraction", type=float, default=0.1)
+    prepare.add_argument("--num-folds", type=int, default=5)
     prepare.add_argument("--seed", type=int, default=0)
     prepare.add_argument("--overwrite", action="store_true")
     prepare.set_defaults(handler=prepare_targets)
@@ -1489,9 +1769,12 @@ def make_parser() -> argparse.ArgumentParser:
     value.add_argument("--targets", type=Path, required=True)
     value.add_argument("--checkpoint", type=Path, required=True)
     value.add_argument("--output-dir", type=Path, required=True)
+    value.add_argument("--heldout-fold", type=int, default=None)
+    value.add_argument("--expected-num-folds", type=int, default=None)
     value.add_argument("--epochs", type=int, default=100)
     value.add_argument("--steps-per-epoch", type=int, default=None)
     value.add_argument("--validation-batches", type=int, default=None)
+    value.add_argument("--snapshot-every-epochs", type=int, default=5)
     value.add_argument("--gamma", type=float, default=None)
     value.add_argument("--chunk-horizon", type=int, default=None)
     value.add_argument("--value-lr", type=float, default=1e-4)
@@ -1536,6 +1819,9 @@ def make_parser() -> argparse.ArgumentParser:
     actor.add_argument("--epochs", type=int, default=100)
     actor.add_argument("--steps-per-epoch", type=int, default=None)
     actor.add_argument("--condition-dropout", type=float, default=0.3)
+    actor.add_argument("--base-loss-weight", type=float, default=0.3)
+    actor.add_argument("--conditional-loss-weight", type=float, default=0.7)
+    actor.add_argument("--snapshot-every-epochs", type=int, default=5)
     actor.add_argument("--condition-hidden-dim", type=int, default=256)
     actor.add_argument("--actor-adapter-lr", type=float, default=1e-4)
     actor.add_argument("--actor-unet-lr", type=float, default=1e-4)
