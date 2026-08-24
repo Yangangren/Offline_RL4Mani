@@ -7294,7 +7294,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--task",
-        choices=("square", "can", "transport", "tool_hang", "pick_cup"),
+        choices=("square", "can", "transport", "tool_hang", "pick_cup", "stack_cup"),
         default="square",
     )
     parser.add_argument(

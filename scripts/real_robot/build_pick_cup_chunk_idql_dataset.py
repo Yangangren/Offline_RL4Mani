@@ -70,6 +70,13 @@ MANIFEST_ATTRS = (
 )
 SOURCE_IDENTITY_VERSION = 1
 BUILDER_VERSION = "pick_cup_chunk_idql_mixed_v1"
+DEFAULT_HUMAN_COUNT = 65
+DEFAULT_EXPECTED_HUMAN_TRANSITIONS = 27_499
+DEFAULT_SUCCESS_COUNT = 23
+DEFAULT_FAILURE_COUNT = 11
+DEFAULT_HUMAN_DATASETS_HELP = (
+    "Repeat for each human HDF5 shard (defaults to round 1 and round 2)."
+)
 REQUIRED_OBS_SHAPES = {
     "main_image": (None, None, 3),
     "wrist_image": (None, None, 3),
@@ -197,12 +204,12 @@ def _normalized_args(args: argparse.Namespace) -> argparse.Namespace:
         "task": TASK,
         "reward_mode": REWARD_MODE,
         "human_mask": "train",
-        "human_count": 65,
-        "expected_human_transitions": 27499,
+        "human_count": DEFAULT_HUMAN_COUNT,
+        "expected_human_transitions": DEFAULT_EXPECTED_HUMAN_TRANSITIONS,
         "success_mask": "success_train",
-        "success_count": 23,
+        "success_count": DEFAULT_SUCCESS_COUNT,
         "failure_mask": "failure_train",
-        "failure_count": 11,
+        "failure_count": DEFAULT_FAILURE_COUNT,
         "actor_condition_mode": "human_only",
         "seed": 0,
         "overwrite": False,
@@ -803,7 +810,7 @@ def validate_existing(raw_args: argparse.Namespace) -> dict[str, Any]:
         shown = "\n".join(f"- {error}" for error in errors[:50])
         if len(errors) > 50:
             shown += f"\n- ... {len(errors) - 50} more errors"
-        raise ValueError(f"pick-cup mixed dataset validation failed:\n{shown}")
+        raise ValueError(f"{TASK} mixed dataset validation failed:\n{shown}")
     return {
         "validated": True,
         "output": str(args.output),
@@ -920,24 +927,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="append",
         type=Path,
         default=None,
-        help="Repeat for each human HDF5 shard (defaults to round 1 and round 2).",
+        help=DEFAULT_HUMAN_DATASETS_HELP,
     )
     parser.add_argument("--rollout-dataset", type=Path, default=DEFAULT_ROLLOUT_DATASET)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--task", choices=(TASK,), default=TASK)
     parser.add_argument("--reward-mode", choices=(REWARD_MODE,), default=REWARD_MODE)
     parser.add_argument("--human-mask", default="train")
-    parser.add_argument("--human-count", type=int, default=65)
+    parser.add_argument("--human-count", type=int, default=DEFAULT_HUMAN_COUNT)
     parser.add_argument(
         "--expected-human-transitions",
         type=int,
-        default=27499,
+        default=DEFAULT_EXPECTED_HUMAN_TRANSITIONS,
         help="Fail if selected human rows drift; use -1 to disable this audit.",
     )
     parser.add_argument("--success-mask", default="success_train")
-    parser.add_argument("--success-count", type=int, default=23)
+    parser.add_argument("--success-count", type=int, default=DEFAULT_SUCCESS_COUNT)
     parser.add_argument("--failure-mask", default="failure_train")
-    parser.add_argument("--failure-count", type=int, default=11)
+    parser.add_argument("--failure-count", type=int, default=DEFAULT_FAILURE_COUNT)
     parser.add_argument(
         "--actor-condition-mode",
         choices=tuple(ACTOR_CONDITION_DEFINITIONS),

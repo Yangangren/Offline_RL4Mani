@@ -84,6 +84,30 @@ RGB_ALIGNMENT_DESCRIPTION = (
 EPISODE_RE = re.compile(
     r"^epoch200_20hz_real_(?P<day>\d{8})_(?P<clock>\d{6})$"
 )
+ENV_ARGS = {
+    "env_name": "PickCupReal-v0",
+    "env_version": "pick_cup_rgb_dp_v1",
+    "type": 2,
+    "env_kwargs": {
+        "real_robot": True,
+        "task": "pick_cup_place_on_plate",
+        "control_freq": 20,
+        "camera_names": ["main", "wrist"],
+        "camera_height": IMAGE_HEIGHT,
+        "camera_width": IMAGE_WIDTH,
+    },
+}
+FULL_DEFAULT_EXPECTED_ACTIONS = 400
+FULL_DEFAULT_SUCCESS_VALID_COUNT = 6
+FULL_DEFAULT_FAILURE_VALID_COUNT = 3
+EXPECTED_FULL_OUTCOME_COUNTS = {"success": 29, "failure": 14}
+EXPECTED_FULL_SAMPLES: int | None = 17_193
+EXPECTED_FULL_DROPPED_PREFIX_ACTIONS: int | None = 7
+# Audited task profiles may allow an exact, finite set of adjacent equal
+# precommand state timestamps. Backward timestamps and every unlisted repeat
+# remain fatal. Values are zero-based edge indices (row i -> row i + 1).
+ALLOWED_REPEATED_STATE_TIMESTAMP_EDGES: dict[str, tuple[int, ...]] = {}
+STARTUP_PREFIX_TRIM_ACTION_LIMIT = 8
 
 
 class RolloutConversionError(ValueError):
@@ -762,8 +786,34 @@ def _validate_steps(
         chunk_values.append(expected_chunk)
         substeps.append(expected_substep)
 
-    if np.any(np.diff(state_times) <= 0.0):
-        raise RolloutConversionError(f"{prefix}: precommand robot state timestamps are not increasing")
+    state_deltas = np.diff(state_times)
+    if np.any(state_deltas < 0.0):
+        raise RolloutConversionError(
+            f"{prefix}: precommand robot state timestamps move backward"
+        )
+    repeated_edges = tuple(int(index) for index in np.flatnonzero(state_deltas == 0.0))
+    expected_repeated_edges = ALLOWED_REPEATED_STATE_TIMESTAMP_EDGES.get(prefix, ())
+    if repeated_edges != expected_repeated_edges:
+        raise RolloutConversionError(
+            f"{prefix}: repeated precommand robot state timestamp edges "
+            f"{repeated_edges} differ from audited edges {expected_repeated_edges}"
+        )
+    for edge in repeated_edges:
+        try:
+            left_sequence = int(
+                steps[edge]["rosbag_join"]["precommand_robot_state_sequence"]
+            )
+            right_sequence = int(
+                steps[edge + 1]["rosbag_join"]["precommand_robot_state_sequence"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RolloutConversionError(
+                f"{prefix}: repeated state timestamp edge {edge} lacks sequence provenance"
+            ) from exc
+        if left_sequence != right_sequence:
+            raise RolloutConversionError(
+                f"{prefix}: repeated timestamp edge {edge} has different state sequences"
+            )
     for index in range(len(steps) - 1):
         if gripper_requested[index] and gripper_success[index] == 1:
             expected_logical = float(gripper_decisions[index])
@@ -1154,13 +1204,15 @@ def load_episode(source: EpisodeSource, options: BuildOptions) -> EpisodePayload
         # A startup recording gap can leave an initially useful but soon stale
         # held pair before the first later camera pair exists. Trim the entire
         # disconnected startup prefix. Any stale row after the first deployed
-        # eight-action chunk, or without exact NPZ evidence of a bag drop, is
+        # task-audited startup window, or without exact NPZ evidence of a bag drop, is
         # an internal data failure and remains fatal.
         try:
             dropped_prefix_actions, prefix_trim_reason = _startup_prefix_trim(
                 image_ages,
                 golden_input_recoveries,
-                startup_action_limit=max(options.action_horizon, 8),
+                startup_action_limit=max(
+                    options.action_horizon, STARTUP_PREFIX_TRIM_ACTION_LIMIT
+                ),
             )
         except RolloutConversionError as exc:
             raise RolloutConversionError(f"{source.episode_id}: {exc}") from exc
@@ -1409,7 +1461,8 @@ def _manifest(
             "resize": "Pillow Lanczos",
             "startup_prefix_policy": (
                 "trim through last stale row only when stale rows are confined "
-                "to the first action chunk and exact golden NPZ proves a startup "
+                f"to the first {STARTUP_PREFIX_TRIM_ACTION_LIMIT} actions and "
+                "exact golden NPZ proves a startup "
                 "rosbag camera drop; internal stale rows are fatal"
             ),
         },
@@ -1432,6 +1485,10 @@ def _manifest(
             ),
             "no_action_clamps": True,
             "checkpoint_and_scales": "strict",
+            "allowed_repeated_state_timestamp_edges": {
+                episode_id: list(edges)
+                for episode_id, edges in ALLOWED_REPEATED_STATE_TIMESTAMP_EDGES.items()
+            },
         },
         "split": {
             "seed": options.split_seed,
@@ -1461,6 +1518,11 @@ def _manifest(
                 "bag_identity": payload.bag_identity,
                 "runner_sha256": payload.runner_sha256,
                 "source_file_sha256": payload.source_file_sha256,
+                "repeated_state_timestamp_edges": list(
+                    ALLOWED_REPEATED_STATE_TIMESTAMP_EDGES.get(
+                        payload.source.episode_id, ()
+                    )
+                ),
             }
             for index, payload in enumerate(payloads)
         ],
@@ -1490,22 +1552,7 @@ def write_dataset(
             output.attrs["conversion_version"] = CONVERSION_VERSION
             output.attrs[CONVERSION_MANIFEST_ATTR] = json.dumps(manifest, sort_keys=True)
             data = output.create_group("data")
-            data.attrs["env_args"] = json.dumps(
-                {
-                    "env_name": "PickCupReal-v0",
-                    "env_version": "pick_cup_rgb_dp_v1",
-                    "type": 2,
-                    "env_kwargs": {
-                        "real_robot": True,
-                        "task": "pick_cup_place_on_plate",
-                        "control_freq": 20,
-                        "camera_names": ["main", "wrist"],
-                        "camera_height": IMAGE_HEIGHT,
-                        "camera_width": IMAGE_WIDTH,
-                    },
-                },
-                sort_keys=True,
-            )
+            data.attrs["env_args"] = json.dumps(ENV_ARGS, sort_keys=True)
             total = 0
             valid_ids = set(masks["valid"])
             for index, payload in enumerate(payloads):
@@ -1522,6 +1569,13 @@ def write_dataset(
                     payload.logical_tick_origin_time
                 )
                 demo.attrs["source_episode_id"] = payload.source.episode_id
+                demo.attrs["repeated_state_timestamp_edges"] = json.dumps(
+                    list(
+                        ALLOWED_REPEATED_STATE_TIMESTAMP_EDGES.get(
+                            payload.source.episode_id, ()
+                        )
+                    )
+                )
                 demo.attrs["source_directory"] = str(payload.source.path)
                 demo.attrs["task_outcome"] = payload.source.outcome
                 demo.attrs["outcome"] = int(success)
@@ -1863,6 +1917,25 @@ def validate_dataset(
             manifest_item = manifest_by_id.get(episode_id)
             if not isinstance(manifest_item, Mapping):
                 raise RolloutConversionError(f"{path}:{key}: manifest provenance absent")
+            expected_repeated_edges = list(
+                ALLOWED_REPEATED_STATE_TIMESTAMP_EDGES.get(episode_id, ())
+            )
+            try:
+                attr_repeated_edges = json.loads(
+                    str(demo.attrs.get("repeated_state_timestamp_edges", "[]"))
+                )
+            except json.JSONDecodeError as exc:
+                raise RolloutConversionError(
+                    f"{path}:{key}: repeated timestamp provenance is invalid"
+                ) from exc
+            if (
+                manifest_item.get("repeated_state_timestamp_edges", [])
+                != expected_repeated_edges
+                or attr_repeated_edges != expected_repeated_edges
+            ):
+                raise RolloutConversionError(
+                    f"{path}:{key}: repeated timestamp provenance differs"
+                )
             expected_recoveries = manifest_item.get("golden_input_recoveries")
             if not isinstance(expected_recoveries, list):
                 raise RolloutConversionError(f"{path}:{key}: golden recovery details absent")
@@ -1986,11 +2059,25 @@ def validate_dataset(
                     wrist_stamp,
                     image_age,
                 )
-            ) or np.any(np.diff(state_time) <= 0.0) or np.any(
+            ) or np.any(np.diff(state_time) < 0.0) or np.any(
                 np.diff(tick_index) < 0
             ):
                 raise RolloutConversionError(
                     f"{path}:{key}: RGB timing is non-finite or non-monotone"
+                )
+            actual_repeated_edges = [
+                int(index)
+                for index in np.flatnonzero(np.diff(state_time) == 0.0)
+            ]
+            # Prefix trimming changes row indices in the materialized dataset.
+            materialized_expected_repeated_edges = [
+                edge - dropped_prefix
+                for edge in expected_repeated_edges
+                if edge >= dropped_prefix
+            ]
+            if actual_repeated_edges != materialized_expected_repeated_edges:
+                raise RolloutConversionError(
+                    f"{path}:{key}: actual repeated timestamp edges differ"
                 )
             if not np.array_equal(
                 source_action_index,
@@ -2036,13 +2123,24 @@ def validate_dataset(
                     )
         if int(data.attrs.get("total", -1)) != samples:
             raise RolloutConversionError(f"{path}: data.total differs")
-        if successes == 29 and failures == 14:
+        if {
+            "success": successes,
+            "failure": failures,
+        } == EXPECTED_FULL_OUTCOME_COUNTS:
             manifest_dropped = int(
                 manifest.get("validation", {}).get(
                     "dropped_startup_prefix_actions", -1
                 )
             )
-            if samples != 17_193 or manifest_dropped != 7:
+            samples_differ = (
+                EXPECTED_FULL_SAMPLES is not None
+                and samples != EXPECTED_FULL_SAMPLES
+            )
+            dropped_differ = (
+                EXPECTED_FULL_DROPPED_PREFIX_ACTIONS is not None
+                and manifest_dropped != EXPECTED_FULL_DROPPED_PREFIX_ACTIONS
+            )
+            if samples_differ or dropped_differ:
                 raise RolloutConversionError(
                     f"{path}: full rollout sample/prefix-trim totals differ"
                 )
@@ -2071,20 +2169,20 @@ def build_dataset(options: BuildOptions) -> dict[str, Any]:
     episodes = discover_episodes(source_root)
     full_default = (
         options.episode_limit is None
-        and options.expected_actions == 400
+        and options.expected_actions == FULL_DEFAULT_EXPECTED_ACTIONS
         and options.action_horizon == 8
-        and options.success_valid_count == 6
-        and options.failure_valid_count == 3
+        and options.success_valid_count == FULL_DEFAULT_SUCCESS_VALID_COUNT
+        and options.failure_valid_count == FULL_DEFAULT_FAILURE_VALID_COUNT
     )
     if full_default:
         outcome_counts = {
             outcome: sum(episode.outcome == outcome for episode in episodes)
             for outcome in ("success", "failure")
         }
-        if outcome_counts != {"success": 29, "failure": 14}:
+        if outcome_counts != EXPECTED_FULL_OUTCOME_COUNTS:
             raise RolloutConversionError(
-                "full pick-cup rollout source must contain exactly 29 successes "
-                f"and 14 failures, got {outcome_counts}"
+                "full rollout source outcome counts differ: expected "
+                f"{EXPECTED_FULL_OUTCOME_COUNTS}, got {outcome_counts}"
             )
     # Split the full source set before applying the smoke-test limit so the
     # identity of an episode never changes with --episode-limit.
@@ -2114,10 +2212,20 @@ def build_dataset(options: BuildOptions) -> dict[str, Any]:
     if full_default:
         total_samples = sum(payload.num_samples for payload in payloads)
         total_dropped = sum(payload.dropped_prefix_actions for payload in payloads)
-        if total_samples != 17_193 or total_dropped != 7:
+        samples_differ = (
+            EXPECTED_FULL_SAMPLES is not None
+            and total_samples != EXPECTED_FULL_SAMPLES
+        )
+        dropped_differ = (
+            EXPECTED_FULL_DROPPED_PREFIX_ACTIONS is not None
+            and total_dropped != EXPECTED_FULL_DROPPED_PREFIX_ACTIONS
+        )
+        if samples_differ or dropped_differ:
             raise RolloutConversionError(
-                "full rollout startup-trim contract expects 17,193 samples and "
-                f"7 dropped prefix actions, got {total_samples} and {total_dropped}"
+                "full rollout startup-trim contract differs: expected "
+                f"samples={EXPECTED_FULL_SAMPLES}, dropped_prefix_actions="
+                f"{EXPECTED_FULL_DROPPED_PREFIX_ACTIONS}; got {total_samples} "
+                f"and {total_dropped}"
             )
     write_dataset(output, payloads, masks, options)
     report = validate_dataset(
