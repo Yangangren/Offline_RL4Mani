@@ -86,14 +86,14 @@ case "$TASK" in
     TASK_DP_CHECKPOINT=trained_models/transport_rgb_dp/transport_ph_rgb_dp_official_s1/models/model_epoch_200.pth
     TASK_EXPERT_DATASET=datasets/transport/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/transport_rgb_dp/epoch200_collection/transport_rgb_dp_rollouts_rgb4.hdf5
-    TASK_IDQL_DATASET=datasets/transport/idql/transport_rgb_dp_idql_200demo_100success_50failure.hdf5
+    TASK_IDQL_DATASET=datasets/transport/idql/transport_rgb_dp_idql_200demo_422success_78failure.hdf5
     TASK_IDQL_OUTPUT_DIR=trained_models/transport_rgb_dp/idql/200demo_100success_50failure
     TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/transport_rgb_dp/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition
     TASK_EXPERT_MASK=
     TASK_EXPERT_COUNT=200
-    TASK_SUCCESS_MASK=success_100
+    TASK_SUCCESS_MASK=success
     TASK_SUCCESS_COUNT=-1
-    TASK_FAILURE_MASK=failure_50
+    TASK_FAILURE_MASK=failure
     TASK_FAILURE_COUNT=-1
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
     TASK_CHUNK_EPOCHS=50
@@ -105,19 +105,20 @@ case "$TASK" in
     TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/transport_rgb_dp/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition_epoch200_actor
     TASK_EVAL_HORIZON=700
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos,robot1_gripper_qpos
+    TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     ;;
   tool_hang)
     TASK_DP_CHECKPOINT=trained_models/tool_hang_rgb_dp/tool_hang_ph_rgb_dp_official_s1/models/model_epoch_200.pth
     TASK_EXPERT_DATASET=datasets/tool_hang/ph/image_v15.rebuilt.hdf5
     TASK_ROLLOUT_DATASET=rollouts/tool_hang_rgb_dp/epoch200_collection/tool_hang_rgb_dp_rollouts_rgb2.hdf5
-    TASK_IDQL_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_100success_50failure.hdf5
+    TASK_IDQL_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_132success_168failure.hdf5
     TASK_IDQL_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/idql/200demo_100success_50failure
     TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition
     TASK_EXPERT_MASK=
     TASK_EXPERT_COUNT=200
-    TASK_SUCCESS_MASK=success_100
+    TASK_SUCCESS_MASK=success
     TASK_SUCCESS_COUNT=-1
-    TASK_FAILURE_MASK=failure_50
+    TASK_FAILURE_MASK=failure
     TASK_FAILURE_COUNT=-1
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
     TASK_CHUNK_EPOCHS=50
@@ -345,6 +346,7 @@ SOURCE_CHUNK_IDQL_CHECKPOINT=${SOURCE_CHUNK_IDQL_CHECKPOINT:-$TASK_SOURCE_CHUNK_
 CHUNK_IDQL_OUTPUT_DIR=${CHUNK_IDQL_OUTPUT_DIR:-$DEFAULT_CHUNK_IDQL_OUTPUT_DIR}
 CHUNK_INITIALIZATION=${CHUNK_INITIALIZATION:-$TASK_CHUNK_INITIALIZATION}
 CHUNK_CONDITIONED_ACTOR=${CHUNK_CONDITIONED_ACTOR:-1}
+TRAIN_ACTOR_ONLY=${TRAIN_ACTOR_ONLY:-0}
 CHUNK_CRITIC_ARCHITECTURE=${CHUNK_CRITIC_ARCHITECTURE:-legacy}
 CHUNK_RISE_V2_FUSION_MODE=${CHUNK_RISE_V2_FUSION_MODE:-film}
 CHUNK_RISE_V2_DENSE_DYNAMICS=${CHUNK_RISE_V2_DENSE_DYNAMICS:-0}
@@ -719,6 +721,26 @@ CHUNK_CONDITION_ARGS=(--conditioned-actor)
 if [[ "$CHUNK_CONDITIONED_ACTOR" == "0" ]]; then
   CHUNK_CONDITION_ARGS=(--no-conditioned-actor)
 fi
+TRAIN_ACTOR_ONLY_ARG=--no-actor-only
+case "$TRAIN_ACTOR_ONLY" in
+  0)
+    ;;
+  1)
+    if [[ "$CHUNK_CONDITIONED_ACTOR" != "1" ]]; then
+      echo "TRAIN_ACTOR_ONLY=1 requires CHUNK_CONDITIONED_ACTOR=1." >&2
+      exit 2
+    fi
+    if [[ "$CHUNK_INITIALIZATION" != "pretrained_dp_joint" && "$CHUNK_INITIALIZATION" != "source_idql_joint" ]]; then
+      echo "TRAIN_ACTOR_ONLY=1 requires CHUNK_INITIALIZATION=pretrained_dp_joint or source_idql_joint." >&2
+      exit 2
+    fi
+    TRAIN_ACTOR_ONLY_ARG=--actor-only
+    ;;
+  *)
+    echo "TRAIN_ACTOR_ONLY must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
 CHUNK_EVAL_CONDITION_ARGS=(
   --require-success-condition-adapter
   --no-forbid-success-condition-adapter
@@ -958,6 +980,12 @@ run_chunk_train() {
         --source-idql-checkpoint "$SOURCE_IDQL_CHECKPOINT"
       )
       ;;
+    source_idql_joint)
+      initialization_args=(
+        --initialization source_idql_joint
+        --source-idql-checkpoint "$SOURCE_IDQL_CHECKPOINT"
+      )
+      ;;
     source_chunk_idql_joint)
       initialization_args=(
         --initialization source_chunk_idql_joint
@@ -1022,6 +1050,7 @@ run_chunk_train() {
     --actor-lr-warmup-steps "${CHUNK_ACTOR_LR_WARMUP_STEPS:-500}" \
     --actor-lr-num-cycles "${CHUNK_ACTOR_LR_NUM_CYCLES:-0.5}" \
     "${CHUNK_CONDITION_ARGS[@]}" \
+    "$TRAIN_ACTOR_ONLY_ARG" \
     --condition-dropout "${CHUNK_CONDITION_DROPOUT:-${CONDITION_DROPOUT:-0.0}}" \
     --condition-hidden-dim "${CHUNK_CONDITION_HIDDEN_DIM:-${CONDITION_HIDDEN_DIM:-$TASK_CHUNK_CONDITION_HIDDEN_DIM}}" \
     --critic-lr "${CHUNK_CRITIC_LR:-${CRITIC_LR:-1e-4}}" \

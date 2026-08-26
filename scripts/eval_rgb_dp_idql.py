@@ -1514,6 +1514,17 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             f"IDQL checkpoint task mismatch: expected {args.expected_task!r}, "
             f"found {checkpoint_task!r} in {idql_checkpoint}"
         )
+    if bool(checkpoint.get("actor_only", False)):
+        if args.actor_source != "hybrid_dp_chunk_actor":
+            raise ValueError(
+                "actor-only checkpoints must evaluate their saved conditioned "
+                "actor with actor_source=hybrid_dp_chunk_actor"
+            )
+        if int(args.num_candidates) != 1:
+            raise ValueError(
+                "actor-only checkpoints have no trained critic; set "
+                "--num-candidates 1"
+            )
     external_dp_chunk_critic = args.actor_source == "external_dp_chunk_critic"
     dp_checkpoint = resolve_base_dp_checkpoint(checkpoint, args)
     dp_policy, dp_ckpt = FileUtils.policy_from_checkpoint(
@@ -1844,8 +1855,7 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
     if args.actor_source == "hybrid_dp_chunk_actor":
         if not hybrid_dp_chunk_actor_iql:
             raise ValueError(
-                "actor_source=hybrid_dp_chunk_actor requires a checkpoint from "
-                "train_square_rgb_dp_chunk_actor_iql.py"
+                "actor_source=hybrid_dp_chunk_actor requires a special checkpoint."
             )
         dp_policy.policy.deserialize(checkpoint["actor_model"], load_optimizers=False)
         dp_policy.policy.set_eval()

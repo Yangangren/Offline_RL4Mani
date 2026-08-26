@@ -59,7 +59,6 @@ from train_rgb_dp_idql import (
     jsonable,
     make_tensorboard_writer,
     make_step_lr_scheduler,
-    mean_metrics,
     parameter_count,
     replace_with_hardlink,
     restore_rng_state,
@@ -87,10 +86,10 @@ ACTOR_CONDITION_DEFINITIONS = {
 }
 DYNAMICS_PREDICTION_MODE = "actor_encoder_direct"
 RISE_V2_DYNAMICS_PREDICTION_MODE = (
-    "actor_encoder_multi_offset_causal_action_prefix"
+    "actor_visual_encoder_multi_offset_causal_action_prefix"
 )
 WCM_DYNAMICS_PREDICTION_MODE = "shared_critic_latent_multi_offset_residual"
-RISE_V2_DYNAMICS_TARGET_MODE = "periodic_hard_copy_actor_encoder_v1"
+RISE_V2_DYNAMICS_TARGET_MODE = "periodic_hard_copy_actor_visual_encoder_v2"
 WCM_DYNAMICS_TARGET_MODE = "periodic_hard_copy_frame_encoder_v1"
 LEGACY_WCM_DYNAMICS_TARGET_MODE = "online_stop_gradient_frame_encoder_v0"
 WCM_DYNAMICS_TARGET_STATE_KEY = "wcm_dynamics_frame_target"
@@ -109,7 +108,11 @@ DEFAULT_LEGACY_DYNAMICS_TARGET_SYNC_INTERVAL = 1000
 ACTOR_OPTIMIZER_TYPE = "adamw"
 ACTOR_WEIGHT_DECAY = 1e-6
 JOINT_ACTOR_INITIALIZATIONS = frozenset(
-    ("pretrained_dp_joint", "source_chunk_idql_joint")
+    (
+        "pretrained_dp_joint",
+        "source_idql_joint",
+        "source_chunk_idql_joint",
+    )
 )
 LATEST_CHECKPOINT_NAME = "latest.pt"
 LATEST_CHECKPOINT_TEMP_PREFIX = f".{LATEST_CHECKPOINT_NAME}.tmp-"
@@ -660,6 +663,73 @@ def mean_distributed_scalars(
     )
 
 
+def _local_scalar_tensor(value: Any, device: torch.device) -> torch.Tensor:
+    """Return one detached float32 scalar without a distributed collective."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(f"metric is not scalar: {tuple(value.shape)}")
+        return value.detach().reshape(()).to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+    scalar = torch.as_tensor(value, device=device, dtype=torch.float32)
+    if scalar.numel() != 1:
+        raise ValueError(f"metric is not scalar: {tuple(scalar.shape)}")
+    return scalar.reshape(())
+
+
+class LocalScalarMetricAccumulator:
+    """Packed rank-local epoch metrics with no per-step host synchronization."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.keys: tuple[str, ...] = ()
+        self.sums: torch.Tensor | None = None
+        self.count = 0
+
+    @torch.no_grad()
+    def update(self, metrics: dict[str, Any]) -> None:
+        keys = tuple(sorted(metrics))
+        if self.keys and keys != self.keys:
+            raise ValueError("metric keys changed within an epoch")
+        values = torch.stack(
+            [_local_scalar_tensor(metrics[key], self.device) for key in keys]
+        )
+        if self.sums is None:
+            self.keys = keys
+            self.sums = values.clone()
+        else:
+            self.sums.add_(values)
+        self.count += 1
+
+    @torch.no_grad()
+    def means(self) -> dict[str, float]:
+        if self.sums is None or self.count == 0:
+            return {}
+        host_values = (self.sums / float(self.count)).cpu().tolist()
+        return {
+            key: float(value)
+            for key, value in zip(self.keys, host_values)
+        }
+
+
+@torch.no_grad()
+def materialize_local_scalar_metrics(
+    metrics: dict[str, Any],
+    device: torch.device,
+) -> dict[str, float]:
+    """Materialize rank-local metrics with one packed device-to-host transfer."""
+    if not metrics:
+        return {}
+    keys = sorted(metrics)
+    values = torch.stack(
+        [_local_scalar_tensor(metrics[key], device) for key in keys]
+    )
+    host_values = values.cpu().tolist()
+    return {key: float(value) for key, value in zip(keys, host_values)}
+
+
 def gather_rank_runtime_states(
     loader_generator: torch.Generator,
     context: DistributedContext,
@@ -680,6 +750,25 @@ def gather_rank_runtime_states(
 
 def trains_joint_actor(args: argparse.Namespace) -> bool:
     return str(args.initialization) in JOINT_ACTOR_INITIALIZATIONS
+
+
+def validate_training_mode(args: argparse.Namespace) -> None:
+    """Keep actor-only training explicit and impossible to misconfigure."""
+    actor_only = bool(getattr(args, "actor_only", False))
+    initialization = str(args.initialization)
+    if actor_only:
+        if not bool(args.conditioned_actor):
+            raise ValueError("actor-only training requires --conditioned-actor")
+        if initialization not in (
+            "pretrained_dp_joint",
+            "source_idql_joint",
+        ):
+            raise ValueError(
+                "actor-only training requires initialization="
+                "pretrained_dp_joint or source_idql_joint"
+            )
+    elif initialization == "source_idql_joint":
+        raise ValueError("source_idql_joint is only supported with --actor-only")
 
 
 def observation_history_frames(
@@ -1170,6 +1259,7 @@ class RiseV2ChunkActionValueNetwork(RiseV2TemporalObservationNetwork):
         temporal_dropout: float,
         fusion_mode: str,
         dynamics_prediction_offsets: tuple[int, ...],
+        dynamics_target_dim: int,
     ):
         super().__init__(
             obs_shapes=obs_shapes,
@@ -1189,6 +1279,7 @@ class RiseV2ChunkActionValueNetwork(RiseV2TemporalObservationNetwork):
         self.dynamics_prediction_offsets = tuple(
             int(value) for value in dynamics_prediction_offsets
         )
+        self.dynamics_target_dim = int(dynamics_target_dim)
         self.q_use_predicted_next_latent = False
         self.nets["action_encoder"] = CausalSequentialActionChunkEncoder(
             action_dim=self.action_dim,
@@ -1214,7 +1305,7 @@ class RiseV2ChunkActionValueNetwork(RiseV2TemporalObservationNetwork):
         if self.dynamics_prediction_offsets:
             self.nets["dynamics_predictor"] = MultiHorizonLatentPredictor(
                 latent_dim=self.latent_dim,
-                target_dim=self.encoder_output_dim,
+                target_dim=self.dynamics_target_dim,
                 prediction_offsets=self.dynamics_prediction_offsets,
                 hidden_dims=hidden_dims,
                 dropout=float(dropout),
@@ -1346,6 +1437,7 @@ def make_rise_v2_chunk_value_networks(
     temporal_dropout: float = 0.0,
     fusion_mode: str = "film",
     dynamics_prediction_offsets: tuple[int, ...] = (),
+    dynamics_target_dim: int | None = None,
 ) -> tuple[nn.ModuleList, nn.ModuleList, RiseV2ChunkValueNetwork]:
     encoder_kwargs = ObsUtils.obs_encoder_kwargs_from_config(
         actor_algo.obs_config.encoder
@@ -1361,6 +1453,13 @@ def make_rise_v2_chunk_value_networks(
         "temporal_feedforward_dim": int(temporal_feedforward_dim),
         "temporal_dropout": float(temporal_dropout),
     }
+    if dynamics_target_dim is None:
+        dynamics_target_dim = actor_visual_feature_dim(
+            deployed_actor_obs_encoder(actor_algo)
+        )
+    dynamics_target_dim = int(dynamics_target_dim)
+    if dynamics_target_dim <= 0:
+        raise ValueError("RISE-v2 dynamics target dimension must be positive")
     critics = nn.ModuleList(
         [
             RiseV2ChunkActionValueNetwork(
@@ -1377,6 +1476,7 @@ def make_rise_v2_chunk_value_networks(
                 dynamics_prediction_offsets=tuple(
                     int(value) for value in dynamics_prediction_offsets
                 ),
+                dynamics_target_dim=dynamics_target_dim,
             )
             for _ in range(int(num_critics))
         ]
@@ -1443,6 +1543,15 @@ def make_rise_v2_system_from_checkpoint(
         raise ValueError(
             "RISE-v2 dense-dynamics metadata and prediction offsets disagree"
         )
+    dynamics_target_dim = checkpoint.get("dynamics_prediction_output_dim")
+    if dynamics_target_dim is None:
+        # RISE-v2 checkpoints predating visual-only supervision used the full
+        # actor observation-encoder vector. This branch is evaluation-only;
+        # resume and source warm-start validation require the current target
+        # contract marker.
+        dynamics_target_dim = int(
+            deployed_actor_obs_encoder(actor_algo).output_shape()[0]
+        )
     return make_rise_v2_chunk_value_networks(
         actor_algo,
         chunk_horizon=int(checkpoint["critic_chunk_horizon"]),
@@ -1464,6 +1573,7 @@ def make_rise_v2_system_from_checkpoint(
         temporal_dropout=float(checkpoint["critic_temporal_dropout"]),
         fusion_mode=str(checkpoint["rise_v2_fusion_mode"]),
         dynamics_prediction_offsets=offsets,
+        dynamics_target_dim=int(dynamics_target_dim),
     )
 
 
@@ -1524,6 +1634,8 @@ def make_rise_chunk_value_networks(
 
 
 def named_crop_randomizers(encoder: nn.Module) -> list[tuple[str, CropRandomizer]]:
+    if isinstance(encoder, RiseV2VisualDynamicsTargetEncoder):
+        encoder = encoder.encoder
     return [
         (name, module)
         for name, module in encoder.named_modules()
@@ -2167,6 +2279,74 @@ def deployed_actor_obs_encoder(actor_algo) -> nn.Module:
     return actor_nets["policy"]["obs_encoder"]
 
 
+def actor_visual_feature_indices(encoder: nn.Module) -> tuple[int, ...]:
+    """Locate RGB feature coordinates in an actor ObservationGroupEncoder."""
+    if not hasattr(encoder, "nets") or "obs" not in encoder.nets:
+        raise TypeError(
+            "RISE-v2 visual dynamics requires an ObservationGroupEncoder with "
+            "an 'obs' group"
+        )
+    obs_encoder = encoder.nets["obs"]
+    required = ("obs_shapes", "obs_nets", "obs_randomizers")
+    if any(not hasattr(obs_encoder, name) for name in required):
+        raise TypeError(
+            "RISE-v2 visual dynamics cannot inspect actor observation features"
+        )
+
+    indices: list[int] = []
+    offset = 0
+    for key in obs_encoder.obs_shapes:
+        feature_shape = obs_encoder.obs_shapes[key]
+        for randomizer in obs_encoder.obs_randomizers[key]:
+            if randomizer is not None:
+                feature_shape = randomizer.output_shape_in(feature_shape)
+        observation_net = obs_encoder.obs_nets[key]
+        if observation_net is not None:
+            feature_shape = observation_net.output_shape(feature_shape)
+        for randomizer in obs_encoder.obs_randomizers[key]:
+            if randomizer is not None:
+                feature_shape = randomizer.output_shape_out(feature_shape)
+        feature_dim = int(np.prod(feature_shape))
+        if ObsUtils.key_is_obs_modality(key=key, obs_modality="rgb"):
+            indices.extend(range(offset, offset + feature_dim))
+        offset += feature_dim
+
+    encoder_output_dim = int(encoder.output_shape()[0])
+    if offset != encoder_output_dim:
+        raise RuntimeError(
+            "actor observation feature layout does not match encoder output: "
+            f"layout={offset}, output={encoder_output_dim}"
+        )
+    if not indices:
+        raise ValueError("RISE-v2 visual dynamics requires at least one RGB input")
+    return tuple(indices)
+
+
+def actor_visual_feature_dim(encoder: nn.Module) -> int:
+    return int(len(actor_visual_feature_indices(encoder)))
+
+
+class RiseV2VisualDynamicsTargetEncoder(nn.Module):
+    """Frozen actor encoder that exposes only its concatenated RGB features."""
+
+    def __init__(self, source_encoder: nn.Module):
+        super().__init__()
+        self.encoder = copy.deepcopy(source_encoder)
+        indices = actor_visual_feature_indices(self.encoder)
+        self.register_buffer(
+            "visual_feature_indices",
+            torch.as_tensor(indices, dtype=torch.long),
+            persistent=False,
+        )
+
+    def output_shape(self) -> list[int]:
+        return [int(self.visual_feature_indices.numel())]
+
+    def forward(self, **inputs) -> torch.Tensor:
+        encoded = self.encoder(**inputs)
+        return encoded.index_select(-1, self.visual_feature_indices)
+
+
 def copy_deployed_dp_encoder_state(module: nn.Module, actor_algo) -> dict[str, int]:
     """Copy, but do not share, the deployed DP raw-observation encoder."""
     source = deployed_actor_obs_encoder(actor_algo)
@@ -2241,7 +2421,12 @@ def sync_actor_dynamics_target_encoder(
     """Hard-sync the frozen dynamics teacher from the deployed actor EMA."""
     source = deployed_actor_obs_encoder(actor_algo)
     source_state = source.state_dict()
-    target_state = target_encoder.state_dict()
+    target_module = (
+        target_encoder.encoder
+        if isinstance(target_encoder, RiseV2VisualDynamicsTargetEncoder)
+        else target_encoder
+    )
+    target_state = target_module.state_dict()
     if set(source_state) != set(target_state):
         raise ValueError("actor dynamics target state keys do not match")
     floating_difference = 0.0
@@ -2261,7 +2446,7 @@ def sync_actor_dynamics_target_encoder(
             floating_reference += float(
                 target_value.detach().float().square().sum()
             )
-    target_encoder.load_state_dict(source_state, strict=True)
+    target_module.load_state_dict(source_state, strict=True)
     configure_encoder_target_random_crops(target_encoder)
     relative_l2 = (
         floating_difference / max(floating_reference, 1e-12)
@@ -2678,6 +2863,56 @@ def validate_resume_semantics(
 ) -> None:
     """Reject resumes that would silently change the task or objective."""
     saved_args = resume_state.get("args", {})
+    saved_actor_only = bool(
+        resume_state.get("actor_only", saved_args.get("actor_only", False))
+    )
+    requested_actor_only = bool(getattr(args, "actor_only", False))
+    if saved_actor_only != requested_actor_only:
+        raise ValueError(
+            f"resume actor_only={saved_actor_only} does not match requested "
+            f"actor_only={requested_actor_only}"
+        )
+    if requested_actor_only:
+        if str(resume_state.get("task", "")) != str(args.task):
+            raise ValueError(
+                f"resume task={resume_state.get('task')!r} does not match "
+                f"requested task={args.task!r}"
+            )
+        saved_dataset = resume_state.get("dataset", saved_args.get("dataset"))
+        if saved_dataset is None:
+            raise ValueError("resume checkpoint has no dataset provenance")
+        if Path(saved_dataset).expanduser().resolve() != args.dataset:
+            raise ValueError(
+                f"resume dataset={saved_dataset!r} does not match requested "
+                f"dataset={str(args.dataset)!r}"
+            )
+        saved_identity = resume_state.get("dataset_identity")
+        if saved_identity != args.dataset_identity:
+            raise ValueError(
+                "resume dataset identity does not match the current mixed HDF5 "
+                "and external source files"
+            )
+        exact_fields = {
+            "epochs": int(args.epochs),
+            "seed": int(args.seed),
+            "batch_size": int(args.batch_size),
+            "effective_global_batch_size": int(args.effective_global_batch_size),
+            "schedule_reference_batch_size": int(args.schedule_reference_batch_size),
+            "chunk_horizon": int(args.chunk_horizon),
+        }
+        if args.steps_per_epoch is not None:
+            exact_fields["steps_per_epoch"] = int(args.steps_per_epoch)
+        for field, requested in exact_fields.items():
+            if field not in saved_args:
+                raise ValueError(
+                    f"resume checkpoint has no immutable {field} configuration"
+                )
+            if saved_args[field] != requested:
+                raise ValueError(
+                    f"resume {field}={saved_args[field]!r} does not match "
+                    f"requested {requested!r}"
+                )
+        return
     requested_critic_observation_horizon = int(
         getattr(args, "critic_observation_horizon", 1)
     )
@@ -3934,16 +4169,11 @@ def compute_rise_v2_chunk_losses(
     weighted_dynamics: list[torch.Tensor] = []
     if prediction_offsets:
         valid_mask = batch["dynamics_targets"]["valid_mask"]
-        global_valid_count = (valid_mask.reshape(-1) > 0.5).sum().detach()
-        if distributed_context is not None and distributed_context.enabled:
-            dist.all_reduce(global_valid_count, op=dist.ReduceOp.SUM)
         for output, q_loss, target in zip(outputs, q_losses, target_features):
             l1, _, rmse = masked_dynamics_losses(
                 output["predicted_next_encoder"],
                 target,
                 valid_mask,
-                distributed_context=distributed_context,
-                global_valid_row_count=global_valid_count,
             )
             weighted = float(dynamics_weight) * l1
             critic_losses.append(q_loss + weighted)
@@ -4013,20 +4243,11 @@ def compute_rise_v2_chunk_losses(
                 (per_row_offset_mse * valid_weights).sum(dim=0).detach()
             )
         offset_counts = valid_weights.sum(dim=0).detach()
-        packed_offset_statistics = torch.cat(
-            (offset_squared_error_sums, offset_counts),
-            dim=0,
-        )
-        if distributed_context is not None and distributed_context.enabled:
-            dist.all_reduce(packed_offset_statistics, op=dist.ReduceOp.SUM)
-        global_squared_error_sums, global_offset_counts = (
-            packed_offset_statistics.split(len(prediction_offsets))
-        )
-        offset_mse_tensor = global_squared_error_sums / (
-            global_offset_counts * float(len(outputs))
+        offset_mse_tensor = offset_squared_error_sums / (
+            offset_counts * float(len(outputs))
         ).clamp_min(1.0)
         offset_mse_values = list(offset_mse_tensor.unbind())
-        offset_valid_counts = list(global_offset_counts.unbind())
+        offset_valid_counts = list(offset_counts.unbind())
 
     info = {
         **{
@@ -4085,7 +4306,6 @@ def compute_rise_v2_chunk_losses(
         "data/action_abs_mean": batch["actions"].abs().mean().detach(),
         "data/action_min": batch["actions"].min().detach(),
         "data/action_max": batch["actions"].max().detach(),
-        "objective/monte_carlo_return_weight": q_predictions.new_zeros(()),
         "sigreg/effective_weight": q_predictions.new_zeros(()),
     }
     for offset_index, offset in enumerate(prediction_offsets):
@@ -4452,7 +4672,6 @@ def compute_wcm_chunk_losses(
         "data/action_abs_mean": batch["actions"].abs().mean().detach(),
         "data/action_min": batch["actions"].min().detach(),
         "data/action_max": batch["actions"].max().detach(),
-        "objective/monte_carlo_return_weight": q_tensor.new_zeros(()),
     }
     for offset_index, offset in enumerate(system.dynamics_prediction_offsets):
         for suffix in ("mse", "valid_count"):
@@ -4692,6 +4911,52 @@ def validate_source(source: dict, args: argparse.Namespace) -> None:
             f"critic_late_fusion_key={args.critic_late_fusion_key!r} does not "
             f"match source value {source_late_fusion!r}"
         )
+
+
+def validate_actor_source(source: dict, args: argparse.Namespace) -> None:
+    """Validate only the actor lineage of a one-step IDQL warm start."""
+    if not source.get("rise_style_rgb_idql", False):
+        raise ValueError("source checkpoint is not a RISE-style RGB IDQL checkpoint")
+    validating_actor_only_resume = bool(
+        getattr(args, "validate_resume_only", False)
+        and source.get("actor_only", False)
+    )
+    if source.get("rise_style_rgb_chunk_idql", False) and not (
+        validating_actor_only_resume
+    ):
+        raise ValueError("source-idql-checkpoint must be the one-step baseline")
+    if str(source.get("task", args.task)) != str(args.task):
+        raise ValueError(
+            f"source task={source.get('task')} does not match task={args.task}"
+        )
+    required = (
+        "actor_model",
+        "pretrained_dp_checkpoint",
+        "action_normalization_stats",
+    )
+    missing = [key for key in required if key not in source]
+    if missing:
+        raise ValueError(f"actor warm start is missing source fields: {missing}")
+    if bool(source.get("conditioned_actor", False)):
+        required_definition = actor_condition_definition(
+            args.actor_condition_mode
+        )
+        if source.get("actor_condition_label_definition") != required_definition:
+            raise ValueError(
+                "source actor condition definition does not match the requested "
+                f"{args.actor_condition_mode!r} mode"
+            )
+        source_hidden_dim = int(
+            source.get("args", {}).get(
+                "condition_hidden_dim",
+                source.get("actor_condition_hidden_dim", -1),
+            )
+        )
+        if source_hidden_dim != int(args.condition_hidden_dim):
+            raise ValueError(
+                f"source condition_hidden_dim={source_hidden_dim} does not "
+                f"match requested {args.condition_hidden_dim}"
+            )
 
 
 def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
@@ -4943,11 +5208,11 @@ def checkpoint_payload(
     pretrained_dp_checkpoint: str,
     critics: nn.ModuleList,
     targets: nn.ModuleList,
-    dynamics_target_encoder: nn.Module,
+    dynamics_target_encoder: nn.Module | None,
     dynamics_target_last_sync_step: int,
-    vf: RiseValueNetwork,
+    vf: RiseValueNetwork | None,
     critic_optimizers: list[torch.optim.Optimizer],
-    vf_optimizer: torch.optim.Optimizer,
+    vf_optimizer: torch.optim.Optimizer | None,
     critic_lr_schedulers: list[Any],
     vf_lr_scheduler: Any,
     wcm_system: WCMChunkValueSystem | None,
@@ -4974,7 +5239,21 @@ def checkpoint_payload(
     )
     is_wcm = args.critic_architecture == WCM_CRITIC_ARCHITECTURE
     is_rise_v2 = args.critic_architecture == RISE_V2_CRITIC_ARCHITECTURE
-    if is_wcm:
+    actor_only = bool(getattr(args, "actor_only", False))
+    if actor_only:
+        if critics or targets or any(
+            value is not None
+            for value in (
+                dynamics_target_encoder,
+                vf,
+                wcm_system,
+                wcm_target_system,
+                wcm_dynamics_target_encoder,
+            )
+        ):
+            raise ValueError("actor-only checkpoint unexpectedly received critic state")
+        model_state = {}
+    elif is_wcm:
         if any(
             value is None
             for value in (
@@ -5025,26 +5304,36 @@ def checkpoint_payload(
         "rise_style_rgb_chunk_idql": True,
         "hybrid_dp_chunk_actor_iql": True,
         "visual_critic_idql": True,
+        "actor_only": actor_only,
+        "critic_trained": not actor_only,
         "critic_architecture": str(args.critic_architecture),
-        "critic_q_head_inputs": architecture_q_head_inputs(
-            args.critic_architecture,
-            args.critic_q_use_predicted_next_latent,
+        "critic_q_head_inputs": (
+            ()
+            if actor_only
+            else architecture_q_head_inputs(
+                args.critic_architecture,
+                args.critic_q_use_predicted_next_latent,
+            )
         ),
         "critic_q_use_predicted_next_latent": bool(
-            args.critic_q_use_predicted_next_latent
+            args.critic_q_use_predicted_next_latent and not actor_only
         ),
         "critic_q_predicted_next_normalization": (
             PREDICTED_NEXT_Q_NORMALIZATION
-            if args.critic_q_use_predicted_next_latent
+            if args.critic_q_use_predicted_next_latent and not actor_only
             else None
         ),
         "critic_representation_modules": (
-            ("encoder", "frame_projection", "temporal_trunk")
+            ()
+            if actor_only
+            else ("encoder", "frame_projection", "temporal_trunk")
             if is_wcm or is_rise_v2
             else ("encoder", "context", "context_norm")
         ),
         "critic_slow_lr_modules": (
-            ("encoder",)
+            ()
+            if actor_only
+            else ("encoder",)
             if is_wcm or is_rise_v2
             else ("encoder", "context", "context_norm")
         ),
@@ -5055,34 +5344,45 @@ def checkpoint_payload(
         "rise_v2_dense_dynamics": (
             bool(args.rise_v2_dense_dynamics) if is_rise_v2 else None
         ),
+        "dynamics_prediction_output_dim": (
+            None
+            if actor_only
+            else int(wcm_system.latent_dim)
+            if is_wcm
+            else int(critics[0].dynamics_target_dim)
+            if is_rise_v2
+            else int(critics[0].encoder_output_dim)
+        ),
         "actor_model": actor_model,
         **model_state,
-        "dynamics_prediction_mode": (
+        "dynamics_prediction_mode": None if actor_only else (
             WCM_DYNAMICS_PREDICTION_MODE
             if is_wcm
             else RISE_V2_DYNAMICS_PREDICTION_MODE
             if is_rise_v2
             else DYNAMICS_PREDICTION_MODE
         ),
-        "dynamics_prediction_target": (
+        "dynamics_prediction_target": None if actor_only else (
             "stop_gradient_periodic_hard_copy_critic_frame_latent"
             if is_wcm
-            else "stop_gradient_periodic_hard_copy_actor_encoder_features"
+            else "stop_gradient_periodic_hard_copy_actor_visual_features"
             if is_rise_v2
             else "normalized_actor_encoder_features"
         ),
         "rise_v2_dynamics_target_mode": (
-            RISE_V2_DYNAMICS_TARGET_MODE if is_rise_v2 else None
+            RISE_V2_DYNAMICS_TARGET_MODE if is_rise_v2 and not actor_only else None
         ),
         "wcm_dynamics_target_mode": (
-            WCM_DYNAMICS_TARGET_MODE if is_wcm else None
+            WCM_DYNAMICS_TARGET_MODE if is_wcm and not actor_only else None
         ),
-        "dynamics_prediction_offsets": tuple(
-            int(value) for value in args.dynamics_prediction_offsets
+        "dynamics_prediction_offsets": (
+            ()
+            if actor_only
+            else tuple(int(value) for value in args.dynamics_prediction_offsets)
         ),
         "dynamics_prediction_consumed_by_q": (
             False
-            if is_wcm or is_rise_v2
+            if actor_only or is_wcm or is_rise_v2
             else bool(args.critic_q_use_predicted_next_latent)
         ),
         "dynamics_target_last_sync_step": int(
@@ -5092,7 +5392,6 @@ def checkpoint_payload(
         "sigreg_knots": int(args.sigreg_knots),
         "sigreg_num_projections": int(args.sigreg_num_projections),
         "sigreg_global_batch": bool(args.sigreg_global_batch),
-        "monte_carlo_return_weight": 0.0,
         "args": vars(args),
         "epoch": int(epoch),
         "step": int(global_step),
@@ -5122,6 +5421,9 @@ def checkpoint_payload(
         "reward_mode": str(args.reward_mode),
         "reward_definition": REWARD_DEFINITIONS[args.reward_mode],
         "critic_reward_source": (
+            "none_critic_disabled"
+            if actor_only
+            else
             "rewards=source_environment_task_reward"
             if args.reward_mode == "task"
             else "rewards=canonical_first_success_terminal_reward"
@@ -5135,6 +5437,8 @@ def checkpoint_payload(
                 + (
                     "from_source_chunk_IDQL_actor"
                     if args.initialization == "source_chunk_idql_joint"
+                    else "from_source_one_step_IDQL_actor"
+                    if args.initialization == "source_idql_joint"
                     else "from_pretrained_DP_ema"
                 )
                 + (
@@ -5192,8 +5496,15 @@ def checkpoint_payload(
             if trains_joint_actor(args)
             else "none_actor_frozen"
         ),
-        "critic_source_mask": "none_all_shared_batch_rows",
+        "critic_source_mask": (
+            "none_critic_disabled"
+            if actor_only
+            else "none_all_shared_batch_rows"
+        ),
         "critic_training_objective": (
+            "disabled_actor_only"
+            if actor_only
+            else
             "task_reward_semi_mdp_chunk_iql_with_shared_wcm_dynamics"
             if is_wcm and args.reward_mode == "task"
             else "terminal_success_semi_mdp_chunk_iql_with_shared_wcm_dynamics"
@@ -5248,6 +5559,9 @@ def checkpoint_payload(
         "expectile": float(args.expectile),
         "target_tau": float(args.target_tau),
         "dynamics_target_source": (
+            "disabled_actor_only"
+            if actor_only
+            else
             "periodic_hard_copy_online_critic_frame_encoder_and_projection"
             if is_wcm
             else "periodic_deployed_actor_ema_obs_encoder"
@@ -5331,6 +5645,8 @@ def checkpoint_payload(
 
 def train(args: argparse.Namespace) -> dict[str, Any]:
     configure_critic_architecture_args(args)
+    validate_training_mode(args)
+    actor_only = bool(args.actor_only)
     distributed = initialize_distributed(args)
     args.distributed = bool(distributed.enabled)
     args.distributed_rank = int(distributed.rank)
@@ -5383,37 +5699,38 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"{distributed.world_size}"
             )
 
-        saved_dynamics_mode = str(
-            resume_state.get(
-                "dynamics_prediction_mode",
-                "",
+        if not actor_only:
+            saved_dynamics_mode = str(
+                resume_state.get(
+                    "dynamics_prediction_mode",
+                    "",
+                )
             )
-        )
-        expected_dynamics_mode = (
-            WCM_DYNAMICS_PREDICTION_MODE
-            if args.critic_architecture == WCM_CRITIC_ARCHITECTURE
-            else RISE_V2_DYNAMICS_PREDICTION_MODE
-            if args.critic_architecture == RISE_V2_CRITIC_ARCHITECTURE
-            else DYNAMICS_PREDICTION_MODE
-        )
-        if saved_dynamics_mode != expected_dynamics_mode:
-            raise ValueError(
-                f"resume dynamics_prediction_mode={saved_dynamics_mode!r} "
-                f"does not match {expected_dynamics_mode!r}; start a "
-                "fresh output directory"
+            expected_dynamics_mode = (
+                WCM_DYNAMICS_PREDICTION_MODE
+                if args.critic_architecture == WCM_CRITIC_ARCHITECTURE
+                else RISE_V2_DYNAMICS_PREDICTION_MODE
+                if args.critic_architecture == RISE_V2_CRITIC_ARCHITECTURE
+                else DYNAMICS_PREDICTION_MODE
             )
-        saved_sync_interval = int(
-            resume_state.get("args", {}).get(
-                "dynamics_target_sync_interval",
-                -1,
+            if saved_dynamics_mode != expected_dynamics_mode:
+                raise ValueError(
+                    f"resume dynamics_prediction_mode={saved_dynamics_mode!r} "
+                    f"does not match {expected_dynamics_mode!r}; start a "
+                    "fresh output directory"
+                )
+            saved_sync_interval = int(
+                resume_state.get("args", {}).get(
+                    "dynamics_target_sync_interval",
+                    -1,
+                )
             )
-        )
-        if saved_sync_interval != int(args.dynamics_target_sync_interval):
-            raise ValueError(
-                "resume dynamics_target_sync_interval="
-                f"{saved_sync_interval} does not match requested "
-                f"{args.dynamics_target_sync_interval}"
-            )
+            if saved_sync_interval != int(args.dynamics_target_sync_interval):
+                raise ValueError(
+                    "resume dynamics_target_sync_interval="
+                    f"{saved_sync_interval} does not match requested "
+                    f"{args.dynamics_target_sync_interval}"
+                )
 
         saved_initialization = str(
             resume_state.get("chunk_initialization", "source_idql_frozen")
@@ -5438,10 +5755,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "actor_obs_encoder_lr": float(args.actor_obs_encoder_lr),
             "actor_reference_weight": float(args.actor_reference_weight),
             "actor_reference_batch_fraction": float(args.actor_reference_batch_fraction),
-            "critic_lr": float(args.critic_lr),
-            "encoder_lr": float(args.encoder_lr),
-            "vf_lr": float(args.vf_lr),
         }
+        if not actor_only:
+            resume_float_fields.update(
+                {
+                    "critic_lr": float(args.critic_lr),
+                    "encoder_lr": float(args.encoder_lr),
+                    "vf_lr": float(args.vf_lr),
+                }
+            )
         legacy_float_defaults: dict[str, float] = {}
         if bool(args.validate_resume_only):
             legacy_actor_lr = saved_args.get("actor_lr")
@@ -5546,12 +5868,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             resume_state["pretrained_dp_checkpoint"]
         )
     elif args.initialization in (
+        "source_idql_joint",
         "source_idql_frozen",
         "source_chunk_idql_joint",
     ):
         source_checkpoint = (
             args.source_idql_checkpoint
-            if args.initialization == "source_idql_frozen"
+            if args.initialization in ("source_idql_joint", "source_idql_frozen")
             else args.source_chunk_idql_checkpoint
         )
         source_for_warm_start = torch.load(
@@ -5559,7 +5882,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             map_location="cpu",
             weights_only=False,
         )
-        if args.initialization == "source_idql_frozen":
+        if args.initialization == "source_idql_joint":
+            validate_actor_source(source_for_warm_start, args)
+        elif args.initialization == "source_idql_frozen":
             validate_source(source_for_warm_start, args)
         else:
             validate_chunk_source(source_for_warm_start, args)
@@ -5608,7 +5933,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     if bool(args.validate_resume_only):
         if resume_state is None:
             raise ValueError("--validate-resume-only requires --resume-checkpoint")
-        validate_chunk_source(resume_state, args)
+        if actor_only:
+            validate_actor_source(resume_state, args)
+        else:
+            validate_chunk_source(resume_state, args)
         saved_epoch = int(resume_state.get("epoch", -1))
         if saved_epoch != int(args.epochs):
             raise ValueError(
@@ -5676,7 +6004,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     resume_state.get("actor_ema_optimization_step", 0)
                 )
         if resume_state is None:
-            if args.initialization == "source_chunk_idql_joint":
+            if args.initialization in (
+                "source_idql_joint",
+                "source_chunk_idql_joint",
+            ):
                 actor_algo.deserialize(
                     source_for_warm_start["actor_model"],
                     load_optimizers=False,
@@ -5738,14 +6069,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     args.observation_horizon = int(
         actor_algo.algo_config.horizon.observation_horizon
     )
-    if int(args.critic_observation_horizon) > args.observation_horizon:
+    if (
+        not actor_only
+        and int(args.critic_observation_horizon) > args.observation_horizon
+    ):
         raise ValueError(
             "critic_observation_horizon cannot exceed the pretrained actor "
             f"observation horizon: {args.critic_observation_horizon} > "
             f"{args.observation_horizon}"
         )
     if (
-        args.critic_architecture
+        not actor_only
+        and args.critic_architecture
         in (RISE_V2_CRITIC_ARCHITECTURE, WCM_CRITIC_ARCHITECTURE)
         and int(args.critic_observation_horizon) < 2
     ):
@@ -5784,8 +6119,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if args.conditioned_actor
         else None
     )
+    loader_args = args
+    if actor_only:
+        # Preserve the sparse current-observation actor path, while avoiding
+        # multi-frame bootstrap histories and dense dynamics targets.
+        loader_args = copy.copy(args)
+        loader_args.critic_observation_horizon = 1
+        loader_args.dynamics_prediction_offsets = ()
     dataset, loader, loader_generator, _ = build_single_loader(
-        args,
+        loader_args,
         actor_policy,
         dp_checkpoint,
         sequence_length=sequence_length,
@@ -5798,10 +6140,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         args.steps_per_epoch_source = "explicit_command_line"
     args.actor_lr_total_steps = int(args.epochs) * int(args.steps_per_epoch)
     args.critic_vf_lr_total_steps = (
-        int(args.epochs) * int(args.steps_per_epoch)
+        0
+        if actor_only
+        else int(args.epochs) * int(args.steps_per_epoch)
     )
     if (
-        args.critic_vf_lr_scheduler == "cosine"
+        not actor_only
+        and args.critic_vf_lr_scheduler == "cosine"
         and int(args.resolved_critic_vf_lr_warmup_steps)
         >= int(args.critic_vf_lr_total_steps)
     ):
@@ -5818,16 +6163,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             ("effective_global_batch_size", int),
             ("schedule_reference_batch_size", int),
             ("steps_per_epoch", int),
-            ("critic_vf_lr_scheduler", str),
-            ("critic_vf_lr_total_steps", int),
-            ("critic_vf_lr_num_cycles", float),
-            *[
-                (f"resolved_{field}", int)
-                for field in SAMPLE_SCALED_STEP_FIELDS
-            ],
-            ("resolved_dynamics_target_sync_interval", int),
-            ("resolved_target_tau", float),
         ]
+        if not actor_only:
+            schedule_fields.extend(
+                [
+                    ("critic_vf_lr_scheduler", str),
+                    ("critic_vf_lr_total_steps", int),
+                    ("critic_vf_lr_num_cycles", float),
+                    *[
+                        (f"resolved_{field}", int)
+                        for field in SAMPLE_SCALED_STEP_FIELDS
+                    ],
+                    ("resolved_dynamics_target_sync_interval", int),
+                    ("resolved_target_tau", float),
+                ]
+            )
         if trains_joint_actor(args):
             schedule_fields.append(("actor_lr_total_steps", int))
         for field, cast in schedule_fields:
@@ -5921,8 +6271,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     critic_lr_schedulers: list[Any] = []
     vf_lr_scheduler = None
     warm_start_audit: dict[str, Any] = {"mode": "resume_checkpoint"}
+    target_encoder_output_dim: int | None = None
 
-    if is_wcm:
+    if actor_only:
+        warm_start_audit = {
+            "mode": "disabled_actor_only",
+            "critic_constructed": False,
+        }
+    elif is_wcm:
         wcm_system, wcm_target_system = make_wcm_chunk_value_system(
             actor_algo,
             chunk_horizon=args.chunk_horizon,
@@ -6104,7 +6460,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             }
             targets = copy.deepcopy(critics)
 
-        dynamics_target_encoder = copy.deepcopy(
+        dynamics_target_encoder = RiseV2VisualDynamicsTargetEncoder(
             deployed_actor_obs_encoder(actor_algo)
         )
         critics = critics.float().to(device)
@@ -6114,14 +6470,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         target_encoder_output_dim = int(
             dynamics_target_encoder.output_shape()[0]
         )
-        critic_encoder_output_dims = {
-            int(critic.encoder_output_dim) for critic in critics
+        critic_target_output_dims = {
+            int(critic.dynamics_target_dim) for critic in critics
         }
-        if critic_encoder_output_dims != {target_encoder_output_dim}:
+        if critic_target_output_dims != {target_encoder_output_dim}:
             raise RuntimeError(
-                "actor dynamics target and critic raw encoder output dimensions "
+                "actor visual target and critic dynamics output dimensions "
                 f"differ: target={target_encoder_output_dim}, "
-                f"critics={sorted(critic_encoder_output_dims)}"
+                f"critics={sorted(critic_target_output_dims)}"
             )
         critic_optimizers = [
             make_critic_optimizer(critic, args.critic_lr, args.encoder_lr)
@@ -6153,7 +6509,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     history: list[dict] = []
     if resume_state is not None:
         scheduler_enabled = args.critic_vf_lr_scheduler != "constant"
-        if is_wcm:
+        if actor_only:
+            pass
+        elif is_wcm:
             wcm_system.load_state_dict(
                 resume_state["chunk_value_system"], strict=True
             )
@@ -6226,7 +6584,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         dynamics_target_last_sync_step = int(
             resume_state.get("dynamics_target_last_sync_step", 0)
         )
-        if scheduler_enabled:
+        if scheduler_enabled and not actor_only:
             scheduler_steps = (
                 [int(wcm_lr_scheduler.last_epoch)]
                 if is_wcm
@@ -6355,7 +6713,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             f"epochs={args.epochs}. Use that checkpoint for evaluation or "
             "increase epochs with a fresh source warm start and schedule."
         )
-    if is_wcm:
+    if actor_only:
+        synchronized_modules = [actor_algo.nets]
+        training_buffer_modules = [actor_algo.nets]
+    elif is_wcm:
         configure_wcm_target_random_crops(wcm_target_system)
         configure_wcm_dynamics_target_random_crops(
             wcm_dynamics_target_encoder
@@ -6400,6 +6761,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 parameters,
                 distributed,
                 bucket_cap_mb=args.gradient_bucket_cap_mb,
+                # Chunk Q/V and DP actor optimization use static graphs whose
+                # optimizer parameters all participate in every update. Skip
+                # the otherwise redundant per-step usage-mask all-reduce.
+                preserve_unused_parameters=False,
             )
         )
         if distributed.enabled
@@ -6495,27 +6860,36 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     architecture = {
         "actor": actor_audit,
+        "actor_only": actor_only,
         "conditional_diffusion_actor": bool(args.conditioned_actor),
         "actor_condition_adapter": args.actor_condition_adapter_type,
         "critic_architecture": str(args.critic_architecture),
         "critic_parameter_counts": (
-            [parameter_count(wcm_system)]
+            []
+            if actor_only
+            else [parameter_count(wcm_system)]
             if is_wcm
             else [parameter_count(x) for x in critics]
         ),
         "target_critic_parameter_counts": (
-            [parameter_count(wcm_target_system)]
+            []
+            if actor_only
+            else [parameter_count(wcm_target_system)]
             if is_wcm
             else [parameter_count(x) for x in targets]
         ),
         "dynamics_target_encoder_parameter_count": (
-            parameter_count(wcm_dynamics_target_encoder)
+            0
+            if actor_only
+            else parameter_count(wcm_dynamics_target_encoder)
             if is_wcm
             else parameter_count(dynamics_target_encoder)
         ),
         "dynamics_target_encoder_output_dim": target_encoder_output_dim,
         "vf_parameter_count": (
-            parameter_count(wcm_system.nets["value_head"])
+            0
+            if actor_only
+            else parameter_count(wcm_system.nets["value_head"])
             if is_wcm
             else parameter_count(vf)
         ),
@@ -6526,17 +6900,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             args.critic_observation_horizon
         ),
         "critic_q_head_inputs": list(
-            architecture_q_head_inputs(
+            ()
+            if actor_only
+            else architecture_q_head_inputs(
                 args.critic_architecture,
                 args.critic_q_use_predicted_next_latent,
             )
         ),
         "critic_q_use_predicted_next_latent": bool(
-            args.critic_q_use_predicted_next_latent
+            args.critic_q_use_predicted_next_latent and not actor_only
         ),
         "critic_q_predicted_next_normalization": (
             PREDICTED_NEXT_Q_NORMALIZATION
-            if args.critic_q_use_predicted_next_latent
+            if args.critic_q_use_predicted_next_latent and not actor_only
             else None
         ),
         "critic_representation_modules": (
@@ -6555,9 +6931,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "rise_v2_dense_dynamics": (
             bool(args.rise_v2_dense_dynamics) if is_rise_v2 else None
         ),
-        "latent_dynamics": True,
-        "actor_encoder_feature_dynamics": not is_wcm,
+        "latent_dynamics": not actor_only,
+        "actor_encoder_feature_dynamics": not actor_only and not is_wcm,
         "dynamics_prediction_mode": (
+            None
+            if actor_only
+            else
             WCM_DYNAMICS_PREDICTION_MODE
             if is_wcm
             else RISE_V2_DYNAMICS_PREDICTION_MODE
@@ -6565,29 +6944,41 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             else DYNAMICS_PREDICTION_MODE
         ),
         "dynamics_prediction_output": (
+            None
+            if actor_only
+            else
             "shared_critic_frame_latents"
             if is_wcm
-            else "raw_actor_encoder_features_at_requested_offsets"
+            else "actor_visual_encoder_features_at_requested_offsets"
             if is_rise_v2
             else "raw_actor_encoder_features"
         ),
         "dynamics_prediction_output_dim": target_encoder_output_dim,
         "dynamics_prediction_residual": bool(is_wcm),
-        "dynamics_prediction_offsets": list(args.dynamics_prediction_offsets),
+        "dynamics_prediction_offsets": (
+            [] if actor_only else list(args.dynamics_prediction_offsets)
+        ),
         "dynamics_prediction_consumed_by_q": (
             False
-            if is_wcm or is_rise_v2
+            if actor_only or is_wcm or is_rise_v2
             else bool(args.critic_q_use_predicted_next_latent)
         ),
         "dynamics_target_encoder": (
+            "disabled_actor_only"
+            if actor_only
+            else
             "frozen_complete_frame_encoder_and_projection_hard_copy"
             if is_wcm
-            else "frozen_copy_periodically_hard_synced_from_deployed_actor_ema_"
-            "obs_encoder"
+            else "visual_features_from_frozen_copy_periodically_hard_synced_"
+            "from_deployed_actor_ema_obs_encoder"
             if trains_joint_actor(args)
-            else "frozen_copy_of_deployed_actor_ema_obs_encoder"
+            else "visual_features_from_frozen_copy_of_deployed_actor_ema_"
+            "obs_encoder"
         ),
         "dynamics_target_update": (
+            "disabled_actor_only"
+            if actor_only
+            else
             "periodic_full_state_dict_hard_sync"
             if is_wcm
             else "periodic_hard_sync"
@@ -6595,10 +6986,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             else "fixed_after_initialization"
         ),
         "wcm_dynamics_target_mode": (
-            WCM_DYNAMICS_TARGET_MODE if is_wcm else None
+            WCM_DYNAMICS_TARGET_MODE if is_wcm and not actor_only else None
         ),
         "rise_v2_dynamics_target_mode": (
-            RISE_V2_DYNAMICS_TARGET_MODE if is_rise_v2 else None
+            RISE_V2_DYNAMICS_TARGET_MODE
+            if is_rise_v2 and not actor_only
+            else None
         ),
         "dynamics_target_context_mlp": False,
         "training_augmentation": (
@@ -6614,6 +7007,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "eval_except_crop_randomizers_in_training_mode"
         ),
         "vf_training": (
+            "disabled_actor_only"
+            if actor_only
+            else
             "shared_temporal_state_expectile_head"
             if is_wcm
             else "independent_causal_temporal_state_expectile_head"
@@ -6632,11 +7028,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "scope": "newest_temporal_context",
             "distributed_reduction": "global_characteristic_moments",
         },
-        "monte_carlo_return_weight": 0.0,
         "actor_reference_distillation": actor_reference_audit,
         "warm_start": warm_start_audit,
     }
     startup = {
+        "actor_only": actor_only,
+        "critic_trained": not actor_only,
         "actor_reference_distillation": actor_reference_audit,
         "task": str(args.task),
         "chunk_initialization": str(args.initialization),
@@ -6660,8 +7057,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "trainable_actor_initialized_from_source_chunk": bool(
                 args.initialization == "source_chunk_idql_joint"
             ),
+            "trainable_actor_initialized_from_source_one_step_idql": bool(
+                args.initialization == "source_idql_joint"
+            ),
             "source_actor_ema_optimization_step_preserved": bool(
-                args.initialization == "source_chunk_idql_joint"
+                args.initialization
+                in ("source_idql_joint", "source_chunk_idql_joint")
             ),
         },
         "dataset": {
@@ -6695,15 +7096,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "persistent_workers": bool(args.persistent_workers),
             "dense_target_read_strategy": (
                 "one_coalesced_successor_window_per_observation_key"
-                if args.sparse_chunk_loader
-                and len(args.dynamics_prediction_offsets) > 0
+                if loader_args.sparse_chunk_loader
+                and len(loader_args.dynamics_prediction_offsets) > 0
                 else "not_applicable"
             ),
             "observation_frames_per_sample": (
                 int(args.observation_horizon)
-                + int(args.critic_observation_horizon)
-                + len(args.dynamics_prediction_offsets)
-                if args.sparse_chunk_loader
+                + int(loader_args.critic_observation_horizon)
+                + len(loader_args.dynamics_prediction_offsets)
+                if loader_args.sparse_chunk_loader
                 else 2
                 * (
                     int(args.observation_horizon) - 1 + int(sequence_length)
@@ -6712,8 +7113,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         },
         "data_routing": {
             "shared_loader": True,
-            "critic_rows": "all_human_success_failure",
+            "critic_rows": (
+                "none_critic_disabled"
+                if actor_only
+                else "all_human_success_failure"
+            ),
             "critic_reward_source": (
+                "none_critic_disabled"
+                if actor_only
+                else
                 "rewards=source_environment_task_reward"
                 if args.reward_mode == "task"
                 else "rewards=canonical_first_success_terminal_reward"
@@ -6845,12 +7253,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "backend": distributed.backend,
             "launcher": "torchrun" if distributed.enabled else "python",
             "gradient_sync": "bounded_async_bucketed_mean_all_reduce",
-            "critic_vf_gradient_sync_phases_per_step": 1,
+            "critic_vf_gradient_sync_phases_per_step": int(not actor_only),
             "actor_gradient_sync_phases_per_step": int(
                 trains_joint_actor(args)
             ),
             "gradient_bucket_cap_mb": float(args.gradient_bucket_cap_mb),
+            "unused_parameter_detection_collective": False,
             "per_step_buffer_broadcast": bool(synchronize_training_buffers),
+            "per_step_metric_collective": False,
+            "metric_source": "rank_zero_local",
             "rank_zero_writes_only": True,
         },
     }
@@ -6912,7 +7323,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if distributed.enabled and hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
         iterator = iter(loader)
-        records: list[dict[str, float]] = []
+        metric_accumulator = (
+            LocalScalarMetricAccumulator(device)
+            if distributed.is_main_process
+            else None
+        )
         for step_in_epoch in range(1, int(args.steps_per_epoch) + 1):
             try:
                 raw_batch = next(iterator)
@@ -6924,6 +7339,80 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 validate=not shared_action_range_validated,
             )
             shared_action_range_validated = True
+
+            # NOTE: the actor-only mode is only used to trained the recap-like conditional 
+            # diffusion actor. The critic and value function are not trained in this mode.
+            if actor_only:
+                if synchronize_training_buffers:
+                    broadcast_module_buffers(
+                        training_buffer_modules,
+                        distributed,
+                    )
+                current_index = int(args.observation_horizon) - 1
+                condition_labels = source_condition_labels(
+                    raw_batch,
+                    current_index=current_index,
+                )
+                actor_batch = add_actor_condition(raw_batch, condition_labels)
+                actor_info: dict[str, Any] = {
+                    "actor/data_rows": float(raw_batch["actions"].shape[0]),
+                    "actor/conditioned": 1.0,
+                    "actor/condition_mean": condition_labels.mean(),
+                    "actor/zero_condition_fraction": (
+                        (condition_labels < 0.5).float().mean()
+                    ),
+                }
+                actor_info.update(
+                    actor_train_step(
+                        actor_algo,
+                        actor_batch,
+                        epoch,
+                        obs_stats,
+                        defer_scalar_conversion=True,
+                    )
+                )
+                global_samples_seen += int(
+                    raw_batch["actions"].shape[0] * distributed.world_size
+                )
+                global_step += 1
+                metrics = dict(actor_info)
+                metrics["mode/actor_only"] = 1.0
+                for group in actor_algo.optimizers["policy"].param_groups:
+                    group_name = str(group.get("group_name", "unknown"))
+                    metrics[f"lr/actor_{group_name}"] = float(group["lr"])
+                metrics["distributed/world_size"] = float(
+                    distributed.world_size
+                )
+                metrics["data/effective_global_batch_rows"] = float(
+                    raw_batch["actions"].shape[0] * distributed.world_size
+                )
+                should_log = (
+                    global_step % int(args.log_every) == 0
+                    or step_in_epoch == int(args.steps_per_epoch)
+                )
+                if distributed.is_main_process:
+                    metric_accumulator.update(metrics)
+                    if should_log:
+                        logged_metrics = materialize_local_scalar_metrics(
+                            metrics,
+                            device,
+                        )
+                        if writer is not None:
+                            for key, value in logged_metrics.items():
+                                writer.add_scalar(key, value, global_step)
+                        print(
+                            json.dumps(
+                                {
+                                    "epoch": epoch,
+                                    "step_in_epoch": step_in_epoch,
+                                    "global_step": global_step,
+                                    **logged_metrics,
+                                }
+                            ),
+                            flush=True,
+                        )
+                del actor_batch, condition_labels
+                continue
             batch = process_chunk_batch(
                 raw_batch,
                 actor_algo,
@@ -7189,34 +7678,31 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             metrics["data/effective_global_batch_rows"] = float(
                 raw_batch["actions"].shape[0] * distributed.world_size
             )
-            metrics = mean_distributed_scalars(
-                metrics,
-                distributed,
-                reductions={
-                    "data/action_min": "min",
-                    "data/action_max": "max",
-                },
-            )
-            records.append(metrics)
             should_log = (
                 global_step % int(args.log_every) == 0
                 or step_in_epoch == int(args.steps_per_epoch)
             )
-            if writer is not None and should_log:
-                for key, value in metrics.items():
-                    writer.add_scalar(key, value, global_step)
-            if distributed.is_main_process and should_log:
-                print(
-                    json.dumps(
-                        {
-                            "epoch": epoch,
-                            "step_in_epoch": step_in_epoch,
-                            "global_step": global_step,
-                            **metrics,
-                        }
-                    ),
-                    flush=True,
-                )
+            if distributed.is_main_process:
+                metric_accumulator.update(metrics)
+                if should_log:
+                    logged_metrics = materialize_local_scalar_metrics(
+                        metrics,
+                        device,
+                    )
+                    if writer is not None:
+                        for key, value in logged_metrics.items():
+                            writer.add_scalar(key, value, global_step)
+                    print(
+                        json.dumps(
+                            {
+                                "epoch": epoch,
+                                "step_in_epoch": step_in_epoch,
+                                "global_step": global_step,
+                                **logged_metrics,
+                            }
+                        ),
+                        flush=True,
+                    )
             if is_wcm:
                 del batch, total_critic_loss
             else:
@@ -7226,7 +7712,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "global_samples_seen": int(global_samples_seen),
             "epoch": int(epoch),
             "global_step": int(global_step),
-            "metrics": mean_metrics(records),
+            "metrics": (
+                metric_accumulator.means()
+                if distributed.is_main_process
+                else {}
+            ),
         }
         history.append(epoch_summary)
         partial = {
@@ -7302,6 +7792,7 @@ def make_parser() -> argparse.ArgumentParser:
         choices=(
             "pretrained_dp_joint",
             "pretrained_dp_frozen",
+            "source_idql_joint",
             "source_idql_frozen",
             "source_chunk_idql_joint",
         ),
@@ -7449,6 +7940,15 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--actor-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Train only the conditioned diffusion actor. Q, V, and dynamics "
+            "are not constructed, updated, or logged."
+        ),
+    )
+    parser.add_argument(
         "--actor-condition-mode",
         choices=tuple(ACTOR_CONDITION_DEFINITIONS),
         default="human_only",
@@ -7579,6 +8079,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         configure_critic_architecture_args(args)
+        validate_training_mode(args)
     except ValueError as error:
         parser.error(str(error))
     for key in (
@@ -7598,7 +8099,7 @@ def main() -> None:
                 parser.error(
                     f"pretrained DP checkpoint does not exist: {args.checkpoint}"
                 )
-        elif args.initialization == "source_idql_frozen":
+        elif args.initialization in ("source_idql_joint", "source_idql_frozen"):
             if (
                 args.source_idql_checkpoint is None
                 or not args.source_idql_checkpoint.is_file()
