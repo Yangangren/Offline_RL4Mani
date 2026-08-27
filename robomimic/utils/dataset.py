@@ -979,16 +979,22 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
 class SparseOneStepSequenceDataset(SparseChunkSequenceDataset):
     """Load only the image frames consumed by one-step IDQL.
 
-    The diffusion actor still receives the full action sequence and its complete
-    observation history. The critic receives a single immediate ``next_obs``
-    frame, stored at time index zero and identified by a dedicated marker.
+    The diffusion actor retains its full action sequence and observation frame
+    stack. ``next_obs`` retains the requested critic history ending at the
+    immediate successor frame.
     """
 
-    def __init__(self, dataset, observation_horizon):
+    def __init__(
+        self,
+        dataset,
+        observation_horizon,
+        critic_observation_horizon=1,
+    ):
         super().__init__(
             dataset,
             chunk_horizon=1,
             observation_horizon=observation_horizon,
+            next_observation_horizon=critic_observation_horizon,
         )
 
     def __getitem__(self, index):

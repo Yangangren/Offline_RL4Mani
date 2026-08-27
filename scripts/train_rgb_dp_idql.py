@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""RISE-style RGB Diffusion Policy + one-step IDQL post-training.
+"""Temporal RGB Diffusion Policy + one-step IDQL post-training.
 
-This is intentionally a single-dataset, single-loader implementation. Every
-sampled batch updates the full pretrained diffusion actor with chunk BC and
-updates independent raw-observation Q1, Q2, and V networks with the one-step
-IQL equations used by RISE's ``robomimic/algo/idql.py``.
+Every mixed human / rollout batch continues training the original unconditioned
+Diffusion Policy actor with full-horizon diffusion BC and trains independent
+two-frame Q1, Q2, and V networks with one-step IQL. An optional one-step visual
+latent prediction loss can regularize each online Q encoder; it predicts only
+the immediate successor observation.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import math
 import os
 import random
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 
 import robomimic.models.obs_nets as ObsNets
 import robomimic.utils.file_utils as FileUtils
@@ -37,6 +40,14 @@ from robomimic.utils.dataset import (
     SparseOneStepSequenceDataset,
 )
 from robomimic.algo.diffusion_policy import replace_bn_with_gn
+from robomimic.models.chunk_iql_nets import (
+    CausalSequentialActionChunkEncoder,
+    CausalTemporalStateTrunk,
+    FiLMStateActionFusion,
+    MultiHorizonLatentPredictor,
+    make_mlp,
+)
+from robomimic.models.obs_core import CropRandomizer
 
 from rgb_dp_distributed import (
     DistributedContext,
@@ -74,6 +85,8 @@ REWARD_DEFINITIONS = {
     ),
     "rise": "expert_transition=1; non_expert_transition=0",
 }
+TEMPORAL_CRITIC_ARCHITECTURE = "rise_temporal_v2"
+TEMPORAL_ONE_STEP_MARKER = "temporal_one_step_idql"
 
 
 def batch_scaled_step_count(
@@ -257,6 +270,26 @@ def actor_trainability(actor_algo) -> dict[str, Any]:
     return result
 
 
+def assert_unconditioned_actor(actor_algo) -> dict[str, Any]:
+    """Reject condition adapters without changing the original DP architecture."""
+    train_policy = actor_algo.nets["policy"]
+    ema_policy = (
+        actor_algo.ema.averaged_model["policy"]
+        if actor_algo.ema is not None
+        else None
+    )
+    if "condition_adapter" in train_policy or (
+        ema_policy is not None and "condition_adapter" in ema_policy
+    ):
+        raise ValueError(
+            "one-step IDQL requires the original unconditioned pretrained DP; "
+            "condition_adapter is present"
+        )
+    return {
+        "condition_adapter_present": False,
+    }
+
+
 class RiseLateFusionMLP(nn.Module):
     """RISE critic MLP with gripper-state fusion at module index 1."""
 
@@ -382,6 +415,593 @@ class RiseValueNetwork(nn.Module):
 class RiseActionValueNetwork(RiseValueNetwork):
     def forward(self, obs_dict, acts, goal_dict=None):
         return self._forward(obs_dict, goal_dict, acts=acts)
+
+
+def observation_history_frames(
+    obs_dict: dict[str, torch.Tensor],
+    obs_shapes: OrderedDict,
+    observation_horizon: int,
+) -> list[dict[str, torch.Tensor]]:
+    """Validate and split a critic history in chronological order."""
+    horizon = int(observation_horizon)
+    frames = [dict() for _ in range(horizon)]
+    batch_size = None
+    for key, shape in obs_shapes.items():
+        if key not in obs_dict:
+            raise KeyError(f"critic observation is missing key {key!r}")
+        value = obs_dict[key]
+        expected_ndim = len(shape) + 2
+        if value.ndim != expected_ndim or int(value.shape[1]) != horizon:
+            raise ValueError(
+                f"critic observation {key!r} must be [B,{horizon},"
+                f"{','.join(str(x) for x in shape)}], got {tuple(value.shape)}"
+            )
+        if tuple(value.shape[2:]) != tuple(shape):
+            raise ValueError(
+                f"critic observation {key!r} has trailing shape "
+                f"{tuple(value.shape[2:])}, expected {tuple(shape)}"
+            )
+        if batch_size is None:
+            batch_size = int(value.shape[0])
+        elif int(value.shape[0]) != batch_size:
+            raise ValueError("critic observation keys have different batch sizes")
+        for frame_index in range(horizon):
+            frames[frame_index][key] = value[:, frame_index]
+    return frames
+
+
+def named_crop_randomizers(encoder: nn.Module) -> list[tuple[str, CropRandomizer]]:
+    if isinstance(encoder, VisualDynamicsTargetEncoder):
+        encoder = encoder.encoder
+    return [
+        (name, module)
+        for name, module in encoder.named_modules()
+        if isinstance(module, CropRandomizer)
+    ]
+
+
+def make_temporal_crop_plan(
+    encoder: nn.Module,
+    *,
+    batch_size: int,
+    seed: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Sample one crop per trajectory and camera without changing global RNG."""
+    generator_device = device if device.type == "cuda" else torch.device("cpu")
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(int(seed))
+    plan = {}
+    for name, randomizer in named_crop_randomizers(encoder):
+        max_height = int(randomizer.input_shape[1]) - int(randomizer.crop_height)
+        max_width = int(randomizer.input_shape[2]) - int(randomizer.crop_width)
+        if max_height <= 0 or max_width <= 0:
+            raise ValueError(f"invalid crop geometry for {name!r}")
+        shape = (int(batch_size), int(randomizer.num_crops))
+        height = (
+            max_height
+            * torch.rand(shape, generator=generator, device=generator_device)
+        ).to(dtype=torch.long)
+        width = (
+            max_width
+            * torch.rand(shape, generator=generator, device=generator_device)
+        ).to(dtype=torch.long)
+        plan[name] = torch.stack((height, width), dim=-1)
+    return plan
+
+
+@contextmanager
+def use_temporal_crop_plan(
+    encoder: nn.Module,
+    crop_plan: dict[str, torch.Tensor] | None,
+    group_ids: torch.Tensor,
+):
+    randomizers = named_crop_randomizers(encoder)
+    if crop_plan is None or not randomizers:
+        yield
+        return
+    if set(crop_plan) != {name for name, _ in randomizers}:
+        raise ValueError("crop plan does not match encoder randomizers")
+    previous = []
+    try:
+        for name, randomizer in randomizers:
+            previous.append(
+                (
+                    randomizer,
+                    randomizer._external_crop_indices,
+                    randomizer._external_crop_group_ids,
+                )
+            )
+            randomizer.set_external_crop_plan(crop_plan[name], group_ids)
+        yield
+    finally:
+        for randomizer, indices, group_ids in previous:
+            randomizer.set_external_crop_plan(indices, group_ids)
+
+
+class TemporalObservationNetwork(nn.Module):
+    """Independent RISE-v2 encoder with a causal frame-history trunk."""
+
+    def __init__(
+        self,
+        *,
+        obs_shapes: OrderedDict,
+        goal_shapes: OrderedDict,
+        encoder_kwargs: dict,
+        latent_dim: int,
+        late_fusion_key: str | None,
+        observation_horizon: int,
+        temporal_num_layers: int,
+        temporal_num_heads: int,
+        temporal_feedforward_dim: int,
+        temporal_dropout: float,
+    ):
+        super().__init__()
+        self.obs_shapes = OrderedDict(obs_shapes)
+        self.goal_shapes = OrderedDict(goal_shapes or {})
+        self.observation_horizon = int(observation_horizon)
+        self.latent_dim = int(latent_dim)
+        if self.observation_horizon != 2:
+            raise ValueError(
+                "one-step temporal IDQL requires exactly two critic frames"
+            )
+        self.late_fusion_keys = tuple(
+            key.strip()
+            for key in str(late_fusion_key or "").split(",")
+            if key.strip()
+        )
+        group_shapes = OrderedDict(obs=self.obs_shapes)
+        if self.goal_shapes:
+            group_shapes["goal"] = self.goal_shapes
+        self.has_goal = "goal" in group_shapes
+        self.nets = nn.ModuleDict()
+        self.nets["encoder"] = ObsNets.ObservationGroupEncoder(
+            observation_group_shapes=group_shapes,
+            encoder_kwargs=encoder_kwargs,
+        )
+        self.encoder_output_dim = int(self.nets["encoder"].output_shape()[0])
+        late_fusion_dim = 0
+        for key in self.late_fusion_keys:
+            if key not in self.obs_shapes:
+                raise KeyError(f"late_fusion_key={key} is absent from obs_shapes")
+            late_fusion_dim += int(np.prod(self.obs_shapes[key]))
+        self.nets["frame_projection"] = make_mlp(
+            self.encoder_output_dim + late_fusion_dim,
+            (),
+            self.latent_dim,
+            final_layer_norm=True,
+        )
+        self.nets["temporal_trunk"] = CausalTemporalStateTrunk(
+            state_dim=self.latent_dim,
+            max_history=self.observation_horizon,
+            num_layers=int(temporal_num_layers),
+            num_heads=int(temporal_num_heads),
+            feedforward_dim=int(temporal_feedforward_dim),
+            dropout=float(temporal_dropout),
+        )
+
+    def _encode_frame(self, obs_dict, goal_dict=None):
+        inputs = {"obs": obs_dict}
+        if self.has_goal:
+            if goal_dict is None:
+                raise ValueError("goal-conditioned critic is missing goal observations")
+            inputs["goal"] = goal_dict
+        encoded = self.nets["encoder"](**inputs)
+        late_parts = [
+            obs_dict[key].flatten(start_dim=1) for key in self.late_fusion_keys
+        ]
+        if late_parts:
+            encoded = torch.cat((encoded, *late_parts), dim=-1)
+        return self.nets["frame_projection"](encoded)
+
+    def encode_state(self, obs_dict, goal_dict=None, *, crop_plan=None):
+        frames = observation_history_frames(
+            obs_dict,
+            self.obs_shapes,
+            self.observation_horizon,
+        )
+        batch_size = int(next(iter(frames[0].values())).shape[0])
+        # Match RISE-v2: one batched encoder call, newest frame first, then
+        # restore chronological order before the causal temporal trunk.
+        encode_order = (len(frames) - 1, *range(len(frames) - 1))
+        flattened_frames = {
+            key: torch.cat(
+                [frames[index][key] for index in encode_order],
+                dim=0,
+            )
+            for key in self.obs_shapes
+        }
+        flattened_goal = (
+            None
+            if goal_dict is None
+            else {
+                key: torch.cat([value] * len(frames), dim=0)
+                for key, value in goal_dict.items()
+            }
+        )
+        crop_groups = torch.arange(
+            batch_size,
+            device=next(iter(flattened_frames.values())).device,
+            dtype=torch.long,
+        ).repeat(len(frames))
+        with use_temporal_crop_plan(
+            self.nets["encoder"], crop_plan, crop_groups
+        ):
+            encoded = self._encode_frame(flattened_frames, flattened_goal)
+        encoded_by_time = encoded.split(batch_size, dim=0)
+        frame_latents = [None] * len(frames)
+        for frame_index, latent in zip(encode_order, encoded_by_time):
+            frame_latents[frame_index] = latent
+        stacked = torch.stack(frame_latents, dim=1)
+        temporal_tokens = self.nets["temporal_trunk"](stacked)
+        return {
+            "temporal_state": temporal_tokens[:, -1],
+            "current_frame_latent": stacked[:, -1],
+            "temporal_tokens": temporal_tokens,
+        }
+
+    @staticmethod
+    def expand_state(state: dict[str, torch.Tensor], batch_size: int):
+        expanded = {}
+        for key, value in state.items():
+            if int(value.shape[0]) == int(batch_size):
+                expanded[key] = value
+            elif int(value.shape[0]) == 1:
+                expanded[key] = value.expand(
+                    int(batch_size), *([-1] * (value.ndim - 1))
+                )
+            else:
+                raise ValueError(
+                    f"cannot expand temporal state batch {value.shape[0]} to "
+                    f"{batch_size}"
+                )
+        return expanded
+
+
+class TemporalOneStepActionValueNetwork(TemporalObservationNetwork):
+    """RISE-v2 Q specialized to a single action and optional t+1 prediction."""
+
+    def __init__(
+        self,
+        *,
+        action_dim: int,
+        hidden_dims: tuple[int, ...],
+        action_hidden_dim: int,
+        num_attention_heads: int,
+        num_action_conv_layers: int,
+        dropout: float,
+        fusion_mode: str,
+        dynamics_target_dim: int,
+        dynamics_enabled: bool,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.action_dim = int(action_dim)
+        self.chunk_horizon = 1
+        self.fusion_mode = str(fusion_mode)
+        self.dynamics_prediction_offsets = (1,) if dynamics_enabled else ()
+        self.dynamics_target_dim = int(dynamics_target_dim)
+        self.q_use_predicted_next_latent = False
+        self.nets["action_encoder"] = CausalSequentialActionChunkEncoder(
+            action_dim=self.action_dim,
+            chunk_horizon=1,
+            context_dim=self.latent_dim,
+            hidden_dim=int(action_hidden_dim),
+            output_dim=self.latent_dim,
+            num_heads=int(num_attention_heads),
+            num_conv_layers=int(num_action_conv_layers),
+            dropout=float(dropout),
+        )
+        self.nets["state_action_fusion"] = FiLMStateActionFusion(
+            latent_dim=self.latent_dim,
+            mode=self.fusion_mode,
+            dropout=float(dropout),
+        )
+        self.nets["q_head"] = make_mlp(
+            3 * self.latent_dim,
+            hidden_dims,
+            1,
+            dropout=float(dropout),
+        )
+        if self.dynamics_prediction_offsets:
+            self.nets["dynamics_predictor"] = MultiHorizonLatentPredictor(
+                latent_dim=self.latent_dim,
+                target_dim=self.dynamics_target_dim,
+                prediction_offsets=(1,),
+                hidden_dims=hidden_dims,
+                dropout=float(dropout),
+            )
+
+    def q_from_state(self, state, acts, action_mask=None, *, return_aux=False):
+        if acts.ndim == 2:
+            acts = acts.unsqueeze(1)
+        expected = (1, self.action_dim)
+        if acts.ndim != 3 or tuple(acts.shape[1:]) != expected:
+            raise ValueError(
+                f"one-step critic expected actions [B,1,{self.action_dim}], "
+                f"got {tuple(acts.shape)}"
+            )
+        if int(state["temporal_state"].shape[0]) != int(acts.shape[0]):
+            state = self.expand_state(state, int(acts.shape[0]))
+        temporal_state = state["temporal_state"]
+        offsets = self.dynamics_prediction_offsets if return_aux else ()
+        action_repr, prefix_repr = self.nets["action_encoder"](
+            temporal_state,
+            acts,
+            action_mask,
+            prefix_offsets=offsets,
+        )
+        fusion = self.nets["state_action_fusion"](temporal_state, action_repr)
+        q = self.nets["q_head"](
+            torch.cat((temporal_state, action_repr, fusion), dim=-1)
+        )
+        if not return_aux:
+            return q
+        predicted = None
+        if prefix_repr is not None:
+            prefix_state = temporal_state.unsqueeze(1).expand_as(prefix_repr)
+            prefix_fusion = self.nets["state_action_fusion"](
+                prefix_state, prefix_repr
+            )
+            predicted = self.nets["dynamics_predictor"](prefix_fusion)
+        return {
+            "q": q,
+            "temporal_state": temporal_state,
+            "current_frame_latent": state["current_frame_latent"],
+            "action_repr": action_repr,
+            "state_action_fusion": fusion,
+            "predicted_next_encoder": predicted,
+        }
+
+    def forward(
+        self,
+        obs_dict,
+        acts,
+        goal_dict=None,
+        action_mask=None,
+        return_aux=False,
+        *,
+        crop_plan=None,
+    ):
+        state = self.encode_state(obs_dict, goal_dict, crop_plan=crop_plan)
+        return self.q_from_state(
+            state,
+            acts,
+            action_mask,
+            return_aux=return_aux,
+        )
+
+
+class TemporalOneStepValueNetwork(TemporalObservationNetwork):
+    def __init__(self, *, hidden_dims, dropout, **kwargs):
+        super().__init__(**kwargs)
+        self.nets["value_head"] = make_mlp(
+            self.latent_dim,
+            hidden_dims,
+            1,
+            dropout=float(dropout),
+        )
+
+    def value_from_state(self, state):
+        return self.nets["value_head"](state["temporal_state"])
+
+    def forward(self, obs_dict, goal_dict=None, *, crop_plan=None):
+        return self.value_from_state(
+            self.encode_state(obs_dict, goal_dict, crop_plan=crop_plan)
+        )
+
+
+def deployed_actor_obs_encoder(actor_algo) -> nn.Module:
+    actor_nets = (
+        actor_algo.ema.averaged_model
+        if actor_algo.ema is not None
+        else actor_algo.nets
+    )
+    return actor_nets["policy"]["obs_encoder"]
+
+
+def actor_visual_feature_indices(encoder: nn.Module) -> tuple[int, ...]:
+    obs_encoder = encoder.nets["obs"]
+    indices = []
+    offset = 0
+    for key in obs_encoder.obs_shapes:
+        feature_shape = obs_encoder.obs_shapes[key]
+        for randomizer in obs_encoder.obs_randomizers[key]:
+            if randomizer is not None:
+                feature_shape = randomizer.output_shape_in(feature_shape)
+        observation_net = obs_encoder.obs_nets[key]
+        if observation_net is not None:
+            feature_shape = observation_net.output_shape(feature_shape)
+        for randomizer in obs_encoder.obs_randomizers[key]:
+            if randomizer is not None:
+                feature_shape = randomizer.output_shape_out(feature_shape)
+        feature_dim = int(np.prod(feature_shape))
+        if ObsUtils.key_is_obs_modality(key=key, obs_modality="rgb"):
+            indices.extend(range(offset, offset + feature_dim))
+        offset += feature_dim
+    if offset != int(encoder.output_shape()[0]) or not indices:
+        raise RuntimeError("could not resolve actor visual feature coordinates")
+    return tuple(indices)
+
+
+class VisualDynamicsTargetEncoder(nn.Module):
+    """Frozen deployed actor encoder exposing only concatenated RGB features."""
+
+    def __init__(self, source_encoder: nn.Module):
+        super().__init__()
+        self.encoder = copy.deepcopy(source_encoder)
+        self.register_buffer(
+            "visual_feature_indices",
+            torch.as_tensor(
+                actor_visual_feature_indices(self.encoder), dtype=torch.long
+            ),
+            persistent=False,
+        )
+
+    def output_shape(self):
+        return [int(self.visual_feature_indices.numel())]
+
+    def forward(self, obs_dict, goal_dict=None, *, crop_plan=None):
+        inputs = {"obs": obs_dict}
+        if goal_dict:
+            inputs["goal"] = goal_dict
+        batch_size = int(next(iter(obs_dict.values())).shape[0])
+        group_ids = torch.arange(
+            batch_size,
+            device=next(iter(obs_dict.values())).device,
+            dtype=torch.long,
+        )
+        with use_temporal_crop_plan(self, crop_plan, group_ids):
+            encoded = self.encoder(**inputs)
+        return encoded.index_select(-1, self.visual_feature_indices)
+
+
+def configure_target_encoder(target_encoder: VisualDynamicsTargetEncoder) -> None:
+    target_encoder.eval().requires_grad_(False)
+    for module in target_encoder.modules():
+        if isinstance(module, CropRandomizer):
+            module.train()
+
+
+def configure_critic_targets(critic_targets: nn.ModuleList) -> None:
+    critic_targets.eval().requires_grad_(False)
+    for critic in critic_targets:
+        critic.nets["encoder"].eval().requires_grad_(False)
+        for module in critic.nets["encoder"].modules():
+            if isinstance(module, CropRandomizer):
+                module.train()
+
+
+def copy_deployed_encoder_state(module: nn.Module, actor_algo) -> dict[str, int]:
+    source = deployed_actor_obs_encoder(actor_algo)
+    module.nets["encoder"] = replace_bn_with_gn(module.nets["encoder"])
+    source_state = source.state_dict()
+    module.nets["encoder"].load_state_dict(source_state, strict=True)
+    return {
+        "tensor_count": int(len(source_state)),
+        "parameter_count": int(sum(value.numel() for value in source_state.values())),
+    }
+
+
+def make_temporal_one_step_value_networks(
+    actor_algo,
+    *,
+    hidden_dims: tuple[int, ...],
+    latent_dim: int = 300,
+    action_hidden_dim: int = 128,
+    num_attention_heads: int = 4,
+    num_action_conv_layers: int = 2,
+    dropout: float = 0.0,
+    num_critics: int = 2,
+    critic_group_norm: bool = False,
+    late_fusion_key: str | None = "robot0_gripper_qpos",
+    observation_horizon: int = 2,
+    temporal_num_layers: int = 2,
+    temporal_num_heads: int = 6,
+    temporal_feedforward_dim: int = 600,
+    temporal_dropout: float = 0.0,
+    fusion_mode: str = "film",
+    dynamics_enabled: bool = False,
+    dynamics_target_dim: int | None = None,
+):
+    encoder_kwargs = ObsUtils.obs_encoder_kwargs_from_config(
+        actor_algo.obs_config.encoder
+    )
+    if dynamics_target_dim is None:
+        dynamics_target_dim = len(
+            actor_visual_feature_indices(deployed_actor_obs_encoder(actor_algo))
+        )
+    common = {
+        "obs_shapes": actor_algo.obs_shapes,
+        "goal_shapes": actor_algo.goal_shapes,
+        "latent_dim": int(latent_dim),
+        "late_fusion_key": late_fusion_key,
+        "observation_horizon": int(observation_horizon),
+        "temporal_num_layers": int(temporal_num_layers),
+        "temporal_num_heads": int(temporal_num_heads),
+        "temporal_feedforward_dim": int(temporal_feedforward_dim),
+        "temporal_dropout": float(temporal_dropout),
+    }
+    critics = nn.ModuleList(
+        [
+            TemporalOneStepActionValueNetwork(
+                **common,
+                encoder_kwargs=copy.deepcopy(encoder_kwargs),
+                action_dim=int(actor_algo.ac_dim),
+                hidden_dims=hidden_dims,
+                action_hidden_dim=int(action_hidden_dim),
+                num_attention_heads=int(num_attention_heads),
+                num_action_conv_layers=int(num_action_conv_layers),
+                dropout=float(dropout),
+                fusion_mode=str(fusion_mode),
+                dynamics_target_dim=int(dynamics_target_dim),
+                dynamics_enabled=bool(dynamics_enabled),
+            )
+            for _ in range(int(num_critics))
+        ]
+    )
+    vf = TemporalOneStepValueNetwork(
+        **common,
+        encoder_kwargs=copy.deepcopy(encoder_kwargs),
+        hidden_dims=hidden_dims,
+        dropout=float(dropout),
+    )
+    if critic_group_norm:
+        critics = replace_bn_with_gn(critics)
+        vf = replace_bn_with_gn(vf)
+    # The deployed Diffusion Policy always carries a BN->GN converted visual
+    # encoder. Keep this conversion architectural (and therefore reproducible
+    # during evaluation reconstruction), independently of the optional
+    # critic-wide group-normalization override.
+    for critic in critics:
+        critic.nets["encoder"] = replace_bn_with_gn(critic.nets["encoder"])
+    vf.nets["encoder"] = replace_bn_with_gn(vf.nets["encoder"])
+    return critics, copy.deepcopy(critics), vf
+
+
+def make_temporal_one_step_system_from_checkpoint(actor_algo, checkpoint: dict):
+    required = (
+        "critic_hidden_dims",
+        "critic_latent_dim",
+        "critic_action_hidden_dim",
+        "critic_num_attention_heads",
+        "critic_num_action_conv_layers",
+        "critic_dropout",
+        "num_critics",
+        "critic_group_norm",
+        "critic_observation_horizon",
+        "critic_temporal_num_layers",
+        "critic_temporal_num_heads",
+        "critic_temporal_feedforward_dim",
+        "critic_temporal_dropout",
+        "critic_rise_v2_fusion_mode",
+        "critic_dynamics_target_dim",
+    )
+    missing = [key for key in required if key not in checkpoint]
+    if missing:
+        raise ValueError(f"temporal one-step checkpoint is missing {missing}")
+    return make_temporal_one_step_value_networks(
+        actor_algo,
+        hidden_dims=tuple(int(value) for value in checkpoint["critic_hidden_dims"]),
+        latent_dim=int(checkpoint["critic_latent_dim"]),
+        action_hidden_dim=int(checkpoint["critic_action_hidden_dim"]),
+        num_attention_heads=int(checkpoint["critic_num_attention_heads"]),
+        num_action_conv_layers=int(checkpoint["critic_num_action_conv_layers"]),
+        dropout=float(checkpoint["critic_dropout"]),
+        num_critics=int(checkpoint["num_critics"]),
+        critic_group_norm=bool(checkpoint["critic_group_norm"]),
+        late_fusion_key=checkpoint.get("critic_late_fusion_key"),
+        observation_horizon=int(checkpoint["critic_observation_horizon"]),
+        temporal_num_layers=int(checkpoint["critic_temporal_num_layers"]),
+        temporal_num_heads=int(checkpoint["critic_temporal_num_heads"]),
+        temporal_feedforward_dim=int(
+            checkpoint["critic_temporal_feedforward_dim"]
+        ),
+        temporal_dropout=float(checkpoint["critic_temporal_dropout"]),
+        fusion_mode=str(checkpoint["critic_rise_v2_fusion_mode"]),
+        dynamics_enabled=bool(checkpoint.get("latent_dynamics", False)),
+        dynamics_target_dim=int(checkpoint["critic_dynamics_target_dim"]),
+    )
 
 
 def action_normalization_stats_match(left: dict, right: dict) -> bool:
@@ -521,6 +1141,9 @@ def build_single_loader(
             dataset = SparseOneStepSequenceDataset(
                 dataset,
                 observation_horizon=observation_horizon,
+                critic_observation_horizon=int(
+                    getattr(args, "critic_observation_horizon", 1)
+                ),
             )
         else:
             dataset = SparseDQLSequenceDataset(
@@ -608,6 +1231,35 @@ def parameter_count(module: nn.Module) -> int:
     return int(sum(parameter.numel() for parameter in module.parameters()))
 
 
+def make_temporal_critic_optimizer(
+    network: nn.Module,
+    *,
+    learning_rate: float,
+    encoder_learning_rate: float,
+) -> torch.optim.Optimizer:
+    encoder_parameters = list(network.nets["encoder"].parameters())
+    encoder_ids = {id(parameter) for parameter in encoder_parameters}
+    other_parameters = [
+        parameter
+        for parameter in network.parameters()
+        if id(parameter) not in encoder_ids
+    ]
+    return torch.optim.Adam(
+        [
+            {
+                "params": other_parameters,
+                "lr": float(learning_rate),
+                "group_name": "critic",
+            },
+            {
+                "params": encoder_parameters,
+                "lr": float(encoder_learning_rate),
+                "group_name": "encoder",
+            },
+        ]
+    )
+
+
 def rise_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
     if args.reward_mode == "task":
         reward_alignment = "source_environment_task_reward"
@@ -619,17 +1271,17 @@ def rise_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
         "matched": [
             "one uniformly shuffled mixed SequenceDataset",
             reward_alignment,
-            "independent_raw_observation_Q1_Q2_target_Q1_target_Q2_V",
+            "independent_two_frame_temporal_Q1_Q2_target_Q1_target_Q2_V",
             "one_step_IQL_Q_and_expectile_V_equations",
             "Q_then_target_soft_update_then_V_update_order",
-            "pure_diffusion_BC_actor_objective",
-            "task_gripper_late_fusion_value_heads",
+            "unconditioned_pretrained_DP_actor_with_full_chunk_diffusion_BC",
+            "causal_temporal_state_and_FiLM_action_fusion",
         ],
         "post_deployment_adaptations": [
             "actor_initialized_from_pretrained_DP_deployed_EMA",
-            "actor_keeps_pretrained_DP_native_sequence_alignment_and_scheduler",
             "local_success_and_failure_rollouts_replace_unreleased_RISE_play_data",
             "RISE_nearby_state_and_action_augmentation_not_applied",
+            "optional_immediate_visual_successor_prediction",
         ],
         "critic_group_norm_compatibility_override": bool(args.critic_group_norm),
     }
@@ -639,31 +1291,45 @@ def process_critic_batch(
     raw_batch: dict,
     actor_algo,
     obs_normalization_stats,
+    critic_observation_horizon: int = 2,
 ) -> dict:
-    """Extract RISE's one-step tuple from the shared sequence batch."""
+    """Extract a two-frame one-step IQL tuple from the sequence batch."""
     current_index = int(actor_algo.algo_config.horizon.observation_horizon) - 1
+    critic_observation_horizon = int(critic_observation_horizon)
+    history_start = current_index - critic_observation_horizon + 1
+    if history_start < 0:
+        raise ValueError(
+            "critic observation horizon exceeds the actor observation history"
+        )
     sparse_next_obs = "one_step_sparse_next_obs" in raw_batch
     if sparse_next_obs:
         invalid_sparse_shapes = {
             key: tuple(raw_batch["next_obs"][key].shape)
             for key in actor_algo.obs_shapes
             if raw_batch["next_obs"][key].ndim < 2
-            or int(raw_batch["next_obs"][key].shape[1]) != 1
+            or int(raw_batch["next_obs"][key].shape[1])
+            != critic_observation_horizon
         }
         if invalid_sparse_shapes:
             raise ValueError(
-                "sparse one-step next observations must have one time step: "
+                "sparse one-step next observations have the wrong history: "
                 f"{invalid_sparse_shapes}"
             )
     critic_batch = {
         "obs": {
-            key: raw_batch["obs"][key][:, current_index]
+            key: raw_batch["obs"][key][
+                :, history_start : current_index + 1
+            ]
             for key in actor_algo.obs_shapes
         },
         "next_obs": {
-            key: raw_batch["next_obs"][key][
-                :, 0 if sparse_next_obs else current_index
-            ]
+            key: (
+                raw_batch["next_obs"][key]
+                if sparse_next_obs
+                else raw_batch["next_obs"][key][
+                    :, history_start : current_index + 1
+                ]
+            )
             for key in actor_algo.obs_shapes
         },
         "actions": raw_batch["actions"][:, current_index],
@@ -698,6 +1364,17 @@ def process_critic_batch(
         )
     if action_min < -1.0 or action_max > 1.0:
         critic_batch["actions"] = actions.clamp(-1.0, 1.0)
+    for name in ("obs", "next_obs"):
+        invalid_history = {
+            key: tuple(value.shape)
+            for key, value in critic_batch[name].items()
+            if int(value.shape[1]) != critic_observation_horizon
+        }
+        if invalid_history:
+            raise ValueError(
+                f"critic {name} must retain {critic_observation_horizon} frames: "
+                f"{invalid_history}"
+            )
     return critic_batch
 
 
@@ -789,6 +1466,180 @@ def compute_critic_losses(
         "data/action_abs_mean": actions.abs().mean(),
         "data/action_min": actions.min(),
         "data/action_max": actions.max(),
+    }
+    return critic_losses, vf_loss, info
+
+
+def compute_temporal_one_step_losses(
+    critics: nn.ModuleList,
+    critic_targets: nn.ModuleList,
+    vf: TemporalOneStepValueNetwork,
+    dynamics_target_encoder: VisualDynamicsTargetEncoder | None,
+    batch: dict,
+    *,
+    discount: float,
+    expectile: float,
+    use_huber: bool,
+    dynamics_weight: float,
+) -> tuple[list[torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
+    """One-step IQL plus an optional immediate visual successor objective."""
+    dynamics_enabled = float(dynamics_weight) > 0.0
+    if dynamics_enabled != (dynamics_target_encoder is not None):
+        raise ValueError(
+            "dynamics target encoder presence must match dynamics_weight > 0"
+        )
+    batch_size = int(batch["actions"].shape[0])
+    device = batch["actions"].device
+    crop_seeds = torch.randint(
+        0,
+        torch.iinfo(torch.int32).max,
+        (len(critics) + 2,),
+        device="cpu",
+    ).tolist()
+    critic_crop_plans = [
+        make_temporal_crop_plan(
+            critic.nets["encoder"],
+            batch_size=batch_size,
+            seed=int(seed),
+            device=device,
+        )
+        for critic, seed in zip(critics, crop_seeds[: len(critics)])
+    ]
+    action_mask = batch["actions"].new_ones((batch_size, 1))
+    outputs = [
+        critic(
+            obs_dict=batch["obs"],
+            acts=batch["actions"],
+            action_mask=action_mask,
+            goal_dict=batch["goal_obs"],
+            return_aux=True,
+            crop_plan=crop_plan,
+        )
+        for critic, crop_plan in zip(critics, critic_crop_plans)
+    ]
+    pred_qs = [output["q"] for output in outputs]
+
+    with torch.no_grad():
+        next_v_crop_plan = make_temporal_crop_plan(
+            vf.nets["encoder"],
+            batch_size=batch_size,
+            seed=int(crop_seeds[-2]),
+            device=device,
+        )
+        target_vf_pred = vf(
+            obs_dict=batch["next_obs"],
+            goal_dict=batch["goal_obs"],
+            crop_plan=next_v_crop_plan,
+        )
+        rewards = batch["rewards"]
+        q_target = (
+            rewards
+            + (1.0 - batch["dones"])
+            * float(discount)
+            * target_vf_pred
+        )
+        target_q_crop_plan = make_temporal_crop_plan(
+            vf.nets["encoder"],
+            batch_size=batch_size,
+            seed=int(crop_seeds[-1]),
+            device=device,
+        )
+        target_qs = [
+            critic(
+                obs_dict=batch["obs"],
+                acts=batch["actions"],
+                action_mask=action_mask,
+                goal_dict=batch["goal_obs"],
+                crop_plan=target_q_crop_plan,
+            )
+            for critic in critic_targets
+        ]
+        target_q_min = torch.cat(target_qs, dim=1).min(
+            dim=1, keepdim=True
+        ).values
+        target_features = []
+        if dynamics_enabled:
+            next_frame = {
+                key: value[:, -1] for key, value in batch["next_obs"].items()
+            }
+            target_features = [
+                dynamics_target_encoder(
+                    next_frame,
+                    batch["goal_obs"],
+                    crop_plan=crop_plan,
+                ).detach()
+                for crop_plan in critic_crop_plans
+            ]
+
+    regression = F.smooth_l1_loss if use_huber else F.mse_loss
+    q_losses = [regression(prediction, q_target) for prediction in pred_qs]
+    dynamics_losses = []
+    critic_losses = []
+    if dynamics_enabled:
+        for output, q_loss, target in zip(outputs, q_losses, target_features):
+            predicted = output["predicted_next_encoder"]
+            if predicted is None or tuple(predicted.shape[1:2]) != (1,):
+                raise RuntimeError("one-step dynamics predictor did not produce t+1")
+            dynamics_loss = F.smooth_l1_loss(predicted[:, 0], target)
+            dynamics_losses.append(dynamics_loss)
+            critic_losses.append(q_loss + float(dynamics_weight) * dynamics_loss)
+    else:
+        critic_losses = q_losses
+
+    vf_crop_plan = make_temporal_crop_plan(
+        vf.nets["encoder"],
+        batch_size=batch_size,
+        seed=int(crop_seeds[-1]),
+        device=device,
+    )
+    vf_state = vf.encode_state(
+        batch["obs"], batch["goal_obs"], crop_plan=vf_crop_plan
+    )
+    vf_pred = vf.value_from_state(vf_state)
+    vf_error = vf_pred - target_q_min
+    vf_weight = torch.where(
+        vf_error > 0.0,
+        1.0 - float(expectile),
+        float(expectile),
+    )
+    vf_loss = (vf_weight * vf_error.square()).mean()
+    q_tensor = torch.cat(pred_qs, dim=1)
+    zero = q_tensor.new_zeros(())
+    dynamics_mean = (
+        torch.stack(dynamics_losses).mean() if dynamics_losses else zero
+    )
+    temporal_states = torch.stack(
+        [output["temporal_state"] for output in outputs], dim=0
+    )
+    info = {
+        **{
+            f"critic/q{index + 1}_loss": loss.detach()
+            for index, loss in enumerate(q_losses)
+        },
+        **{
+            f"critic/q{index + 1}_mean": prediction.mean().detach()
+            for index, prediction in enumerate(pred_qs)
+        },
+        "critic/q_target_mean": q_target.mean().detach(),
+        "critic/target_v_mean": target_vf_pred.mean().detach(),
+        "critic/q_ensemble_std": q_tensor.std(dim=1).mean().detach(),
+        "vf/loss": vf_loss.detach(),
+        "vf/value_mean": vf_pred.mean().detach(),
+        "vf/target_q_min_mean": target_q_min.mean().detach(),
+        "vf/error_mean": vf_error.mean().detach(),
+        "dynamics/loss": dynamics_mean.detach(),
+        "dynamics/weighted_loss": (
+            float(dynamics_weight) * dynamics_mean
+        ).detach(),
+        "dynamics/enabled": q_tensor.new_tensor(float(dynamics_enabled)),
+        "representation/temporal_feature_std": temporal_states.std(
+            dim=1, unbiased=False
+        ).mean().detach(),
+        "data/reward_mean": rewards.mean().detach(),
+        "data/done_fraction": batch["dones"].mean().detach(),
+        "data/action_abs_mean": batch["actions"].abs().mean().detach(),
+        "data/action_min": batch["actions"].min().detach(),
+        "data/action_max": batch["actions"].max().detach(),
     }
     return critic_losses, vf_loss, info
 
@@ -1083,6 +1934,7 @@ def checkpoint_payload(
     critics: nn.ModuleList,
     critic_targets: nn.ModuleList,
     vf: nn.Module,
+    dynamics_target_encoder: VisualDynamicsTargetEncoder | None,
     critic_optimizers: list[torch.optim.Optimizer],
     vf_optimizer: torch.optim.Optimizer,
     critic_lr_schedulers: list[Any],
@@ -1106,12 +1958,18 @@ def checkpoint_payload(
     )
     return {
         "rise_style_rgb_idql": True,
+        TEMPORAL_ONE_STEP_MARKER: True,
         "hybrid_dp_chunk_actor_iql": True,
         "visual_critic_idql": True,
         "actor_model": actor_algo.serialize(),
         "critics": [critic.state_dict() for critic in critics],
         "critic_targets": [critic.state_dict() for critic in critic_targets],
         "vf": vf.state_dict(),
+        "dynamics_target_encoder": (
+            dynamics_target_encoder.state_dict()
+            if dynamics_target_encoder is not None
+            else None
+        ),
         "critic_optimizers": [optimizer.state_dict() for optimizer in critic_optimizers],
         "vf_optimizer": vf_optimizer.state_dict(),
         "critic_lr_schedulers": [
@@ -1154,11 +2012,38 @@ def checkpoint_payload(
             if args.reward_mode == "terminal_success"
             else "rewards=expert_1_non_expert_0"
         ),
-        "critic_input_mode": "independent_raw_observation_encoders",
+        "critic_input_mode": "independent_causal_two_frame_temporal_encoders",
         "critic_action_space": "pretrained_dp_normalized_action_space",
         "critic_action_input": "single_action_at_current_observation_index",
         "critic_horizon": 1,
-        "latent_dynamics": False,
+        "critic_chunk_horizon": 1,
+        "critic_architecture": TEMPORAL_CRITIC_ARCHITECTURE,
+        "critic_observation_horizon": int(args.critic_observation_horizon),
+        "critic_latent_dim": int(args.latent_dim),
+        "critic_action_hidden_dim": int(args.action_hidden_dim),
+        "critic_num_attention_heads": int(args.num_attention_heads),
+        "critic_num_action_conv_layers": int(args.num_action_conv_layers),
+        "critic_dropout": float(args.dropout),
+        "critic_temporal_num_layers": int(args.temporal_num_layers),
+        "critic_temporal_num_heads": int(args.temporal_num_heads),
+        "critic_temporal_feedforward_dim": int(
+            args.temporal_feedforward_dim
+        ),
+        "critic_temporal_dropout": float(args.temporal_dropout),
+        "critic_rise_v2_fusion_mode": str(args.rise_v2_fusion_mode),
+        "critic_dynamics_target_dim": int(
+            critics[0].dynamics_target_dim
+        ),
+        "critic_dynamics_prediction_offsets": (
+            (1,) if float(args.dynamics_weight) > 0.0 else ()
+        ),
+        "latent_dynamics": bool(float(args.dynamics_weight) > 0.0),
+        "dynamics_weight": float(args.dynamics_weight),
+        "dynamics_prediction_target": (
+            "immediate_next_visual_actor_encoder_features"
+            if float(args.dynamics_weight) > 0.0
+            else None
+        ),
         "critic_hidden_dims": tuple(int(value) for value in args.critic_hidden_dims),
         "num_critics": int(args.num_critics),
         "critic_group_norm": bool(args.critic_group_norm),
@@ -1174,7 +2059,6 @@ def checkpoint_payload(
         "actor_initialized_from_deployed_ema": True,
         "actor_pretrained_checkpoint_loaded": True,
         "actor_exactly_matched_deployed_ema_at_initialization": True,
-        "actor_encoder_trainable": True,
         "rise_reference_alignment": rise_reference_alignment(args),
         "actor_ema_optimization_step": int(
             actor_algo.ema.optimization_step if actor_algo.ema is not None else 0
@@ -1238,11 +2122,24 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "num_critics",
         "critic_group_norm",
         "critic_late_fusion_key",
+        "critic_observation_horizon",
+        "latent_dim",
+        "action_hidden_dim",
+        "num_attention_heads",
+        "num_action_conv_layers",
+        "dropout",
+        "temporal_num_layers",
+        "temporal_num_heads",
+        "temporal_feedforward_dim",
+        "temporal_dropout",
+        "rise_v2_fusion_mode",
+        "dynamics_weight",
         "discount",
         "expectile",
         "target_tau",
         "actor_lr",
         "critic_lr",
+        "encoder_lr",
         "vf_lr",
         "lr_scheduler",
         "lr_warmup_steps",
@@ -1336,6 +2233,7 @@ def train(args: argparse.Namespace) -> dict:
         total_steps=args.lr_total_steps,
         num_cycles=args.lr_num_cycles,
     )
+    unconditioned_actor_audit = assert_unconditioned_actor(actor_algo)
     audit = dataset_audit(
         args.dataset,
         len(dataset),
@@ -1345,22 +2243,63 @@ def train(args: argparse.Namespace) -> dict:
     action_stats = dp_checkpoint["action_normalization_stats"]
     obs_normalization_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
 
-    critics, critic_targets, vf = make_rise_value_networks(
+    dynamics_enabled = float(args.dynamics_weight) > 0.0
+    dynamics_target_dim = len(
+        actor_visual_feature_indices(deployed_actor_obs_encoder(actor_algo))
+    )
+    dynamics_target_encoder = (
+        VisualDynamicsTargetEncoder(deployed_actor_obs_encoder(actor_algo))
+        if dynamics_enabled
+        else None
+    )
+    critics, critic_targets, vf = make_temporal_one_step_value_networks(
         actor_algo,
         hidden_dims=tuple(int(value) for value in args.critic_hidden_dims),
+        latent_dim=int(args.latent_dim),
+        action_hidden_dim=int(args.action_hidden_dim),
+        num_attention_heads=int(args.num_attention_heads),
+        num_action_conv_layers=int(args.num_action_conv_layers),
+        dropout=float(args.dropout),
         num_critics=args.num_critics,
         critic_group_norm=args.critic_group_norm,
         late_fusion_key=args.critic_late_fusion_key,
+        observation_horizon=int(args.critic_observation_horizon),
+        temporal_num_layers=int(args.temporal_num_layers),
+        temporal_num_heads=int(args.temporal_num_heads),
+        temporal_feedforward_dim=int(args.temporal_feedforward_dim),
+        temporal_dropout=float(args.temporal_dropout),
+        fusion_mode=str(args.rise_v2_fusion_mode),
+        dynamics_enabled=dynamics_enabled,
+        dynamics_target_dim=dynamics_target_dim,
     )
+    encoder_initialization = {
+        "mode": "deployed_pretrained_dp_raw_obs_encoder_copy",
+        "critics": [
+            copy_deployed_encoder_state(critic, actor_algo) for critic in critics
+        ],
+        "vf": copy_deployed_encoder_state(vf, actor_algo),
+    }
+    critic_targets = copy.deepcopy(critics)
     critics = critics.float().to(device)
     critic_targets = critic_targets.float().to(device)
     vf = vf.float().to(device)
+    if dynamics_target_encoder is not None:
+        dynamics_target_encoder = dynamics_target_encoder.float().to(device)
+        configure_target_encoder(dynamics_target_encoder)
     critic_targets.requires_grad_(False)
     critic_optimizers = [
-        torch.optim.Adam(critic.parameters(), lr=float(args.critic_lr))
+        make_temporal_critic_optimizer(
+            critic,
+            learning_rate=args.critic_lr,
+            encoder_learning_rate=args.encoder_lr,
+        )
         for critic in critics
     ]
-    vf_optimizer = torch.optim.Adam(vf.parameters(), lr=float(args.vf_lr))
+    vf_optimizer = make_temporal_critic_optimizer(
+        vf,
+        learning_rate=args.vf_lr,
+        encoder_learning_rate=args.encoder_lr,
+    )
     critic_lr_schedulers = [
         make_step_lr_scheduler(
             optimizer,
@@ -1391,6 +2330,16 @@ def train(args: argparse.Namespace) -> dict:
         )
         if not checkpoint.get("rise_style_rgb_idql", False):
             raise ValueError("resume checkpoint is not from train_rgb_dp_idql.py")
+        if not checkpoint.get(TEMPORAL_ONE_STEP_MARKER, False):
+            raise ValueError(
+                "legacy one-frame checkpoints cannot resume the temporal "
+                "one-step recipe"
+            )
+        if checkpoint.get("actor_training_objective") != "diffusion_bc_full_chunk":
+            raise ValueError(
+                "resume checkpoint did not train the DP actor with full-chunk "
+                "diffusion BC and cannot resume standard IDQL"
+            )
         saved_distributed = checkpoint.get("distributed_training", {})
         if bool(saved_distributed.get("enabled", False)) and (
             not distributed.enabled
@@ -1451,6 +2400,19 @@ def train(args: argparse.Namespace) -> dict:
         for critic_target, state in zip(critic_targets, checkpoint["critic_targets"]):
             critic_target.load_state_dict(state)
         vf.load_state_dict(checkpoint["vf"])
+        saved_dynamics_target = checkpoint.get("dynamics_target_encoder")
+        if dynamics_target_encoder is None:
+            if saved_dynamics_target is not None:
+                raise ValueError(
+                    "resume checkpoint has dynamics state but dynamics is disabled"
+                )
+        else:
+            if saved_dynamics_target is None:
+                raise ValueError("resume checkpoint is missing dynamics target state")
+            dynamics_target_encoder.load_state_dict(
+                saved_dynamics_target, strict=True
+            )
+            configure_target_encoder(dynamics_target_encoder)
         for optimizer, state in zip(critic_optimizers, checkpoint["critic_optimizers"]):
             optimizer.load_state_dict(state)
         vf_optimizer.load_state_dict(checkpoint["vf_optimizer"])
@@ -1537,8 +2499,7 @@ def train(args: argparse.Namespace) -> dict:
 
     actor_algo.set_train()
     critics.train()
-    critic_targets.train()
-    critic_targets.requires_grad_(False)
+    configure_critic_targets(critic_targets)
     vf.train()
     synchronized_modules: list[nn.Module] = [
         actor_algo.nets,
@@ -1546,6 +2507,8 @@ def train(args: argparse.Namespace) -> dict:
         critic_targets,
         vf,
     ]
+    if dynamics_target_encoder is not None:
+        synchronized_modules.append(dynamics_target_encoder)
     if actor_algo.ema is not None:
         synchronized_modules.append(actor_algo.ema.averaged_model)
     broadcast_module_state(synchronized_modules, distributed)
@@ -1567,20 +2530,30 @@ def train(args: argparse.Namespace) -> dict:
         critic_targets,
         vf,
     ]
+    if dynamics_target_encoder is not None:
+        training_buffer_modules.append(dynamics_target_encoder)
     synchronize_training_buffers = modules_have_mutable_batch_norm(
         training_buffer_modules
     )
     if distributed.enabled and args.resume_checkpoint is None:
         seed_process(int(args.seed) + distributed.rank, device)
-    trainability = actor_trainability(actor_algo)
+    actor_audit = {
+        **actor_trainability(actor_algo),
+        **unconditioned_actor_audit,
+    }
     architecture = {
-        "actor": trainability,
+        "actor": actor_audit,
         "critic_parameter_counts": [parameter_count(critic) for critic in critics],
         "target_critic_parameter_counts": [
             parameter_count(critic) for critic in critic_targets
         ],
         "vf_parameter_count": parameter_count(vf),
         "independent_raw_obs_encoders": True,
+        "encoder_initialization": encoder_initialization,
+        "critic_architecture": TEMPORAL_CRITIC_ARCHITECTURE,
+        "critic_observation_horizon": int(args.critic_observation_horizon),
+        "causal_temporal_trunk": True,
+        "state_action_fusion": str(args.rise_v2_fusion_mode),
         "critic_group_norm": bool(args.critic_group_norm),
         "critic_late_fusion_key": args.critic_late_fusion_key,
     }
@@ -1603,7 +2576,7 @@ def train(args: argparse.Namespace) -> dict:
             "class": dataset.__class__.__name__,
             "sparse_one_step_loader": bool(args.sparse_one_step_loader),
             "observation_loading": (
-                "actor_observation_history_plus_one_immediate_next_observation"
+                "actor_observation_history_plus_two_frame_successor_critic_history"
                 if args.sparse_one_step_loader
                 else "full_obs_and_next_obs_sequences"
             ),
@@ -1665,6 +2638,7 @@ def train(args: argparse.Namespace) -> dict:
             "target_tau": float(args.target_tau),
             "actor_lr": float(args.actor_lr),
             "critic_lr": float(args.critic_lr),
+            "encoder_lr": float(args.encoder_lr),
             "vf_lr": float(args.vf_lr),
             "lr_scheduler": str(args.lr_scheduler),
             "lr_warmup_steps": int(args.lr_warmup_steps),
@@ -1678,6 +2652,7 @@ def train(args: argparse.Namespace) -> dict:
             "action": int(actor_algo.algo_config.horizon.action_horizon),
             "prediction": int(actor_algo.algo_config.horizon.prediction_horizon),
             "critic": 1,
+            "critic_observation": int(args.critic_observation_horizon),
         },
         "critic_action_contract": {
             "input": "actions[:, observation_horizon - 1]",
@@ -1685,9 +2660,19 @@ def train(args: argparse.Namespace) -> dict:
             "uses_action_chunk": False,
         },
         "latent_dynamics": {
-            "enabled": False,
-            "loss_weight": 0.0,
-            "target_encoder": False,
+            "enabled": dynamics_enabled,
+            "loss_weight": float(args.dynamics_weight),
+            "prediction_offset": 1 if dynamics_enabled else None,
+            "target": (
+                "immediate_next_visual_actor_encoder_features"
+                if dynamics_enabled
+                else None
+            ),
+            "target_encoder": (
+                "frozen_deployed_pretrained_dp_visual_encoder"
+                if dynamics_enabled
+                else False
+            ),
         },
         "distributed": {
             "enabled": bool(distributed.enabled),
@@ -1736,6 +2721,7 @@ def train(args: argparse.Namespace) -> dict:
                     actor_algo.optimizers["policy"].param_groups[0]["lr"]
                 ),
                 "critic": float(critic_optimizers[0].param_groups[0]["lr"]),
+                "encoder": float(critic_optimizers[0].param_groups[1]["lr"]),
                 "vf": float(vf_optimizer.param_groups[0]["lr"]),
             }
 
@@ -1743,15 +2729,18 @@ def train(args: argparse.Namespace) -> dict:
                 raw_batch,
                 actor_algo,
                 obs_normalization_stats,
+                critic_observation_horizon=args.critic_observation_horizon,
             )
-            critic_losses, vf_loss, critic_info = compute_critic_losses(
+            critic_losses, vf_loss, critic_info = compute_temporal_one_step_losses(
                 critics,
                 critic_targets,
                 vf,
+                dynamics_target_encoder,
                 critic_batch,
                 discount=args.discount,
                 expectile=args.expectile,
                 use_huber=args.use_huber,
+                dynamics_weight=args.dynamics_weight,
             )
             update_critics(
                 critics,
@@ -1785,7 +2774,6 @@ def train(args: argparse.Namespace) -> dict:
                     "actor/data_rows": float(actor_rows),
                     "actor/filtered_rows": 0.0,
                     "actor/data_fraction": 1.0,
-                    "actor/source_mask_applied": 0.0,
                 }
             )
             global_samples_seen += int(
@@ -1796,6 +2784,7 @@ def train(args: argparse.Namespace) -> dict:
             metrics.update(actor_info)
             metrics["lr/actor"] = learning_rates_used["actor"]
             metrics["lr/critic"] = learning_rates_used["critic"]
+            metrics["lr/encoder"] = learning_rates_used["encoder"]
             metrics["lr/vf"] = learning_rates_used["vf"]
             metrics["distributed/world_size"] = float(distributed.world_size)
             metrics["data/effective_global_batch_rows"] = float(
@@ -1869,6 +2858,7 @@ def train(args: argparse.Namespace) -> dict:
                     critics=critics,
                     critic_targets=critic_targets,
                     vf=vf,
+                    dynamics_target_encoder=dynamics_target_encoder,
                     critic_optimizers=critic_optimizers,
                     vf_optimizer=vf_optimizer,
                     critic_lr_schedulers=critic_lr_schedulers,
@@ -1990,8 +2980,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Load only the actor observation history and the critic's immediate "
-            "next observation while preserving the full action sequence."
+            "Load only the critic's current two-frame history, immediate "
+            "successor history, and current action."
         ),
     )
     parser.add_argument("--num-workers", type=int, default=4)
@@ -2011,13 +3001,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reward-mode",
         choices=tuple(REWARD_DEFINITIONS),
-        default="task",
-        help="Expected dataset reward mode; task is the default.",
+        default="terminal_success",
+        help="Expected dataset reward mode; terminal_success is the default.",
     )
     parser.add_argument("--expectile", type=float, default=0.9)
     parser.add_argument("--target-tau", type=float, default=0.01)
     parser.add_argument("--actor-lr", type=float, default=1e-4)
     parser.add_argument("--critic-lr", type=float, default=1e-4)
+    parser.add_argument("--encoder-lr", type=float, default=1e-5)
     parser.add_argument("--vf-lr", type=float, default=1e-4)
     parser.add_argument(
         "--lr-scheduler",
@@ -2027,6 +3018,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-warmup-steps", type=int, default=500)
     parser.add_argument("--lr-num-cycles", type=float, default=0.5)
     parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=(300, 400, 300))
+    parser.add_argument("--critic-observation-horizon", type=int, default=2)
+    parser.add_argument("--latent-dim", type=int, default=300)
+    parser.add_argument("--action-hidden-dim", type=int, default=128)
+    parser.add_argument("--num-attention-heads", type=int, default=4)
+    parser.add_argument("--num-action-conv-layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--temporal-num-layers", type=int, default=2)
+    parser.add_argument("--temporal-num-heads", type=int, default=6)
+    parser.add_argument("--temporal-feedforward-dim", type=int, default=600)
+    parser.add_argument("--temporal-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--rise-v2-fusion-mode",
+        choices=("concat", "film"),
+        default="film",
+    )
+    parser.add_argument(
+        "--dynamics-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional t+1 visual latent Smooth-L1 weight. Zero creates no "
+            "dynamics head and performs no target-encoder forward pass."
+        ),
+    )
     parser.add_argument("--num-critics", type=int, default=2)
     parser.add_argument(
         "--critic-group-norm",

@@ -12,7 +12,7 @@ if [[ "$first_arg" == "square" || "$first_arg" == "can" || "$first_arg" == "tran
 fi
 TASK=${TASK:-square}
 TASK=${TASK,,}
-TASK_DEFAULT_IDQL_REWARD_MODE=task
+TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
 TASK_REAL_ROBOT=0
 TASK_REAL_ROBOT_HUMAN_DATASETS=
 TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=
@@ -24,69 +24,73 @@ case "$TASK" in
     TASK_DP_CHECKPOINT=trained_models/square_rgb_dp/square_ph_rgb_dp_official_s1/models/model_epoch_200.pth
     TASK_EXPERT_DATASET=datasets/square/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/square_rgb_dp/epoch190_collection/square_rgb_dp_rollouts_rgb2.hdf5
-    TASK_IDQL_DATASET=datasets/square/idql/square_rgb_dp_idql_200demo_100success_50failure.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/square_rgb_dp/idql/200demo_100success_50failure
-    TASK_EVAL_OUTPUT=rollouts/square_rgb_dp/idql/200demo_100success_50failure
+    TASK_IDQL_DATASET=datasets/square/idql/square_rgb_dp_idql_200demo_406success_94failure.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/square_rgb_dp/idql/200demo_406success_94failure
+    TASK_EVAL_OUTPUT=rollouts/square_rgb_dp/idql/200demo_406success_94failure
     TASK_EXPERT_MASK=
     TASK_EXPERT_COUNT=200
-    TASK_SUCCESS_MASK=success_100
+    TASK_SUCCESS_MASK=success
     TASK_SUCCESS_COUNT=-1
-    TASK_FAILURE_MASK=failure_50
+    TASK_FAILURE_MASK=failure
     TASK_FAILURE_COUNT=-1
     TASK_CRITIC_GROUP_NORM=1
     TASK_EVAL_HORIZON=400
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
+    TASK_TERMINAL_SUCCESS_DATASET=datasets/square/idql/square_rgb_dp_idql_200demo_406success_94failure_terminal_success.hdf5
     ;;
   can)
     TASK_DP_CHECKPOINT=trained_models/can_rgb_dp/can_ph_rgb_dp_official_s1/models/model_epoch_50.pth
     TASK_EXPERT_DATASET=datasets/can/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/can_rgb_dp/epoch50_collection/can_rgb_dp_rollouts_rgb2.hdf5
-    TASK_IDQL_DATASET=datasets/can/idql/can_rgb_dp_idql_200demo_100success_33failure.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/can_rgb_dp/idql/200demo_100success_33failure
-    TASK_EVAL_OUTPUT=rollouts/can_rgb_dp/idql/200demo_100success_33failure
+    TASK_IDQL_DATASET=datasets/can/idql/can_rgb_dp_idql_200demo_467success_33failure.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/can_rgb_dp/idql/200demo_467success_33failure
+    TASK_EVAL_OUTPUT=rollouts/can_rgb_dp/idql/200demo_467success_33failure
     TASK_EXPERT_MASK=
     TASK_EXPERT_COUNT=200
-    TASK_SUCCESS_MASK=success_100
+    TASK_SUCCESS_MASK=success
     TASK_SUCCESS_COUNT=-1
     TASK_FAILURE_MASK=failure
     TASK_FAILURE_COUNT=-1
     TASK_CRITIC_GROUP_NORM=0
     TASK_EVAL_HORIZON=400
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
+    TASK_TERMINAL_SUCCESS_DATASET=datasets/can/idql/can_rgb_dp_idql_200demo_467success_33failure_terminal_success.hdf5
     ;;
   transport)
     TASK_DP_CHECKPOINT=trained_models/transport_rgb_dp/transport_ph_rgb_dp_official_s1/models/model_epoch_200.pth
     TASK_EXPERT_DATASET=datasets/transport/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/transport_rgb_dp/epoch200_collection/transport_rgb_dp_rollouts_rgb4.hdf5
-    TASK_IDQL_DATASET=datasets/transport/idql/transport_rgb_dp_idql_200demo_100success_50failure.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/transport_rgb_dp/idql/200demo_100success_50failure
-    TASK_EVAL_OUTPUT=rollouts/transport_rgb_dp/idql/200demo_100success_50failure
+    TASK_IDQL_DATASET=datasets/transport/idql/transport_rgb_dp_idql_200demo_422success_78failure.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/transport_rgb_dp/idql/200demo_422success_78failure
+    TASK_EVAL_OUTPUT=rollouts/transport_rgb_dp/idql/200demo_422success_78failure
     TASK_EXPERT_MASK=
     TASK_EXPERT_COUNT=200
-    TASK_SUCCESS_MASK=success_100
+    TASK_SUCCESS_MASK=success
     TASK_SUCCESS_COUNT=-1
-    TASK_FAILURE_MASK=failure_50
+    TASK_FAILURE_MASK=failure
     TASK_FAILURE_COUNT=-1
     TASK_CRITIC_GROUP_NORM=0
     TASK_EVAL_HORIZON=700
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos,robot1_gripper_qpos
+    TASK_TERMINAL_SUCCESS_DATASET=datasets/transport/idql/transport_rgb_dp_idql_200demo_422success_78failure_terminal_success_reward.hdf5
     ;;
   tool_hang)
     TASK_DP_CHECKPOINT=trained_models/tool_hang_rgb_dp/tool_hang_ph_rgb_dp_official_s1/models/model_epoch_200.pth
     TASK_EXPERT_DATASET=datasets/tool_hang/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/tool_hang_rgb_dp/epoch200_collection/tool_hang_rgb_dp_rollouts_rgb2.hdf5
-    TASK_IDQL_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_100success_50failure.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/idql/200demo_100success_50failure
-    TASK_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/idql/200demo_100success_50failure
+    TASK_IDQL_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_132success_168failure.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/idql/200demo_132success_168failure
+    TASK_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/idql/200demo_132success_168failure
     TASK_EXPERT_MASK=
     TASK_EXPERT_COUNT=200
-    TASK_SUCCESS_MASK=success_100
+    TASK_SUCCESS_MASK=success
     TASK_SUCCESS_COUNT=-1
-    TASK_FAILURE_MASK=failure_50
+    TASK_FAILURE_MASK=failure
     TASK_FAILURE_COUNT=-1
     TASK_CRITIC_GROUP_NORM=0
     TASK_EVAL_HORIZON=700
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
+    TASK_TERMINAL_SUCCESS_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_132success_168failure_terminal_success.hdf5
     ;;
   pick_cup)
     TASK_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_200.pth
@@ -192,7 +196,7 @@ case "$IDQL_REWARD_MODE" in
     DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_pretrained_dp_actor_task_reward
     ;;
   terminal_success)
-    DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_terminal_success_reward.hdf5
+    DEFAULT_IDQL_DATASET=${TASK_TERMINAL_SUCCESS_DATASET:-${TASK_IDQL_DATASET%.hdf5}_terminal_success_reward.hdf5}
     DEFAULT_IDQL_OUTPUT_DIR=${TASK_IDQL_OUTPUT_DIR}_terminal_success_reward
     DEFAULT_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_terminal_success_reward
     DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_pretrained_dp_actor_terminal_success_reward
@@ -429,9 +433,9 @@ run_train() {
     --seed "${SEED:-0}" \
     --epochs "${EPOCHS:-50}" \
     "${steps_per_epoch_args[@]}" \
-    --schedule-reference-batch-size "${IDQL_SCHEDULE_REFERENCE_BATCH_SIZE:-64}" \
-    --batch-size "${BATCH_SIZE:-64}" \
-    --num-workers "${NUM_WORKERS:-4}" \
+    --schedule-reference-batch-size "${BATCH_SIZE:-100}" \
+    --batch-size "${BATCH_SIZE:-100}" \
+    --num-workers "${NUM_WORKERS:-6}" \
     --prefetch-factor "${PREFETCH_FACTOR:-2}" \
     "$PIN_MEMORY_ARG" \
     "$PERSISTENT_WORKERS_ARG" \
@@ -443,11 +447,24 @@ run_train() {
     --target-tau "${TARGET_TAU:-0.01}" \
     --actor-lr "${ACTOR_LR:-1e-4}" \
     --critic-lr "${CRITIC_LR:-1e-4}" \
+    --encoder-lr "${ENCODER_LR:-1e-5}" \
     --vf-lr "${VF_LR:-1e-4}" \
     --lr-scheduler "${LR_SCHEDULER:-cosine}" \
     --lr-warmup-steps "${LR_WARMUP_STEPS:-500}" \
     --lr-num-cycles "${LR_NUM_CYCLES:-0.5}" \
     --critic-hidden-dims ${CRITIC_HIDDEN_DIMS:-300 400 300} \
+    --critic-observation-horizon "${IDQL_CRITIC_OBSERVATION_HORIZON:-2}" \
+    --latent-dim "${IDQL_LATENT_DIM:-300}" \
+    --action-hidden-dim "${IDQL_ACTION_HIDDEN_DIM:-128}" \
+    --num-attention-heads "${IDQL_NUM_ATTENTION_HEADS:-4}" \
+    --num-action-conv-layers "${IDQL_NUM_ACTION_CONV_LAYERS:-2}" \
+    --dropout "${IDQL_DROPOUT:-0.0}" \
+    --temporal-num-layers "${IDQL_TEMPORAL_NUM_LAYERS:-2}" \
+    --temporal-num-heads "${IDQL_TEMPORAL_NUM_HEADS:-6}" \
+    --temporal-feedforward-dim "${IDQL_TEMPORAL_FEEDFORWARD_DIM:-600}" \
+    --temporal-dropout "${IDQL_TEMPORAL_DROPOUT:-0.0}" \
+    --rise-v2-fusion-mode "${IDQL_RISE_V2_FUSION_MODE:-film}" \
+    --dynamics-weight "${DYNAMICS_WEIGHT:-0.0}" \
     --num-critics "${NUM_CRITICS:-2}" \
     "$CRITIC_GROUP_NORM_ARG" \
     --critic-late-fusion-key "$CRITIC_LATE_FUSION_KEY" \

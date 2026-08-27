@@ -44,7 +44,12 @@ from train_rgb_dp_chunk_idql import (
     make_rise_chunk_value_networks,
     match_encoder_normalization_to_checkpoint,
 )
-from train_rgb_dp_idql import action_normalization_stats_match, make_rise_value_networks
+from train_rgb_dp_idql import (
+    TEMPORAL_ONE_STEP_MARKER,
+    action_normalization_stats_match,
+    make_rise_value_networks,
+    make_temporal_one_step_system_from_checkpoint,
+)
 from train_rgb_dp_dql import make_dql_value_networks
 
 
@@ -1621,7 +1626,19 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
             int(args.num_candidates) > 1
             and critic_architecture != WCM_CRITIC_ARCHITECTURE
         ):
-            if checkpoint.get("rise_style_rgb_chunk_idql", False):
+            if checkpoint.get(TEMPORAL_ONE_STEP_MARKER, False):
+                if critic_architecture != RISE_V2_CRITIC_ARCHITECTURE:
+                    raise ValueError(
+                        "temporal one-step checkpoint must use "
+                        f"{RISE_V2_CRITIC_ARCHITECTURE}"
+                    )
+                critics, critic_targets, vf = (
+                    make_temporal_one_step_system_from_checkpoint(
+                        dp_policy.policy,
+                        checkpoint,
+                    )
+                )
+            elif checkpoint.get("rise_style_rgb_chunk_idql", False):
                 q_uses_predicted_next = bool(
                     checkpoint.get(
                         "critic_q_use_predicted_next_latent",

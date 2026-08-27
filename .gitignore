@@ -137,4 +137,5 @@ tests/real_robot/*
 !tests/real_robot/test_stack_cup_rgb_dp_baseline.py
 !tests/real_robot/test_eval_stack_cup_rgb_dp.py
 !tests/test_rgb_dp_idql_launcher.py
+!tests/test_rgb_dp_idql_temporal.py
 !tests/test_stack_cup_idql_launchers.py
