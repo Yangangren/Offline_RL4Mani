@@ -89,70 +89,6 @@ motion MAE/RMSE, physical translation and rotation RMSE, and gripper sign
 accuracy per slot. These remain open-loop imitation diagnostics, not robot
 success measurements.
 
-## Round-1 5 Hz baseline
-
-The deployment-oriented 5 Hz variant is separate from the original 20 Hz,
-two-round baseline. It uses the 49 QA-eligible demonstrations from collection
-round 1 (source episodes 002--050), a fixed four-source-command grid, and one
-fresh policy action per 5 Hz observation. The production dataset is
-`datasets/real_robot/pick_cup_5hz_round1/round1_5hz_rgb.hdf5`.
-
-Validate the published dataset, regenerate its fingerprinted config, and train:
-
-```bash
-/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
-  scripts/real_robot/run_pick_cup_rgb_dp_5hz_round1.py \
-  --stages validate prepare train
-```
-
-To rebuild the 5 Hz shard from the raw package before training, include the
-`dataset` stage. A matching existing shard is validated and reused; pass
-`--force-dataset` only when intentionally replacing it.
-
-```bash
-/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
-  scripts/real_robot/run_pick_cup_rgb_dp_5hz_round1.py \
-  --stages dataset validate prepare train
-```
-
-The 5 Hz observation/action/prediction horizons are `2/1/4`. Each normalized
-motion target is the componentwise mean of four 20 Hz source commands and is
-decoded over 0.2 seconds with scales 0.048 m and 0.144 rad. The gripper target
-is the dense logical state after the fourth source command. A robot adapter must
-interpolate and rate-limit this macro target; it must not apply the maximum
-translation or rotation as an instantaneous jump.
-
-To exercise the 5 Hz model and checkpoint path without starting a production
-run:
-
-```bash
-/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
-  scripts/real_robot/run_pick_cup_rgb_dp_5hz_round1.py \
-  --stages validate prepare train --smoke --name-suffix preflight
-```
-
-### Held-out checkpoint evaluation
-
-`validate` in the launcher checks the HDF5 data contract; it does not load a
-trained policy. Use the checkpoint evaluator to test all held-out windows. It
-reports the online-network diffusion validation loss separately from EMA
-rollout-action replay, uses fixed seeds, does not shuffle, and does not drop the
-last partial batch.
-
-```bash
-/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
-  scripts/real_robot/eval_pick_cup_rgb_dp_5hz_round1.py \
-  --checkpoint /absolute/path/to/model_epoch_100.pth \
-  --seeds 1 2 3 \
-  --batch-size 64 \
-  --device auto \
-  --output /absolute/path/to/model_epoch_100_heldout_eval.json
-```
-
-The command evaluates the five `valid`-mask demonstrations only. The action
-errors are open-loop command-imitation metrics, not closed-loop task success.
-Use `--max-windows N` only for a quick smoke test.
-
 ## 20 Hz mixed-data chunk IDQL
 
 The real pick-cup chunk-IDQL task is exposed as `pick_cup` in the repository
@@ -178,12 +114,20 @@ The deterministic fitting split contains exactly 99 episodes:
 - 11 of 14 failed rollouts, with the other three in `failure_valid`.
 
 The mixed fitting output is
-`datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_65demo_23success_11failure_terminal_success.hdf5`.
+`datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_65demo_23success_11failure_terminal_success_human_success_condition.hdf5`.
+The chunk launcher also builds the disjoint held-out file
+`datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_validation_10demo_6success_3failure_terminal_success_human_success_condition.hdf5`.
+It contains all 10 human validation episodes, six successful validation
+rollouts, and three failed validation rollouts (7,964 windows total). Both
+files retain source episode identities, and training aborts if any identity
+appears in both.
 It uses `terminal_success`: a successful episode has its sole reward of 1 on
 the final recorded transition, while a failure has zero reward throughout;
-both terminate at the recorded episode end. The default actor condition is
-`human_only`, so human rows have condition 1 and every rollout row has
-condition 0. The first training run uses `pretrained_dp_joint`, initializing
+both terminate at the recorded episode end. The default chunk-actor condition
+is `human_success`: human and successful-rollout rows have condition 1, while
+failed-rollout rows have condition 0. Each build or validation prints these
+semantics and the positive/negative episode and transition counts. The first
+training run uses `pretrained_dp_joint`, initializing
 from the deployed epoch-200 Diffusion Policy and optimizing the actor jointly
 with Q/V; the actor is not frozen.
 
@@ -208,6 +152,15 @@ Only after that command succeeds, launch the default joint-actor run:
 bash run_rgb_dp_chunk_idql.sh pick_cup train_chunk_idql
 ```
 
+The default critic is `rise_temporal_v2`: Q and V each consume the full
+two-frame actor observation history and score an eight-action chunk. After
+every epoch, rank zero evaluates the online actor and Q/V losses over every
+held-out window with a fixed RNG seed and no updates. Metrics are recorded
+under `validation/*`, and the lowest held-out diffusion loss is preserved as
+`best_validation.pt`. The RISE-v2 output directory has a
+`_rise_temporal_v2` suffix so it cannot be confused with the completed legacy
+critic run.
+
 The build and training stages also validate existing inputs before use. Their
 successful terminal output is the source of truth for full-corpus conversion
 validation; this documentation does not imply that a particular local build
@@ -219,9 +172,10 @@ must not be used as a real-robot execution client.
 ## 20 Hz mixed-data one-step IDQL
 
 The one-step launcher also exposes `pick_cup`. It deliberately reuses the
-exact 99-episode mixed HDF5 above, including its deterministic fitting split,
-`terminal_success` rewards, and source identities. This makes one-step versus
-chunk-IDQL comparisons differ in the learning horizon rather than the data.
+same deterministic 99-episode fitting split and `terminal_success` rewards in
+the original file without the `_human_success_condition` suffix. Its stored
+actor condition remains `human_only`; the chunk launcher uses a separate file
+so an existing HDF5 is never silently reinterpreted.
 Before training, the launcher revalidates both the converted rollout source
 and the mixed external-link dataset.
 
@@ -257,11 +211,17 @@ production rollout output has 29,826 retained transitions, including 26/6
 success train/valid episodes and 14/4 failure train/valid episodes.
 
 The mixed fitting file is
-`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_44demo_26success_14failure_terminal_success.hdf5`.
+`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_44demo_26success_14failure_terminal_success_human_success_condition.hdf5`.
 It contains 84 episodes and 45,668 transitions: 21,793 from the 44 human
 `train` episodes, 15,494 from 26 successful rollout-train episodes, and 8,381
 from 14 failed rollout-train episodes. It uses external HDF5 links and virtual
 shifted `next_obs`, so the image data are not copied into the small mixed file.
+The chunk launcher additionally builds
+`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_validation_5demo_6success_4failure_terminal_success_human_success_condition.hdf5`,
+containing the five held-out human episodes and the 6/4 held-out successful /
+failed rollouts (8,594 windows). It is evaluated in full after every chunk
+training epoch, with the best held-out actor checkpoint retained as
+`best_validation.pt`. One-step IDQL remains unchanged.
 
 Build or revalidate the rollout and mixed datasets through either launcher:
 
@@ -271,7 +231,8 @@ bash run_rgb_dp_idql.sh stack_cup build_dataset
 ```
 
 Start the default first chunked run (joint actor, not frozen) or the one-step
-comparison. Both reuse the same mixed dataset and terminal-success targets:
+comparison. Both use the same selected episodes and terminal-success targets;
+only chunk IDQL stores the `human_success` actor condition:
 
 ```bash
 bash run_rgb_dp_chunk_idql.sh stack_cup train_chunk_idql
@@ -322,7 +283,6 @@ steps, EMA, and the full `[256, 512, 1024]` temporal U-Net.
 /home/ryan/miniconda3/envs/robomimic_stable/bin/python -m unittest \
   tests.real_robot.test_build_pick_cup_dataset \
   tests.real_robot.test_pick_cup_rgb_dp_baseline \
-  tests.real_robot.test_pick_cup_5hz_pipeline \
   tests.test_train_utils_validation_scheduler -v
 ```
 

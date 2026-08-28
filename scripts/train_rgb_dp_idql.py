@@ -1024,6 +1024,9 @@ def build_single_loader(
     actor_policy,
     dp_checkpoint: dict,
     sequence_length: int | None = None,
+    *,
+    shuffle: bool = True,
+    drop_last: bool | None = None,
 ):
     actor_algo = actor_policy.policy
     config, _ = FileUtils.config_from_checkpoint(
@@ -1162,7 +1165,7 @@ def build_single_loader(
             dataset,
             num_replicas=distributed_world_size,
             rank=distributed_rank,
-            shuffle=True,
+            shuffle=bool(shuffle),
             seed=int(args.seed),
             drop_last=False,
         )
@@ -1171,17 +1174,19 @@ def build_single_loader(
     if int(args.num_workers) > 0:
         loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
         loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=int(args.batch_size),
-        shuffle=distributed_sampler is None,
-        sampler=distributed_sampler,
-        drop_last=(
+    if drop_last is None:
+        available_rows = (
             len(distributed_sampler)
             if distributed_sampler is not None
             else len(dataset)
         )
-        >= int(args.batch_size),
+        drop_last = available_rows >= int(args.batch_size)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=int(args.batch_size),
+        shuffle=bool(shuffle) and distributed_sampler is None,
+        sampler=distributed_sampler,
+        drop_last=bool(drop_last),
         num_workers=int(args.num_workers),
         pin_memory=bool(args.pin_memory and actor_algo.device.type == "cuda"),
         generator=generator,

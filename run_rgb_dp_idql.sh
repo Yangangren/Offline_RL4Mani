@@ -95,7 +95,6 @@ case "$TASK" in
   pick_cup)
     TASK_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_200.pth
     TASK_EXPERT_DATASET=datasets/real_robot/pick_cup/round1_rgb.hdf5
-    TASK_PICK_CUP_HUMAN_DATASETS="datasets/real_robot/pick_cup/round1_rgb.hdf5 datasets/real_robot/pick_cup/round2_rgb.hdf5"
     TASK_ROLLOUT_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_epoch200_20hz_rollouts.hdf5
     TASK_IDQL_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_65demo_23success_11failure_terminal_success.hdf5
     TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/idql/65demo_23success_11failure_terminal_success
@@ -111,7 +110,7 @@ case "$TASK" in
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
     TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     TASK_REAL_ROBOT=1
-    TASK_REAL_ROBOT_HUMAN_DATASETS=$TASK_PICK_CUP_HUMAN_DATASETS
+    TASK_REAL_ROBOT_HUMAN_DATASETS="datasets/real_robot/pick_cup/round1_rgb.hdf5 datasets/real_robot/pick_cup/round2_rgb.hdf5"
     TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets/pick_cup/rollout
     TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_pick_cup_rollout_hdf5.py
     TASK_REAL_ROBOT_MIXED_BUILDER=scripts/real_robot/build_pick_cup_chunk_idql_dataset.py
@@ -179,14 +178,8 @@ fi
 DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
 EXPERT_DATASET=${EXPERT_DATASET:-$TASK_EXPERT_DATASET}
 ROLLOUT_DATASET=${ROLLOUT_DATASET:-$TASK_ROLLOUT_DATASET}
-PICK_CUP_HUMAN_DATASETS=${PICK_CUP_HUMAN_DATASETS:-${TASK_PICK_CUP_HUMAN_DATASETS:-}}
-PICK_CUP_ROLLOUT_SOURCE_ROOT=${PICK_CUP_ROLLOUT_SOURCE_ROOT:-/home/ryan/datasets/pick_cup/rollout}
 REAL_ROBOT_HUMAN_DATASETS=${REAL_ROBOT_HUMAN_DATASETS:-$TASK_REAL_ROBOT_HUMAN_DATASETS}
 REAL_ROBOT_ROLLOUT_SOURCE_ROOT=${REAL_ROBOT_ROLLOUT_SOURCE_ROOT:-$TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT}
-if [[ "$TASK" == "pick_cup" ]]; then
-  REAL_ROBOT_HUMAN_DATASETS=${PICK_CUP_HUMAN_DATASETS:-$REAL_ROBOT_HUMAN_DATASETS}
-  REAL_ROBOT_ROLLOUT_SOURCE_ROOT=${PICK_CUP_ROLLOUT_SOURCE_ROOT:-$REAL_ROBOT_ROLLOUT_SOURCE_ROOT}
-fi
 IDQL_REWARD_MODE=${IDQL_REWARD_MODE:-$TASK_DEFAULT_IDQL_REWARD_MODE}
 case "$IDQL_REWARD_MODE" in
   task)
@@ -281,7 +274,7 @@ require_simulation_stage_task() {
   local stage_name=$1
   if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
     echo "[rgb_dp_idql task=$TASK] stage '$stage_name' is simulation-only and cannot create or control the real robot." >&2
-    echo "Use scripts/real_robot_deploy for shadow evaluation or guarded real-robot execution." >&2
+    echo "Use the task's dedicated 20 Hz real-robot deployment path for shadow evaluation or guarded execution." >&2
     exit 2
   fi
 }

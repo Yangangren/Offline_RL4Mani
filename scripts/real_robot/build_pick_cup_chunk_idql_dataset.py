@@ -3,8 +3,9 @@
 
 The human demonstrations already have an episode-level train / validation
 split, and the rollout converter creates outcome-stratified train / validation
-masks.  This builder deliberately consumes only the fitting masks.  It does
-not infer an earlier success time from robot state or gripper events: every
+masks. This builder emits either a fitting or a held-out mixed dataset, while
+auditing that the requested source masks do not overlap the opposite split. It
+does not infer an earlier success time from robot state or gripper events: every
 successful source episode must already contain exactly one positive task reward
 at its final recorded transition, while failed rollouts must contain none.
 
@@ -203,6 +204,7 @@ def _normalized_args(args: argparse.Namespace) -> argparse.Namespace:
     defaults = {
         "task": TASK,
         "reward_mode": REWARD_MODE,
+        "selection_role": "train",
         "human_mask": "train",
         "human_count": DEFAULT_HUMAN_COUNT,
         "expected_human_transitions": DEFAULT_EXPECTED_HUMAN_TRANSITIONS,
@@ -248,15 +250,26 @@ def resolve_selection(
         if not path.is_file():
             raise FileNotFoundError(path)
         with h5py.File(path, "r") as source:
-            train = _read_mask(source, str(args.human_mask))
-            if "mask/valid" in source:
-                valid = set(_read_mask(source, "valid"))
-                overlap = sorted(set(train).intersection(valid), key=_demo_sort_key)
-                if overlap:
-                    raise ValueError(
-                        f"{path} human train and valid masks overlap: {overlap}"
-                    )
-            human_candidates.extend((path, key) for key in train)
+            selected = _read_mask(source, str(args.human_mask))
+            opposite_mask = (
+                "valid" if args.selection_role == "train" else "train"
+            )
+            opposite_path = f"mask/{opposite_mask}"
+            if opposite_path not in source:
+                raise KeyError(
+                    f"{path} is missing {opposite_path}; the real-robot "
+                    f"{args.selection_role} split must be auditable"
+                )
+            opposite = set(_read_mask(source, opposite_mask))
+            overlap = sorted(
+                set(selected).intersection(opposite), key=_demo_sort_key
+            )
+            if overlap:
+                raise ValueError(
+                    f"{path} requested human {args.selection_role} mask "
+                    f"overlaps mask/{opposite_mask}: {overlap}"
+                )
+            human_candidates.extend((path, key) for key in selected)
             candidate_env = _text(source["data"].attrs.get("env_args", ""))
             if not candidate_env:
                 raise ValueError(f"{path}:data is missing env_args")
@@ -274,16 +287,20 @@ def resolve_selection(
     with h5py.File(args.rollout_dataset, "r") as source:
         successes = [(args.rollout_dataset, key) for key in _read_mask(source, args.success_mask)]
         failures = [(args.rollout_dataset, key) for key in _read_mask(source, args.failure_mask)]
-        validation_keys: set[str] = set()
-        for validation_mask in ("success_valid", "failure_valid"):
-            if f"mask/{validation_mask}" not in source:
+        opposite_suffix = (
+            "valid" if args.selection_role == "train" else "train"
+        )
+        opposite_keys: set[str] = set()
+        for opposite_mask in (
+            f"success_{opposite_suffix}",
+            f"failure_{opposite_suffix}",
+        ):
+            if f"mask/{opposite_mask}" not in source:
                 raise KeyError(
-                    f"{args.rollout_dataset} is missing mask/{validation_mask}; "
-                    "the real-robot fitting split must be auditable"
+                    f"{args.rollout_dataset} is missing mask/{opposite_mask}; "
+                    f"the real-robot {args.selection_role} split must be auditable"
                 )
-            validation_keys.update(_read_mask(source, validation_mask))
-        if "mask/valid" in source:
-            validation_keys.update(_read_mask(source, "valid"))
+            opposite_keys.update(_read_mask(source, opposite_mask))
         overlap = sorted(
             {key for _, key in successes}.intersection(key for _, key in failures),
             key=_demo_sort_key,
@@ -292,13 +309,13 @@ def resolve_selection(
             raise ValueError(f"rollout success and failure masks overlap: {overlap}")
         leaked = sorted(
             ({key for _, key in successes} | {key for _, key in failures})
-            & validation_keys,
+            & opposite_keys,
             key=_demo_sort_key,
         )
         if leaked:
             raise ValueError(
-                "rollout fitting masks overlap held-out validation episodes: "
-                f"{leaked}"
+                f"rollout {args.selection_role} masks overlap the "
+                f"{opposite_suffix} split: {leaked}"
             )
         rollout_env = _text(source["data"].attrs.get("env_args", ""))
         if not rollout_env:
@@ -494,7 +511,9 @@ def _write_mask(group: h5py.Group, key: str, values: list[str]) -> None:
 
 
 def _expected_masks(
-    records: list[tuple[str, Path, str]], actor_condition_mode: str
+    records: list[tuple[str, Path, str]],
+    actor_condition_mode: str,
+    selection_role: str,
 ) -> dict[str, list[str]]:
     all_keys = [f"demo_{index}" for index in range(len(records))]
     labels = [record[0] for record in records]
@@ -514,7 +533,7 @@ def _expected_masks(
     negative = [key for key in all_keys if key not in set(positive)]
     return {
         "all": all_keys,
-        "train": all_keys,
+        selection_role if selection_role == "train" else "valid": all_keys,
         "expert": human,
         "human": human,
         "non_expert": rollout,
@@ -628,7 +647,9 @@ def validate_existing(raw_args: argparse.Namespace) -> dict[str, Any]:
         raise FileNotFoundError(args.output)
     records, expected_env_args = resolve_selection(args)
     identities = _source_identities(args)
-    masks = _expected_masks(records, args.actor_condition_mode)
+    masks = _expected_masks(
+        records, args.actor_condition_mode, args.selection_role
+    )
     expected_keys = [f"demo_{index}" for index in range(len(records))]
     errors: list[str] = []
     transition_counts = {label: 0 for label in SOURCE_LABELS}
@@ -649,6 +670,12 @@ def validate_existing(raw_args: argparse.Namespace) -> dict[str, Any]:
                 errors.append(
                     f"root attribute {key!r}={output.attrs.get(key)!r}, expected {expected!r}"
                 )
+        stored_selection_role = output.attrs.get("selection_role")
+        if stored_selection_role is None:
+            if args.selection_role != "train":
+                errors.append("root is missing validation selection_role")
+        elif _text(stored_selection_role) != str(args.selection_role):
+            errors.append("root selection_role does not match")
         if int(output.attrs.get("selection_seed", -1)) != int(args.seed):
             errors.append("root selection_seed does not match")
         if int(output.attrs.get("source_identity_version", -1)) != SOURCE_IDENTITY_VERSION:
@@ -811,10 +838,33 @@ def validate_existing(raw_args: argparse.Namespace) -> dict[str, Any]:
         if len(errors) > 50:
             shown += f"\n- ... {len(errors) - 50} more errors"
         raise ValueError(f"{TASK} mixed dataset validation failed:\n{shown}")
+    positive_transition_count = transition_counts["expert"]
+    if args.actor_condition_mode == "human_success":
+        positive_transition_count += transition_counts[
+            "non_expert_success"
+        ]
+    total_transition_count = sum(transition_counts.values())
     return {
         "validated": True,
         "output": str(args.output),
         "task": TASK,
+        "selection_role": str(args.selection_role),
+        "actor_condition": {
+            "mode": str(args.actor_condition_mode),
+            "definition": ACTOR_CONDITION_DEFINITIONS[
+                args.actor_condition_mode
+            ],
+            "positive_episodes": len(
+                masks["actor_condition_positive"]
+            ),
+            "negative_episodes": len(
+                masks["actor_condition_negative"]
+            ),
+            "positive_transitions": int(positive_transition_count),
+            "negative_transitions": int(
+                total_transition_count - positive_transition_count
+            ),
+        },
         "episodes": {
             "human": sum(label == "expert" for label, _, _ in records),
             "success_rollout": sum(
@@ -843,7 +893,9 @@ def build(raw_args: argparse.Namespace) -> dict[str, Any]:
     if args.output.exists() and not args.overwrite:
         raise FileExistsError(f"{args.output} exists; pass --overwrite to replace it")
 
-    masks = _expected_masks(records, args.actor_condition_mode)
+    masks = _expected_masks(
+        records, args.actor_condition_mode, args.selection_role
+    )
     transition_counts = {label: 0 for label in SOURCE_LABELS}
     with _atomic_output(args) as staged:
         with h5py.File(staged, "w", libver="latest") as output:
@@ -863,6 +915,7 @@ def build(raw_args: argparse.Namespace) -> dict[str, Any]:
             data.attrs["total"] = sum(transition_counts.values())
             data.attrs["env_args"] = env_args
             output.attrs["builder_version"] = BUILDER_VERSION
+            output.attrs["selection_role"] = str(args.selection_role)
             output.attrs["task"] = TASK
             output.attrs["reward_mode"] = REWARD_MODE
             output.attrs["reward_definition"] = REWARD_DEFINITION
@@ -880,7 +933,8 @@ def build(raw_args: argparse.Namespace) -> dict[str, Any]:
                 ACTOR_CONDITION_DEFINITIONS[args.actor_condition_mode]
             )
             output.attrs["sampling_definition"] = (
-                "one concatenated fitting dataset; uniform over SequenceDataset indices"
+                f"one concatenated {args.selection_role} dataset; "
+                "uniform over SequenceDataset indices"
             )
             output.attrs["selection_seed"] = int(args.seed)
             output.attrs["source_identity_version"] = SOURCE_IDENTITY_VERSION
@@ -903,6 +957,7 @@ def build(raw_args: argparse.Namespace) -> dict[str, Any]:
             "sole final positive reward; no inferred early truncation"
         ),
         "actor_condition_mode": str(args.actor_condition_mode),
+        "selection_role": str(args.selection_role),
         "human_mask": str(args.human_mask),
         "rollout_masks": {
             "success": str(args.success_mask),
@@ -933,6 +988,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--task", choices=(TASK,), default=TASK)
     parser.add_argument("--reward-mode", choices=(REWARD_MODE,), default=REWARD_MODE)
+    parser.add_argument(
+        "--selection-role",
+        choices=("train", "validation"),
+        default="train",
+        help=(
+            "Whether the selected masks form the fitting dataset or the "
+            "strictly held-out validation dataset."
+        ),
+    )
     parser.add_argument("--human-mask", default="train")
     parser.add_argument("--human-count", type=int, default=DEFAULT_HUMAN_COUNT)
     parser.add_argument(

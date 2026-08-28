@@ -174,6 +174,9 @@ def build_single_loader(
     actor_policy,
     dp_checkpoint: dict,
     sequence_length: int | None = None,
+    *,
+    shuffle: bool = True,
+    drop_last: bool | None = None,
 ):
     """Build the mixed-data loader without checkpoint-era split filters."""
     return _build_single_loader(
@@ -181,6 +184,8 @@ def build_single_loader(
         actor_policy,
         checkpoint_for_unfiltered_mixed_dataset(dp_checkpoint),
         sequence_length=sequence_length,
+        shuffle=shuffle,
+        drop_last=drop_last,
     )
 
 
@@ -708,6 +713,46 @@ class LocalScalarMetricAccumulator:
         if self.sums is None or self.count == 0:
             return {}
         host_values = (self.sums / float(self.count)).cpu().tolist()
+        return {
+            key: float(value)
+            for key, value in zip(self.keys, host_values)
+        }
+
+
+class WeightedScalarMetricAccumulator:
+    """Accumulate validation means weighted by the number of data windows."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.keys: tuple[str, ...] = ()
+        self.weighted_sums: torch.Tensor | None = None
+        self.total_weight = 0
+
+    @torch.no_grad()
+    def update(self, metrics: dict[str, Any], weight: int) -> None:
+        if int(weight) <= 0:
+            raise ValueError("validation metric weight must be positive")
+        keys = tuple(sorted(metrics))
+        if self.keys and keys != self.keys:
+            raise ValueError("validation metric keys changed between batches")
+        values = torch.stack(
+            [_local_scalar_tensor(metrics[key], self.device) for key in keys]
+        )
+        weighted = values * float(weight)
+        if self.weighted_sums is None:
+            self.keys = keys
+            self.weighted_sums = weighted.clone()
+        else:
+            self.weighted_sums.add_(weighted)
+        self.total_weight += int(weight)
+
+    @torch.no_grad()
+    def means(self) -> dict[str, float]:
+        if self.weighted_sums is None or self.total_weight == 0:
+            return {}
+        host_values = (
+            self.weighted_sums / float(self.total_weight)
+        ).cpu().tolist()
         return {
             key: float(value)
             for key, value in zip(self.keys, host_values)
@@ -2863,6 +2908,32 @@ def validate_resume_semantics(
 ) -> None:
     """Reject resumes that would silently change the task or objective."""
     saved_args = resume_state.get("args", {})
+    requested_validation = getattr(args, "validation_dataset", None)
+    saved_validation = saved_args.get("validation_dataset")
+    if requested_validation is None:
+        if saved_validation is not None:
+            raise ValueError(
+                "resume checkpoint used a validation dataset, but none was "
+                "requested"
+            )
+    else:
+        if saved_validation is None or (
+            Path(saved_validation).expanduser().resolve()
+            != requested_validation
+        ):
+            raise ValueError(
+                "resume validation dataset path does not match the requested "
+                "held-out dataset"
+            )
+        saved_validation_identity = resume_state.get(
+            "validation_dataset_identity",
+            saved_args.get("validation_dataset_identity"),
+        )
+        if saved_validation_identity != args.validation_dataset_identity:
+            raise ValueError(
+                "resume validation dataset identity does not match the current "
+                "held-out HDF5 and external source files"
+            )
     saved_actor_only = bool(
         resume_state.get("actor_only", saved_args.get("actor_only", False))
     )
@@ -3379,6 +3450,7 @@ def audit_actor_conditions(
     *,
     reward_mode: str,
     actor_condition_mode: str,
+    allow_single_condition_class: bool = False,
 ) -> dict[str, Any]:
     """Validate actor labels independently of the selected critic reward."""
     expected_definition = actor_condition_definition(actor_condition_mode)
@@ -3465,14 +3537,34 @@ def audit_actor_conditions(
                 )
             episode_counts[source_name] += 1
             transition_counts[source_name] += int(condition_labels.size)
-    missing_sources = [
-        source for source, count in episode_counts.items() if count == 0
-    ]
-    if missing_sources:
+    positive_episode_count = sum(
+        episode_counts[source] for source in positive_sources
+    )
+    negative_episode_count = sum(
+        episode_counts[source] for source in negative_sources
+    )
+    if positive_episode_count == 0 and negative_episode_count == 0:
+        raise ValueError("conditioned actor dataset contains no episodes")
+    single_condition_class_override_used = bool(
+        positive_episode_count == 0 or negative_episode_count == 0
+    )
+    if (
+        single_condition_class_override_used
+        and not allow_single_condition_class
+    ):
         raise ValueError(
-            "conditioned actor dataset is missing required sources: "
-            f"{missing_sources}"
+            "conditioned actor dataset must contain both condition classes; "
+            f"positive_sources={positive_sources} have "
+            f"{positive_episode_count} episodes and "
+            f"negative_sources={negative_sources} have "
+            f"{negative_episode_count} episodes. For the explicit ablation "
+            "only, pass --allow-single-condition-class"
         )
+    observed_condition_classes = []
+    if negative_episode_count > 0:
+        observed_condition_classes.append(0.0)
+    if positive_episode_count > 0:
+        observed_condition_classes.append(1.0)
     return {
         "mode": str(actor_condition_mode),
         "definition": expected_definition,
@@ -3483,6 +3575,65 @@ def audit_actor_conditions(
         "condition_mask": 1.0,
         "episode_counts": episode_counts,
         "transition_counts": transition_counts,
+        "observed_condition_classes": observed_condition_classes,
+        "allow_single_condition_class_requested": bool(
+            allow_single_condition_class
+        ),
+        "single_condition_class_override_used": (
+            single_condition_class_override_used
+        ),
+    }
+
+
+def mixed_dataset_source_episodes(path: Path) -> set[tuple[str, str]]:
+    """Return immutable source episode identifiers from a mixed HDF5."""
+    records: set[tuple[str, str]] = set()
+    with h5py.File(path, "r") as handle:
+        for episode_key, episode in handle["data"].items():
+            source_file = episode.attrs.get("rise_source_file")
+            source_demo = episode.attrs.get("rise_source_demo")
+            if isinstance(source_file, bytes):
+                source_file = source_file.decode("utf-8")
+            if isinstance(source_demo, bytes):
+                source_demo = source_demo.decode("utf-8")
+            if not source_file or not source_demo:
+                raise ValueError(
+                    f"{path}:data/{episode_key} is missing source provenance"
+                )
+            identifier = (
+                str(Path(str(source_file)).expanduser().resolve()),
+                str(source_demo),
+            )
+            if identifier in records:
+                raise ValueError(
+                    f"{path} contains source episode more than once: "
+                    f"{identifier}"
+                )
+            records.add(identifier)
+    return records
+
+
+def audit_validation_dataset_split(
+    training_dataset: Path,
+    validation_dataset: Path,
+) -> dict[str, Any]:
+    """Prove that held-out evaluation shares no source episodes with fitting."""
+    if training_dataset == validation_dataset:
+        raise ValueError("validation dataset must differ from training dataset")
+    training_records = mixed_dataset_source_episodes(training_dataset)
+    validation_records = mixed_dataset_source_episodes(validation_dataset)
+    overlap = sorted(training_records.intersection(validation_records))
+    if overlap:
+        raise ValueError(
+            "training and validation mixed datasets share source episodes: "
+            f"{overlap[:10]}"
+        )
+    if not validation_records:
+        raise ValueError("validation dataset contains no source episodes")
+    return {
+        "training_source_episodes": int(len(training_records)),
+        "validation_source_episodes": int(len(validation_records)),
+        "overlap_source_episodes": 0,
     }
 
 
@@ -4680,6 +4831,222 @@ def compute_wcm_chunk_losses(
     return total_loss, info
 
 
+def actor_validation_step(
+    actor_algo,
+    raw_batch: dict,
+    epoch: int,
+    obs_normalization_stats,
+) -> dict[str, Any]:
+    """Evaluate the online diffusion objective without optimizer or EMA updates."""
+    actor_batch = actor_algo.process_batch_for_training(raw_batch)
+    actor_batch = actor_algo.postprocess_batch_for_training(
+        actor_batch,
+        obs_normalization_stats=obs_normalization_stats,
+    )
+    info = actor_algo.train_on_batch(
+        actor_batch,
+        epoch=epoch,
+        validate=True,
+    )
+    log = actor_algo.log_info(info, materialize=False)
+    allowed_types = (int, float, np.number, torch.Tensor)
+    return {
+        f"actor/{key}" if not str(key).startswith("actor/") else str(key): (
+            value if isinstance(value, torch.Tensor) else float(value)
+        )
+        for key, value in log.items()
+        if isinstance(value, allowed_types)
+    }
+
+
+@torch.no_grad()
+def evaluate_validation_epoch(
+    *,
+    args: argparse.Namespace,
+    epoch: int,
+    loader,
+    actor_algo,
+    obs_stats,
+    actor_only: bool,
+    is_wcm: bool,
+    is_rise_v2: bool,
+    critics: nn.ModuleList,
+    targets: nn.ModuleList,
+    dynamics_target_encoder: nn.Module | None,
+    vf: nn.Module | None,
+    wcm_system: WCMChunkValueSystem | None,
+    wcm_target_system: WCMChunkValueSystem | None,
+    wcm_dynamics_target_encoder: WCMFrameTargetEncoder | None,
+    device: torch.device,
+    global_step: int,
+) -> dict[str, float]:
+    """Run deterministic, full-coverage held-out evaluation on rank zero."""
+    accumulator = WeightedScalarMetricAccumulator(device)
+    batch_count = 0
+    window_count = 0
+    actor_was_training = bool(actor_algo.nets.training)
+    reference_was_training = (
+        bool(actor_algo.reference_nets.training)
+        if actor_algo.reference_nets is not None
+        else False
+    )
+    critic_modes = [bool(module.training) for module in critics]
+    vf_was_training = bool(vf.training) if vf is not None else False
+    wcm_was_training = (
+        bool(wcm_system.training) if wcm_system is not None else False
+    )
+    actor_algo.set_eval()
+    if actor_algo.reference_nets is not None:
+        actor_algo.reference_nets.eval()
+    if wcm_system is not None:
+        wcm_system.eval()
+        wcm_target_system.eval()
+        wcm_dynamics_target_encoder.eval()
+    else:
+        critics.eval()
+        targets.eval()
+        if vf is not None:
+            vf.eval()
+        if dynamics_target_encoder is not None:
+            dynamics_target_encoder.eval()
+    try:
+        with fork_rng_with_seed(int(args.validation_seed), device):
+            for raw_batch in loader:
+                raw_batch = align_shared_batch_actions(
+                    raw_batch,
+                    validate=False,
+                )
+                rows = int(raw_batch["actions"].shape[0])
+                metrics: dict[str, Any] = {}
+                if trains_joint_actor(args):
+                    actor_batch = raw_batch
+                    if args.conditioned_actor:
+                        current_index = int(args.observation_horizon) - 1
+                        condition_labels = source_condition_labels(
+                            raw_batch,
+                            current_index=current_index,
+                        )
+                        actor_batch = add_actor_condition(
+                            actor_batch,
+                            condition_labels,
+                        )
+                        metrics.update(
+                            {
+                                "actor/condition_mean": condition_labels.mean(),
+                                "actor/zero_condition_fraction": (
+                                    (condition_labels < 0.5).float().mean()
+                                ),
+                            }
+                        )
+                    metrics.update(
+                        actor_validation_step(
+                            actor_algo,
+                            actor_batch,
+                            epoch,
+                            obs_stats,
+                        )
+                    )
+
+                if not actor_only:
+                    batch = process_chunk_batch(
+                        raw_batch,
+                        actor_algo,
+                        obs_stats,
+                        chunk_horizon=args.chunk_horizon,
+                        discount=args.discount,
+                        reward_mode=args.reward_mode,
+                        critic_observation_horizon=(
+                            args.critic_observation_horizon
+                        ),
+                        dynamics_prediction_offsets=(
+                            args.dynamics_prediction_offsets
+                        ),
+                    )
+                    if is_wcm:
+                        _, critic_info = compute_wcm_chunk_losses(
+                            wcm_system,
+                            wcm_target_system,
+                            wcm_dynamics_target_encoder,
+                            batch,
+                            discount=args.discount,
+                            expectile=args.expectile,
+                            use_huber=args.use_huber,
+                            dynamics_weight=args.dynamics_weight,
+                            sigreg_weight=args.sigreg_weight,
+                            sigreg_knots=args.sigreg_knots,
+                            sigreg_num_projections=args.sigreg_num_projections,
+                            sigreg_global_batch=False,
+                            global_step=global_step,
+                            distributed_context=None,
+                        )
+                    elif is_rise_v2:
+                        _, _, critic_info = compute_rise_v2_chunk_losses(
+                            critics,
+                            targets,
+                            dynamics_target_encoder,
+                            vf,
+                            batch,
+                            discount=args.discount,
+                            expectile=args.expectile,
+                            use_huber=args.use_huber,
+                            dynamics_weight=args.dynamics_weight,
+                            distributed_context=None,
+                        )
+                    else:
+                        _, _, critic_info = compute_chunk_losses(
+                            critics,
+                            targets,
+                            dynamics_target_encoder,
+                            vf,
+                            batch,
+                            discount=args.discount,
+                            expectile=args.expectile,
+                            use_huber=args.use_huber,
+                            dynamics_weight=args.dynamics_weight,
+                            dynamics_cosine_weight=(
+                                args.dynamics_cosine_weight
+                            ),
+                            distributed_context=None,
+                        )
+                    metrics.update(critic_info)
+                prefixed = {
+                    f"validation/{key}": value
+                    for key, value in metrics.items()
+                }
+                accumulator.update(prefixed, rows)
+                batch_count += 1
+                window_count += rows
+    finally:
+        if actor_was_training:
+            actor_algo.set_train()
+        else:
+            actor_algo.set_eval()
+        if actor_algo.reference_nets is not None:
+            actor_algo.reference_nets.train(reference_was_training)
+        if wcm_system is not None:
+            wcm_system.train(wcm_was_training)
+            configure_wcm_target_random_crops(wcm_target_system)
+            configure_wcm_dynamics_target_random_crops(
+                wcm_dynamics_target_encoder
+            )
+        else:
+            for module, was_training in zip(critics, critic_modes):
+                module.train(was_training)
+            if vf is not None:
+                vf.train(vf_was_training)
+            configure_target_random_crops(targets)
+            if dynamics_target_encoder is not None:
+                configure_encoder_target_random_crops(
+                    dynamics_target_encoder
+                )
+    if batch_count == 0 or window_count == 0:
+        raise ValueError("validation loader produced no held-out windows")
+    result = accumulator.means()
+    result["validation/batches"] = float(batch_count)
+    result["validation/windows"] = float(window_count)
+    return result
+
+
 def make_critic_optimizer(
     critic: nn.Module,
     critic_lr: float,
@@ -5412,6 +5779,14 @@ def checkpoint_payload(
         "task": str(args.task),
         "dataset": str(args.dataset),
         "dataset_identity": copy.deepcopy(args.dataset_identity),
+        "validation_dataset": (
+            str(args.validation_dataset)
+            if getattr(args, "validation_dataset", None) is not None
+            else None
+        ),
+        "validation_dataset_identity": copy.deepcopy(
+            getattr(args, "validation_dataset_identity", None)
+        ),
         "single_dataloader": distributed_world_size == 1,
         "sampling": (
             "distributed_shuffled_SequenceDataset_indices"
@@ -5459,6 +5834,9 @@ def checkpoint_payload(
             )
         ),
         "conditioned_actor": bool(args.conditioned_actor),
+        "actor_single_condition_class_ablation": bool(
+            args.conditioned_actor and args.allow_single_condition_class
+        ),
         "actor_condition_mode": (
             str(args.actor_condition_mode) if args.conditioned_actor else None
         ),
@@ -5646,6 +6024,8 @@ def checkpoint_payload(
 def train(args: argparse.Namespace) -> dict[str, Any]:
     configure_critic_architecture_args(args)
     validate_training_mode(args)
+    args.validation_dataset = getattr(args, "validation_dataset", None)
+    args.validation_seed = int(getattr(args, "validation_seed", 10_000))
     actor_only = bool(args.actor_only)
     distributed = initialize_distributed(args)
     args.distributed = bool(distributed.enabled)
@@ -5655,6 +6035,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     configure_batch_semantics(args, distributed)
     args.dataset_identity = mixed_dataset_identity(args.dataset)
     validate_mixed_dataset_source_identity(args.dataset_identity)
+    args.validation_dataset_identity = None
+    if getattr(args, "validation_dataset", None) is not None:
+        args.validation_dataset_identity = mixed_dataset_identity(
+            args.validation_dataset
+        )
+        validate_mixed_dataset_source_identity(
+            args.validation_dataset_identity
+        )
     if distributed.is_main_process:
         if args.resume_checkpoint is None:
             cleaned_temporaries = prepare_fresh_output_directory(
@@ -5821,6 +6209,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"match requested conditioned_actor={args.conditioned_actor}"
             )
         if saved_conditioned_actor:
+            saved_allow_single_condition_class = bool(
+                resume_state.get("args", {}).get(
+                    "allow_single_condition_class", False
+                )
+            )
+            if saved_allow_single_condition_class != bool(
+                args.allow_single_condition_class
+            ):
+                raise ValueError(
+                    "resume allow_single_condition_class="
+                    f"{saved_allow_single_condition_class} does not match "
+                    "requested allow_single_condition_class="
+                    f"{args.allow_single_condition_class}; start a fresh "
+                    "output directory"
+                )
             saved_condition_mode = str(
                 resume_state.get("args", {}).get(
                     "actor_condition_mode", "human_only"
@@ -6115,6 +6518,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             args.dataset,
             reward_mode=str(args.reward_mode),
             actor_condition_mode=str(args.actor_condition_mode),
+            allow_single_condition_class=bool(
+                args.allow_single_condition_class
+            ),
         )
         if args.conditioned_actor
         else None
@@ -6132,6 +6538,55 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         dp_checkpoint,
         sequence_length=sequence_length,
     )
+    validation_dataset = None
+    validation_loader = None
+    validation_audit = None
+    validation_condition_audit = None
+    validation_split_audit = None
+    if (
+        args.validation_dataset is not None
+        and distributed.is_main_process
+    ):
+        validation_loader_args = copy.copy(loader_args)
+        validation_loader_args.dataset = args.validation_dataset
+        validation_loader_args.seed = int(args.validation_seed)
+        # Validation is intentionally rank-zero-only. All ranks hold identical
+        # synchronized models, and this avoids padding or duplicating held-out
+        # windows through a DistributedSampler.
+        validation_loader_args.distributed_world_size = 1
+        validation_loader_args.distributed_rank = 0
+        (
+            validation_dataset,
+            validation_loader,
+            _,
+            _,
+        ) = build_single_loader(
+            validation_loader_args,
+            actor_policy,
+            dp_checkpoint,
+            sequence_length=sequence_length,
+            shuffle=False,
+            drop_last=False,
+        )
+        validation_audit = dataset_audit(
+            args.validation_dataset,
+            len(validation_dataset),
+            expected_task=args.task,
+            expected_reward_mode=args.reward_mode,
+        )
+        validation_split_audit = audit_validation_dataset_split(
+            args.dataset,
+            args.validation_dataset,
+        )
+        if args.conditioned_actor:
+            validation_condition_audit = audit_actor_conditions(
+                args.validation_dataset,
+                reward_mode=str(args.reward_mode),
+                actor_condition_mode=str(args.actor_condition_mode),
+                allow_single_condition_class=bool(
+                    args.allow_single_condition_class
+                ),
+            )
     if args.steps_per_epoch is None:
         args.steps_per_epoch = int(len(loader))
         args.steps_per_epoch_source = "auto_DataLoader_length"
@@ -7070,6 +7525,34 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "provenance_identity": copy.deepcopy(args.dataset_identity),
             "actor_conditioning": condition_audit,
         },
+        "validation": (
+            {
+                "enabled": True,
+                "dataset": str(args.validation_dataset),
+                "provenance_identity": copy.deepcopy(
+                    args.validation_dataset_identity
+                ),
+                "dataset_audit": validation_audit,
+                "split_audit": validation_split_audit,
+                "actor_conditioning": validation_condition_audit,
+                "frequency_epochs": 1,
+                "coverage": "all_held_out_windows",
+                "execution": "rank_zero_only_no_parameter_updates",
+                "seed": int(args.validation_seed),
+                "num_batches": (
+                    int(len(validation_loader))
+                    if validation_loader is not None
+                    else None
+                ),
+                "selection_metric": (
+                    "validation/actor/Loss"
+                    if trains_joint_actor(args)
+                    else None
+                ),
+            }
+            if args.validation_dataset is not None
+            else {"enabled": False}
+        ),
         "loader": {
             "class": dataset.__class__.__name__,
             "num_loaders": int(distributed.world_size),
@@ -7317,6 +7800,20 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if args.max_gradient_norm is None or args.max_gradient_norm <= 0.0
         else float(args.max_gradient_norm)
     )
+
+    best_validation_loss: float | None = None
+    best_validation_epoch: int | None = None
+    for completed_epoch in history:
+        completed_metrics = completed_epoch.get("metrics", {})
+        candidate = completed_metrics.get("validation/actor/Loss")
+        if candidate is None or not np.isfinite(float(candidate)):
+            continue
+        if (
+            best_validation_loss is None
+            or float(candidate) < best_validation_loss
+        ):
+            best_validation_loss = float(candidate)
+            best_validation_epoch = int(completed_epoch.get("epoch", -1))
 
     shared_action_range_validated = False
     for epoch in range(start_epoch + 1, int(args.epochs) + 1):
@@ -7708,15 +8205,79 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 del batch, critic_losses, vf_loss
 
+        validation_metrics: dict[str, float] = {}
+        validation_improved = False
+        if validation_loader is not None:
+            validation_metrics = evaluate_validation_epoch(
+                args=args,
+                epoch=epoch,
+                loader=validation_loader,
+                actor_algo=actor_algo,
+                obs_stats=obs_stats,
+                actor_only=actor_only,
+                is_wcm=is_wcm,
+                is_rise_v2=is_rise_v2,
+                critics=critics,
+                targets=targets,
+                dynamics_target_encoder=dynamics_target_encoder,
+                vf=vf,
+                wcm_system=wcm_system,
+                wcm_target_system=wcm_target_system,
+                wcm_dynamics_target_encoder=(
+                    wcm_dynamics_target_encoder
+                ),
+                device=device,
+                global_step=global_step,
+            )
+            selection_loss = validation_metrics.get(
+                "validation/actor/Loss"
+            )
+            if selection_loss is not None:
+                if not np.isfinite(float(selection_loss)):
+                    raise ValueError(
+                        "held-out actor validation loss is non-finite"
+                    )
+                if (
+                    best_validation_loss is None
+                    or float(selection_loss) < best_validation_loss
+                ):
+                    best_validation_loss = float(selection_loss)
+                    best_validation_epoch = int(epoch)
+                    validation_improved = True
+            if writer is not None:
+                for key, value in validation_metrics.items():
+                    writer.add_scalar(key, value, global_step)
+            print(
+                json.dumps(
+                    {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "validation_best": validation_improved,
+                        **validation_metrics,
+                    }
+                ),
+                flush=True,
+            )
+        if distributed.enabled:
+            improvement_flag = torch.tensor(
+                int(validation_improved),
+                device=device,
+                dtype=torch.int32,
+            )
+            dist.broadcast(improvement_flag, src=0)
+            validation_improved = bool(improvement_flag.item())
+
+        epoch_metrics = (
+            metric_accumulator.means()
+            if distributed.is_main_process
+            else {}
+        )
+        epoch_metrics.update(validation_metrics)
         epoch_summary = {
             "global_samples_seen": int(global_samples_seen),
             "epoch": int(epoch),
             "global_step": int(global_step),
-            "metrics": (
-                metric_accumulator.means()
-                if distributed.is_main_process
-                else {}
-            ),
+            "metrics": epoch_metrics,
         }
         history.append(epoch_summary)
         partial = {
@@ -7726,18 +8287,29 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "global_samples_seen": int(global_samples_seen),
             "last_epoch_metrics": epoch_summary["metrics"],
             "history": history,
+            "best_validation": {
+                "metric": "validation/actor/Loss",
+                "value": best_validation_loss,
+                "epoch": best_validation_epoch,
+            },
             "checkpoints": {
                 "latest": str(args.output_dir / "latest.pt"),
                 "last": str(args.output_dir / "last.pt"),
+                "best_validation": (
+                    str(args.output_dir / "best_validation.pt")
+                    if best_validation_epoch is not None
+                    else None
+                ),
             },
         }
         if distributed.is_main_process:
             atomic_write_json(args.output_dir / "partial_summary.json", partial)
 
-        if (
+        regular_checkpoint = (
             epoch % int(args.save_every_epochs) == 0
             or epoch == int(args.epochs)
-        ):
+        )
+        if regular_checkpoint or validation_improved:
             rank_runtime_states = (
                 gather_rank_runtime_states(loader_generator, distributed)
                 if distributed.enabled
@@ -7750,6 +8322,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 latest = args.output_dir / LATEST_CHECKPOINT_NAME
                 atomic_torch_save(payload, latest)
+                if validation_improved:
+                    replace_with_hardlink(
+                        latest,
+                        args.output_dir / "best_validation.pt",
+                    )
                 if epoch == int(args.epochs):
                     replace_with_hardlink(latest, args.output_dir / "last.pt")
                 if (
@@ -7810,6 +8387,21 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument(
+        "--validation-dataset",
+        type=Path,
+        default=None,
+        help=(
+            "Optional disjoint mixed HDF5 evaluated in full after every "
+            "epoch. The launcher enables this only for real-robot tasks."
+        ),
+    )
+    parser.add_argument(
+        "--validation-seed",
+        type=int,
+        default=10_000,
+        help="Fixed RNG seed used for comparable validation losses.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--validate-resume-only", action="store_true")
@@ -7957,6 +8549,16 @@ def make_parser() -> argparse.ArgumentParser:
             "human and successful rollouts=1 and failure rollouts=0"
         ),
     )
+    parser.add_argument(
+        "--allow-single-condition-class",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Ablation only: allow a conditioned-actor training dataset to "
+            "contain only condition 0 or only condition 1. The default "
+            "requires both classes."
+        ),
+    )
     parser.add_argument("--condition-dropout", type=float, default=0.0)
     parser.add_argument("--condition-hidden-dim", type=int, default=256)
     parser.add_argument("--critic-lr", type=float, default=1e-4)
@@ -8087,6 +8689,7 @@ def main() -> None:
         "source_idql_checkpoint",
         "source_chunk_idql_checkpoint",
         "dataset",
+        "validation_dataset",
         "output_dir",
         "resume_checkpoint",
     ):

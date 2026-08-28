@@ -12,6 +12,7 @@ USER_SUCCESS_MASK_SET=${SUCCESS_MASK+x}
 USER_SUCCESS_COUNT_SET=${SUCCESS_COUNT+x}
 USER_FAILURE_MASK_SET=${FAILURE_MASK+x}
 USER_FAILURE_COUNT_SET=${FAILURE_COUNT+x}
+USER_REAL_ROBOT_VALIDATION_DATASET_SET=${REAL_ROBOT_VALIDATION_DATASET+x}
 
 first_arg=${1:-}
 first_arg=${first_arg,,}
@@ -32,29 +33,31 @@ TASK_REAL_ROBOT_HUMAN_DATASETS=
 TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=
 TASK_REAL_ROBOT_ROLLOUT_BUILDER=
 TASK_REAL_ROBOT_MIXED_BUILDER=
+TASK_REAL_ROBOT_VALIDATION_DATASET=
+TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=-1
 
 case "$TASK" in
   square)
     TASK_DP_CHECKPOINT=trained_models/square_rgb_dp/square_ph_rgb_dp_official_s1/models/model_epoch_200.pth
     TASK_EXPERT_DATASET=datasets/square/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/square_rgb_dp/epoch190_collection/square_rgb_dp_rollouts_rgb2.hdf5
-    TASK_IDQL_DATASET=datasets/square/idql/square_rgb_dp_idql_200demo_100success_50failure.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/square_rgb_dp/idql/200demo_100success_50failure
-    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/square_rgb_dp/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition
+    TASK_IDQL_DATASET=datasets/square/idql/square_rgb_dp_idql_200demo_406success_94failure.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/square_rgb_dp/idql/200demo_406success_94failure
+    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/square_rgb_dp/chunk_idql/200demo_406success_94failure_h8_dynamics_human_condition
     TASK_EXPERT_MASK=
     TASK_EXPERT_COUNT=200
-    TASK_SUCCESS_MASK=success_100
+    TASK_SUCCESS_MASK=success
     TASK_SUCCESS_COUNT=-1
-    TASK_FAILURE_MASK=failure_50
+    TASK_FAILURE_MASK=failure
     TASK_FAILURE_COUNT=-1
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
     TASK_CHUNK_EPOCHS=50
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
-    TASK_ENCODER_FREEZE_STEPS=0
-    TASK_CHUNK_EVAL_OUTPUT=rollouts/square_rgb_dp_visual/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition
+    TASK_ENCODER_FREEZE_STEPS=1000
+    TASK_CHUNK_EVAL_OUTPUT=rollouts/square_rgb_dp/chunk_idql/200demo_406success_94failure_h8_dynamics_human_condition
     TASK_COMPOSED_DP_CHECKPOINT=$TASK_DP_CHECKPOINT
-    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/square_rgb_dp_visual/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition_epoch200_actor
+    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/square_rgb_dp/chunk_idql/200demo_406success_94failure_h8_dynamics_human_condition_epoch200_actor
     TASK_EVAL_HORIZON=400
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
     ;;
@@ -135,7 +138,6 @@ case "$TASK" in
   pick_cup)
     TASK_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_200.pth
     TASK_EXPERT_DATASET=datasets/real_robot/pick_cup/round1_rgb.hdf5
-    TASK_PICK_CUP_HUMAN_DATASETS="datasets/real_robot/pick_cup/round1_rgb.hdf5 datasets/real_robot/pick_cup/round2_rgb.hdf5"
     TASK_ROLLOUT_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_epoch200_20hz_rollouts.hdf5
     TASK_IDQL_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_65demo_23success_11failure_terminal_success.hdf5
     TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/idql/65demo_23success_11failure_terminal_success
@@ -158,10 +160,12 @@ case "$TASK" in
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
     TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     TASK_REAL_ROBOT=1
-    TASK_REAL_ROBOT_HUMAN_DATASETS=$TASK_PICK_CUP_HUMAN_DATASETS
+    TASK_REAL_ROBOT_HUMAN_DATASETS="datasets/real_robot/pick_cup/round1_rgb.hdf5 datasets/real_robot/pick_cup/round2_rgb.hdf5"
     TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets/pick_cup/rollout
     TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_pick_cup_rollout_hdf5.py
     TASK_REAL_ROBOT_MIXED_BUILDER=scripts/real_robot/build_pick_cup_chunk_idql_dataset.py
+    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_validation_10demo_6success_3failure_terminal_success.hdf5
+    TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=4371
     ;;
   stack_cup)
     TASK_DP_CHECKPOINT=trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260822155238/models/model_epoch_200.pth
@@ -192,6 +196,8 @@ case "$TASK" in
     TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets/stack_cup/rollout
     TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_stack_cup_rollout_hdf5.py
     TASK_REAL_ROBOT_MIXED_BUILDER=scripts/real_robot/build_stack_cup_chunk_idql_dataset.py
+    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_validation_5demo_6success_4failure_terminal_success.hdf5
+    TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=2643
     ;;
   *)
     echo "Unsupported TASK=$TASK. Use square, can, transport, tool_hang, pick_cup, or stack_cup." >&2
@@ -274,16 +280,24 @@ fi
 DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
 EXPERT_DATASET=${EXPERT_DATASET:-$TASK_EXPERT_DATASET}
 ROLLOUT_DATASET=${ROLLOUT_DATASET:-$TASK_ROLLOUT_DATASET}
-PICK_CUP_HUMAN_DATASETS=${PICK_CUP_HUMAN_DATASETS:-${TASK_PICK_CUP_HUMAN_DATASETS:-}}
-PICK_CUP_ROLLOUT_SOURCE_ROOT=${PICK_CUP_ROLLOUT_SOURCE_ROOT:-/home/ryan/datasets/pick_cup/rollout}
 REAL_ROBOT_HUMAN_DATASETS=${REAL_ROBOT_HUMAN_DATASETS:-$TASK_REAL_ROBOT_HUMAN_DATASETS}
 REAL_ROBOT_ROLLOUT_SOURCE_ROOT=${REAL_ROBOT_ROLLOUT_SOURCE_ROOT:-$TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT}
-if [[ "$TASK" == "pick_cup" ]]; then
-  REAL_ROBOT_HUMAN_DATASETS=${PICK_CUP_HUMAN_DATASETS:-$REAL_ROBOT_HUMAN_DATASETS}
-  REAL_ROBOT_ROLLOUT_SOURCE_ROOT=${PICK_CUP_ROLLOUT_SOURCE_ROOT:-$REAL_ROBOT_ROLLOUT_SOURCE_ROOT}
-fi
+REAL_ROBOT_VALIDATION_DATASET=${REAL_ROBOT_VALIDATION_DATASET:-$TASK_REAL_ROBOT_VALIDATION_DATASET}
+REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=${REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS:-$TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS}
 IDQL_REWARD_MODE=${IDQL_REWARD_MODE:-$TASK_DEFAULT_IDQL_REWARD_MODE}
-CHUNK_ACTOR_CONDITION_MODE=${CHUNK_ACTOR_CONDITION_MODE:-human_only} # human_success
+CHUNK_ACTOR_CONDITION_MODE=${CHUNK_ACTOR_CONDITION_MODE:-human_success} # human_success
+case "$CHUNK_ACTOR_CONDITION_MODE" in
+  human_only)
+    ACTOR_CONDITION_DESCRIPTION="human=1 success_rollout=0 failure_rollout=0"
+    ;;
+  human_success)
+    ACTOR_CONDITION_DESCRIPTION="human=1 success_rollout=1 failure_rollout=0"
+    ;;
+  *)
+    echo "Unsupported CHUNK_ACTOR_CONDITION_MODE." >&2
+    exit 2
+    ;;
+esac
 
 case "$IDQL_REWARD_MODE" in
   task)
@@ -327,7 +341,13 @@ if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
 fi
 if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "human_success" ]]; then
   condition_path_tag=human_success_condition
-  if [[ "$IDQL_REWARD_MODE" == "task" ]]; then
+  if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
+    # Real-robot base names already include their terminal-success reward tag.
+    DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_${condition_path_tag}.hdf5
+    if [[ -z "$USER_REAL_ROBOT_VALIDATION_DATASET_SET" ]]; then
+      REAL_ROBOT_VALIDATION_DATASET=${TASK_REAL_ROBOT_VALIDATION_DATASET%.hdf5}_${condition_path_tag}.hdf5
+    fi
+  elif [[ "$IDQL_REWARD_MODE" == "task" ]]; then
     DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_${condition_path_tag}_task_reward.hdf5
   elif [[ "$IDQL_REWARD_MODE" == "terminal_success" ]]; then
     DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_${condition_path_tag}_terminal_success_reward.hdf5
@@ -338,6 +358,14 @@ if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "human_success" ]]; then
   DEFAULT_CHUNK_EVAL_OUTPUT=${DEFAULT_CHUNK_EVAL_OUTPUT/human_condition/$condition_path_tag}
   DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT/human_condition/$condition_path_tag}
 fi
+CHUNK_CRITIC_ARCHITECTURE=${CHUNK_CRITIC_ARCHITECTURE:-rise_temporal_v2}
+if [[ "$TASK_REAL_ROBOT" == "1" && "$CHUNK_CRITIC_ARCHITECTURE" != "legacy" ]]; then
+  # Never reuse a completed legacy directory for a structurally incompatible
+  # temporal critic.
+  DEFAULT_CHUNK_IDQL_OUTPUT_DIR=${DEFAULT_CHUNK_IDQL_OUTPUT_DIR}_${CHUNK_CRITIC_ARCHITECTURE}
+  DEFAULT_CHUNK_EVAL_OUTPUT=${DEFAULT_CHUNK_EVAL_OUTPUT}_${CHUNK_CRITIC_ARCHITECTURE}
+  DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT}_${CHUNK_CRITIC_ARCHITECTURE}
+fi
 IDQL_DATASET=${IDQL_DATASET:-$DEFAULT_IDQL_DATASET}
 IDQL_OUTPUT_DIR=${IDQL_OUTPUT_DIR:-$DEFAULT_IDQL_OUTPUT_DIR}
 IDQL_CHECKPOINT=${IDQL_CHECKPOINT:-$IDQL_OUTPUT_DIR/last.pt}
@@ -347,9 +375,10 @@ CHUNK_IDQL_OUTPUT_DIR=${CHUNK_IDQL_OUTPUT_DIR:-$DEFAULT_CHUNK_IDQL_OUTPUT_DIR}
 CHUNK_INITIALIZATION=${CHUNK_INITIALIZATION:-$TASK_CHUNK_INITIALIZATION}
 CHUNK_CONDITIONED_ACTOR=${CHUNK_CONDITIONED_ACTOR:-1}
 TRAIN_ACTOR_ONLY=${TRAIN_ACTOR_ONLY:-0}
-CHUNK_CRITIC_ARCHITECTURE=${CHUNK_CRITIC_ARCHITECTURE:-legacy}
 CHUNK_RISE_V2_FUSION_MODE=${CHUNK_RISE_V2_FUSION_MODE:-film}
-CHUNK_RISE_V2_DENSE_DYNAMICS=${CHUNK_RISE_V2_DENSE_DYNAMICS:-0}
+CHUNK_RISE_V2_DENSE_DYNAMICS=${CHUNK_RISE_V2_DENSE_DYNAMICS:-1}
+
+# critic choice
 case "$CHUNK_CRITIC_ARCHITECTURE" in
   wcm_shared_temporal_v1)
     CHUNK_CRITIC_OBSERVATION_HORIZON=${CHUNK_CRITIC_OBSERVATION_HORIZON:-2}
@@ -623,7 +652,7 @@ require_simulation_stage_task() {
   local stage_name=$1
   if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
     echo "[rgb_dp_chunk_idql task=$TASK] stage '$stage_name' is simulation-only and cannot create or control the real robot." >&2
-    echo "Use scripts/real_robot_deploy for shadow evaluation or guarded real-robot execution." >&2
+    echo "Use the task's dedicated 20 Hz real-robot deployment path for shadow evaluation or guarded execution." >&2
     exit 2
   fi
 }
@@ -721,6 +750,23 @@ CHUNK_CONDITION_ARGS=(--conditioned-actor)
 if [[ "$CHUNK_CONDITIONED_ACTOR" == "0" ]]; then
   CHUNK_CONDITION_ARGS=(--no-conditioned-actor)
 fi
+ALLOW_SINGLE_CONDITION_CLASS_ARG=--no-allow-single-condition-class
+case "${CHUNK_ALLOW_SINGLE_CONDITION_CLASS:-0}" in
+  0)
+    ;;
+  1)
+    if [[ "$CHUNK_CONDITIONED_ACTOR" != "1" ]]; then
+      echo "CHUNK_ALLOW_SINGLE_CONDITION_CLASS=1 requires CHUNK_CONDITIONED_ACTOR=1." >&2
+      exit 2
+    fi
+    echo "[rgb_dp_chunk_idql] ABLATION: allowing a single actor-condition class." >&2
+    ALLOW_SINGLE_CONDITION_CLASS_ARG=--allow-single-condition-class
+    ;;
+  *)
+    echo "CHUNK_ALLOW_SINGLE_CONDITION_CLASS must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
 TRAIN_ACTOR_ONLY_ARG=--no-actor-only
 case "$TRAIN_ACTOR_ONLY" in
   0)
@@ -844,6 +890,7 @@ run_real_robot_mixed_builder() {
   local -a human_datasets=()
   local -a human_args=()
   local -a mode_args=()
+  echo "[rgb_dp_chunk_idql task=$TASK] actor condition: mode=$CHUNK_ACTOR_CONDITION_MODE ($ACTOR_CONDITION_DESCRIPTION)" >&2
   read -r -a human_datasets <<< "$REAL_ROBOT_HUMAN_DATASETS"
   if (( ${#human_datasets[@]} == 0 )); then
     echo "REAL_ROBOT_HUMAN_DATASETS must contain at least one human HDF5 path." >&2
@@ -879,10 +926,60 @@ run_real_robot_mixed_builder() {
     "${mode_args[@]}"
 }
 
+run_real_robot_validation_builder() {
+  local validation_only=${1:-0}
+  local -a human_datasets=()
+  local -a human_args=()
+  local -a mode_args=()
+  read -r -a human_datasets <<< "$REAL_ROBOT_HUMAN_DATASETS"
+  if (( ${#human_datasets[@]} == 0 )); then
+    echo "REAL_ROBOT_HUMAN_DATASETS must contain at least one human HDF5 path." >&2
+    exit 2
+  fi
+  if [[ -z "$REAL_ROBOT_VALIDATION_DATASET" ]]; then
+    echo "TASK=$TASK has no real-robot validation dataset configured." >&2
+    exit 2
+  fi
+  for dataset_path in "${human_datasets[@]}"; do
+    if [[ ! -f "$dataset_path" || ! -s "$dataset_path" ]]; then
+      echo "[rgb_dp_chunk_idql task=$TASK] human dataset does not exist or is empty: $dataset_path" >&2
+      exit 1
+    fi
+    human_args+=(--human-dataset "$dataset_path")
+  done
+  if [[ ! -f "$ROLLOUT_DATASET" || ! -s "$ROLLOUT_DATASET" ]]; then
+    echo "[rgb_dp_chunk_idql task=$TASK] rollout dataset does not exist or is empty: $ROLLOUT_DATASET" >&2
+    exit 1
+  fi
+  if [[ "$validation_only" == "1" || ( -f "$REAL_ROBOT_VALIDATION_DATASET" && "${OVERWRITE_DATASET:-0}" != "1" ) ]]; then
+    mode_args=(--validate-only)
+  elif [[ "${OVERWRITE_DATASET:-0}" == "1" ]]; then
+    mode_args=(--overwrite)
+  fi
+  "$PYTHON" -B "$TASK_REAL_ROBOT_MIXED_BUILDER" \
+    --task "$TASK" \
+    "${human_args[@]}" \
+    --rollout-dataset "$ROLLOUT_DATASET" \
+    --output "$REAL_ROBOT_VALIDATION_DATASET" \
+    --selection-role validation \
+    --human-mask valid \
+    --human-count -1 \
+    --expected-human-transitions "$REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS" \
+    --success-mask success_valid \
+    --success-count -1 \
+    --failure-mask failure_valid \
+    --failure-count -1 \
+    --reward-mode "$IDQL_REWARD_MODE" \
+    --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+    --seed "${DATASET_SEED:-0}" \
+    "${mode_args[@]}"
+}
+
 build_dataset() {
   local overwrite_args=()
   if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
     run_real_robot_mixed_builder 0
+    run_real_robot_validation_builder 0
     return
   fi
   if [[ ! -f "$EXPERT_DATASET" ]]; then
@@ -917,6 +1014,18 @@ build_dataset() {
 ensure_dataset() {
   if [[ "$ROUND2_CHUNK_TRAINING" == "1" && -z "$USER_ROLLOUT_DATASET_SET" ]]; then
     ensure_collection_rgb_dataset
+  fi
+  if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
+    if [[ "${OVERWRITE_DATASET:-0}" == "1" ]]; then
+      echo "[rgb_dp_chunk_idql task=$TASK] rebuilding fitting and validation datasets" >&2
+    elif [[ ! -f "$IDQL_DATASET" || ! -f "$REAL_ROBOT_VALIDATION_DATASET" ]]; then
+      echo "[rgb_dp_chunk_idql task=$TASK] building missing fitting or validation dataset" >&2
+    else
+      echo "[rgb_dp_chunk_idql task=$TASK] validating fitting and held-out dataset provenance" >&2
+    fi
+    run_real_robot_mixed_builder 0
+    run_real_robot_validation_builder 0
+    return
   fi
   if [[ "${OVERWRITE_DATASET:-0}" == "1" ]]; then
     echo "[rgb_dp_chunk_idql] rebuilding mixed dataset: $IDQL_DATASET" >&2
@@ -954,8 +1063,15 @@ run_chunk_train() {
   local initialization_args=()
   local distributed_args=()
   local validation_args=()
+  local heldout_args=()
   if [[ "${CHUNK_VALIDATE_RESUME_ONLY:-0}" == "1" ]]; then
     validation_args=(--validate-resume-only)
+  fi
+  if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
+    heldout_args=(
+      --validation-dataset "$REAL_ROBOT_VALIDATION_DATASET"
+      --validation-seed "${CHUNK_VALIDATION_SEED:-10000}"
+    )
   fi
   local train_launcher=("$PYTHON" -B)
   if [[ -n "$resume_path" ]]; then
@@ -1017,6 +1133,7 @@ run_chunk_train() {
     "${distributed_args[@]}" \
     "${initialization_args[@]}" \
     --dataset "$IDQL_DATASET" \
+    "${heldout_args[@]}" \
     --output-dir "$CHUNK_IDQL_OUTPUT_DIR" \
     "${resume_args[@]}" \
     "${validation_args[@]}" \
@@ -1034,6 +1151,7 @@ run_chunk_train() {
     --hdf5-cache-mode "${HDF5_CACHE_MODE:-low_dim}" \
     --reward-mode "$IDQL_REWARD_MODE" \
     --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+    "$ALLOW_SINGLE_CONDITION_CLASS_ARG" \
     --chunk-horizon "${CHUNK_HORIZON:-8}" \
     --critic-architecture "$CHUNK_CRITIC_ARCHITECTURE" \
     --critic-observation-horizon "$CHUNK_CRITIC_OBSERVATION_HORIZON" \
