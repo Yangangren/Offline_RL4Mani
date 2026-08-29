@@ -25,6 +25,41 @@ import robomimic.utils.obs_utils as ObsUtils
 from robomimic.algo import register_algo_factory_func, PolicyAlgo
 
 
+def binary_condition_loss_stats(
+    per_sample_loss,
+    success_condition,
+    condition_mask,
+):
+    """Return count-safe condition-1 and condition-0 loss monitoring stats."""
+    per_sample_loss = per_sample_loss.reshape(-1)
+    success_condition = success_condition.reshape(-1)
+    condition_mask = condition_mask.reshape(-1)
+    if not (
+        per_sample_loss.shape == success_condition.shape == condition_mask.shape
+    ):
+        raise ValueError("condition monitoring tensors must have matching rows")
+    if per_sample_loss.numel() == 0:
+        raise ValueError("condition monitoring requires at least one row")
+    monitored = condition_mask > 0.5
+    stats = {}
+    for condition_value, condition_name in (
+        (1.0, "condition_1"),
+        (0.0, "condition_0"),
+    ):
+        condition_rows = monitored & (
+            (success_condition >= 0.5)
+            if condition_value == 1.0
+            else (success_condition < 0.5)
+        )
+        condition_count = condition_rows.sum()
+        stats[f"{condition_name}_loss"] = (
+            (per_sample_loss * condition_rows).sum()
+            / condition_count.clamp_min(1)
+        )
+        stats[f"{condition_name}_fraction"] = condition_rows.float().mean()
+    return stats
+
+
 class SuccessConditionResidual(nn.Module):
     """Zero-initialized residual adapter for success-conditioned DP."""
 
@@ -942,6 +977,26 @@ class DiffusionPolicyUNet(PolicyAlgo):
             per_sample_energy = F.mse_loss(
                 noise_pred, noise, reduction="none"
             ).flatten(start_dim=1).mean(dim=1)
+
+            if condition_stats is not None:
+                # Report the ordinary diffusion denoising objective separately
+                # for the two source conditions. Use the undropped dataset
+                # labels for monitoring so these metrics retain a stable meaning
+                # even when condition dropout is enabled during training.
+                monitored_condition, monitored_mask = (
+                    self._success_condition_inputs(
+                        B,
+                        batch=batch,
+                        validate=True,
+                    )
+                )
+                condition_stats.update(
+                    binary_condition_loss_stats(
+                        per_sample_energy,
+                        monitored_condition,
+                        monitored_mask,
+                    )
+                )
 
             reference_distillation_loss = None
             weighted_reference_distillation_loss = None

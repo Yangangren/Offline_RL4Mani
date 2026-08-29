@@ -136,7 +136,7 @@ case "$TASK" in
     TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     ;;
   pick_cup)
-    TASK_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_200.pth
+    TASK_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_50.pth
     TASK_EXPERT_DATASET=datasets/real_robot/pick_cup/round1_rgb.hdf5
     TASK_ROLLOUT_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_epoch200_20hz_rollouts.hdf5
     TASK_IDQL_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_65demo_23success_11failure_terminal_success.hdf5
@@ -149,7 +149,7 @@ case "$TASK" in
     TASK_FAILURE_MASK=failure_train
     TASK_FAILURE_COUNT=11
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
-    TASK_CHUNK_EPOCHS=50
+    TASK_CHUNK_EPOCHS=25
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
@@ -181,7 +181,7 @@ case "$TASK" in
     TASK_FAILURE_MASK=failure_train
     TASK_FAILURE_COUNT=14
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
-    TASK_CHUNK_EPOCHS=50
+    TASK_CHUNK_EPOCHS=30
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
@@ -430,6 +430,21 @@ if [[ "$CHUNK_CRITIC_ARCHITECTURE" == "wcm_shared_temporal_v1" ]]; then
 else
   VF_ENCODER_FREEZE_STEPS=${VF_ENCODER_FREEZE_STEPS:-$TASK_VF_ENCODER_FREEZE_STEPS}
 fi
+
+# prevent overfitting of actor in the real-robot experiments
+if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
+  DEFAULT_CHUNK_ACTOR_UNET_LR=1e-5
+  DEFAULT_CHUNK_ACTOR_OBS_ENCODER_LR=1e-5
+  DEFAULT_CHUNK_ACTOR_OBS_ENCODER_FREEZE_STEPS=$ENCODER_FREEZE_STEPS
+else
+  DEFAULT_CHUNK_ACTOR_UNET_LR=1e-4
+  DEFAULT_CHUNK_ACTOR_OBS_ENCODER_LR=1e-4
+  DEFAULT_CHUNK_ACTOR_OBS_ENCODER_FREEZE_STEPS=0
+fi
+CHUNK_ACTOR_ADAPTER_LR=${CHUNK_ACTOR_ADAPTER_LR:-1e-4}
+CHUNK_ACTOR_UNET_LR=${CHUNK_ACTOR_UNET_LR:-$DEFAULT_CHUNK_ACTOR_UNET_LR}
+CHUNK_ACTOR_OBS_ENCODER_LR=${CHUNK_ACTOR_OBS_ENCODER_LR:-$DEFAULT_CHUNK_ACTOR_OBS_ENCODER_LR}
+CHUNK_ACTOR_OBS_ENCODER_FREEZE_STEPS=${CHUNK_ACTOR_OBS_ENCODER_FREEZE_STEPS:-$DEFAULT_CHUNK_ACTOR_OBS_ENCODER_FREEZE_STEPS}
 EXPERT_MASK=${EXPERT_MASK:-$TASK_EXPERT_MASK}
 EXPERT_COUNT=${EXPERT_COUNT:-$TASK_EXPERT_COUNT}
 SUCCESS_MASK=${SUCCESS_MASK:-$TASK_SUCCESS_MASK}
@@ -1159,9 +1174,10 @@ run_chunk_train() {
     --expectile "${EXPECTILE:-0.9}" \
     --target-tau "${TARGET_TAU:-0.01}" \
     --dynamics-target-sync-interval "${DYNAMICS_TARGET_SYNC_INTERVAL:-$DEFAULT_DYNAMICS_TARGET_SYNC_INTERVAL}" \
-    --actor-adapter-lr "${CHUNK_ACTOR_ADAPTER_LR:-1e-4}" \
-    --actor-unet-lr "${CHUNK_ACTOR_UNET_LR:-1e-4}" \
-    --actor-obs-encoder-lr "${CHUNK_ACTOR_OBS_ENCODER_LR:-1e-4}" \
+    --actor-adapter-lr "$CHUNK_ACTOR_ADAPTER_LR" \
+    --actor-unet-lr "$CHUNK_ACTOR_UNET_LR" \
+    --actor-obs-encoder-lr "$CHUNK_ACTOR_OBS_ENCODER_LR" \
+    --actor-obs-encoder-freeze-steps "$CHUNK_ACTOR_OBS_ENCODER_FREEZE_STEPS" \
     --actor-reference-weight "${CHUNK_ACTOR_REFERENCE_WEIGHT:-0.0}" \
     --actor-reference-batch-fraction "${CHUNK_ACTOR_REFERENCE_BATCH_FRACTION:-0.25}" \
     --actor-lr-scheduler "${CHUNK_ACTOR_LR_SCHEDULER:-cosine}" \

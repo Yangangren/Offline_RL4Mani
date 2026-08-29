@@ -510,6 +510,7 @@ def initialize_distributed(args: argparse.Namespace) -> DistributedContext:
 
 SAMPLE_SCALED_STEP_FIELDS = (
     "actor_lr_warmup_steps",
+    "actor_obs_encoder_freeze_steps",
     "critic_vf_lr_warmup_steps",
     "dynamics_warmup_steps",
     "encoder_freeze_steps",
@@ -4837,26 +4838,49 @@ def actor_validation_step(
     epoch: int,
     obs_normalization_stats,
 ) -> dict[str, Any]:
-    """Evaluate the online diffusion objective without optimizer or EMA updates."""
-    actor_batch = actor_algo.process_batch_for_training(raw_batch)
-    actor_batch = actor_algo.postprocess_batch_for_training(
-        actor_batch,
-        obs_normalization_stats=obs_normalization_stats,
-    )
-    info = actor_algo.train_on_batch(
-        actor_batch,
-        epoch=epoch,
-        validate=True,
-    )
-    log = actor_algo.log_info(info, materialize=False)
+    """Evaluate the deployed EMA actor without optimizer or EMA updates."""
+    if actor_algo.ema is None:
+        raise RuntimeError("held-out actor validation requires EMA actor weights")
+    online_nets = actor_algo.nets
+    ema_nets = actor_algo.ema.averaged_model
+    ema_was_training = bool(ema_nets.training)
+    try:
+        actor_algo.nets = ema_nets
+        ema_nets.eval()
+        actor_batch = actor_algo.process_batch_for_training(raw_batch)
+        actor_batch = actor_algo.postprocess_batch_for_training(
+            actor_batch,
+            obs_normalization_stats=obs_normalization_stats,
+        )
+        info = actor_algo.train_on_batch(
+            actor_batch,
+            epoch=epoch,
+            validate=True,
+        )
+        log = actor_algo.log_info(info, materialize=False)
+    finally:
+        actor_algo.nets = online_nets
+        ema_nets.train(ema_was_training)
     allowed_types = (int, float, np.number, torch.Tensor)
-    return {
+    metrics = {
         f"actor/{key}" if not str(key).startswith("actor/") else str(key): (
             value if isinstance(value, torch.Tensor) else float(value)
         )
         for key, value in log.items()
         if isinstance(value, allowed_types)
+        and not str(key).startswith("Optimizer/")
     }
+    # WeightedScalarMetricAccumulator weights each batch by its total row count.
+    # Convert each conditional mean to a row-normalized contribution here; the
+    # exact per-condition mean is reconstructed after epoch aggregation.
+    for condition_name in ("condition_1", "condition_0"):
+        loss_key = f"actor/SuccessCondition/{condition_name}_loss"
+        fraction_key = f"actor/SuccessCondition/{condition_name}_fraction"
+        if loss_key in metrics and fraction_key in metrics:
+            metrics[f"{loss_key}_contribution"] = (
+                metrics.pop(loss_key) * metrics[fraction_key]
+            )
+    return metrics
 
 
 @torch.no_grad()
@@ -5042,6 +5066,21 @@ def evaluate_validation_epoch(
     if batch_count == 0 or window_count == 0:
         raise ValueError("validation loader produced no held-out windows")
     result = accumulator.means()
+    for condition_name in ("condition_1", "condition_0"):
+        loss_key = (
+            f"validation/actor/SuccessCondition/{condition_name}_loss"
+        )
+        fraction_key = (
+            f"validation/actor/SuccessCondition/{condition_name}_fraction"
+        )
+        contribution = result.pop(f"{loss_key}_contribution", None)
+        fraction = result.get(fraction_key)
+        if contribution is not None and fraction is not None:
+            result[loss_key] = (
+                float(contribution) / float(fraction)
+                if float(fraction) > 0.0
+                else 0.0
+            )
     result["validation/batches"] = float(batch_count)
     result["validation/windows"] = float(window_count)
     return result
@@ -5107,6 +5146,11 @@ def set_vf_encoder_trainable(
 ) -> None:
     """Freeze only V's raw-observation encoder, never its value head."""
     vf.nets["encoder"].requires_grad_(bool(trainable))
+
+
+def set_actor_obs_encoder_trainable(actor_algo, trainable: bool) -> None:
+    """Freeze only the online actor encoder; U-Net and adapter keep training."""
+    actor_algo.nets["policy"]["obs_encoder"].requires_grad_(bool(trainable))
 
 
 def update_networks(
@@ -5977,6 +6021,9 @@ def checkpoint_payload(
         "actor_adapter_lr": float(args.actor_adapter_lr),
         "actor_unet_lr": float(args.actor_unet_lr),
         "actor_obs_encoder_lr": float(args.actor_obs_encoder_lr),
+        "actor_obs_encoder_freeze_steps": int(
+            args.actor_obs_encoder_freeze_steps
+        ),
         "actor_reference_weight": float(args.actor_reference_weight),
         "actor_reference_batch_fraction": float(
             args.actor_reference_batch_fraction
@@ -5990,6 +6037,9 @@ def checkpoint_payload(
         "vf_lr": float(args.vf_lr),
         "actor_frozen": bool(not trains_joint_actor(args)),
         "actor_encoder_trainable": bool(trains_joint_actor(args)),
+        "actor_encoder_trainable_after_warmup": bool(
+            trains_joint_actor(args)
+        ),
         "actor_ema_optimization_step": int(actor_ema_optimization_step),
         "global_samples_seen": int(global_samples_seen),
         "rng_state": (
@@ -6173,6 +6223,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     f"{field}={requested_value}"
                 )
         if saved_initialization in JOINT_ACTOR_INITIALIZATIONS:
+            saved_actor_encoder_freeze = int(
+                saved_args.get("actor_obs_encoder_freeze_steps", 0)
+            )
+            if saved_actor_encoder_freeze != int(
+                args.actor_obs_encoder_freeze_steps
+            ):
+                raise ValueError(
+                    "resume actor_obs_encoder_freeze_steps="
+                    f"{saved_actor_encoder_freeze} does not match requested "
+                    "actor_obs_encoder_freeze_steps="
+                    f"{args.actor_obs_encoder_freeze_steps}"
+                )
             saved_actor_scheduler = str(
                 saved_args.get("actor_lr_scheduler", "constant")
             )
@@ -6628,13 +6690,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     *[
                         (f"resolved_{field}", int)
                         for field in SAMPLE_SCALED_STEP_FIELDS
+                        if field != "actor_obs_encoder_freeze_steps"
                     ],
                     ("resolved_dynamics_target_sync_interval", int),
                     ("resolved_target_tau", float),
                 ]
             )
         if trains_joint_actor(args):
-            schedule_fields.append(("actor_lr_total_steps", int))
+            schedule_fields.extend(
+                [
+                    ("actor_lr_total_steps", int),
+                    ("resolved_actor_obs_encoder_freeze_steps", int),
+                ]
+            )
         for field, cast in schedule_fields:
             if field in saved_args:
                 saved_raw_value = saved_args[field]
@@ -7538,6 +7606,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "frequency_epochs": 1,
                 "coverage": "all_held_out_windows",
                 "execution": "rank_zero_only_no_parameter_updates",
+                "actor_weights": "exponential_moving_average",
                 "seed": int(args.validation_seed),
                 "num_batches": (
                     int(len(validation_loader))
@@ -7681,6 +7750,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "actor_adapter_lr": float(args.actor_adapter_lr),
             "actor_unet_lr": float(args.actor_unet_lr),
             "actor_obs_encoder_lr": float(args.actor_obs_encoder_lr),
+            "actor_obs_encoder_freeze_steps": int(
+                args.actor_obs_encoder_freeze_steps
+            ),
             "actor_optimizer_type": ACTOR_OPTIMIZER_TYPE,
             "actor_weight_decay": ACTOR_WEIGHT_DECAY,
             "actor_reference_weight": float(args.actor_reference_weight),
@@ -7836,6 +7908,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 validate=not shared_action_range_validated,
             )
             shared_action_range_validated = True
+            actor_obs_encoder_trainable = False
+            if trains_joint_actor(args):
+                actor_obs_encoder_trainable = global_step >= int(
+                    args.resolved_actor_obs_encoder_freeze_steps
+                )
+                set_actor_obs_encoder_trainable(
+                    actor_algo,
+                    actor_obs_encoder_trainable,
+                )
 
             # NOTE: the actor-only mode is only used to trained the recap-like conditional 
             # diffusion actor. The critic and value function are not trained in this mode.
@@ -7854,6 +7935,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 actor_info: dict[str, Any] = {
                     "actor/data_rows": float(raw_batch["actions"].shape[0]),
                     "actor/conditioned": 1.0,
+                    "actor/obs_encoder_trainable": float(
+                        actor_obs_encoder_trainable
+                    ),
                     "actor/condition_mean": condition_labels.mean(),
                     "actor/zero_condition_fraction": (
                         (condition_labels < 0.5).float().mean()
@@ -8048,6 +8132,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 actor_info = {
                     "actor/data_rows": float(actor_row_count),
                     "actor/conditioned": float(args.conditioned_actor),
+                    "actor/obs_encoder_trainable": float(
+                        actor_obs_encoder_trainable
+                    ),
                 }
                 if args.conditioned_actor:
                     actor_info.update(
@@ -8509,6 +8596,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--actor-adapter-lr", type=float, default=1e-4)
     parser.add_argument("--actor-unet-lr", type=float, default=1e-4)
     parser.add_argument("--actor-obs-encoder-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--actor-obs-encoder-freeze-steps",
+        type=int,
+        default=0,
+        help=(
+            "Reference-batch optimizer steps that train the actor adapter and "
+            "U-Net while keeping the online actor observation encoder frozen."
+        ),
+    )
     parser.add_argument("--actor-reference-weight", type=float, default=0.0)
     parser.add_argument(
         "--actor-reference-batch-fraction",
@@ -8762,6 +8858,7 @@ def main() -> None:
         parser.error("critic-hidden-dims must all be positive")
     for name in (
         "actor_lr_warmup_steps",
+        "actor_obs_encoder_freeze_steps",
         "critic_vf_lr_warmup_steps",
         "dynamics_warmup_steps",
         "encoder_freeze_steps",
