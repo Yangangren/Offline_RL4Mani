@@ -18,44 +18,48 @@ case "$TASK" in
     TASK_DP_CHECKPOINT=trained_models/square_rgb_dp/square_ph_rgb_dp_official_s1/models/model_epoch_200.pth
     TASK_DEMO_DATASET=datasets/square/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/square_rgb_dp/epoch190_collection/square_rgb_dp_rollouts_rgb2.hdf5
-    TASK_FAILURE_MASK=failure_50
-    TASK_FAILURE_COUNT=50
-    TASK_GT_CHUNKS=rollouts/square_rgb_dp/epoch190_collection/square_rgb_dp_gt_good_failure_chunks.hdf5
-    TASK_OUTPUT_DIR=trained_models/square_rgb_dp/gt_good_failure_imitation/200demo_100success_50failure
-    TASK_EVAL_OUTPUT=rollouts/square_rgb_dp/gt_good_failure_imitation/200demo_100success_50failure
+    TASK_SUCCESS_COUNT=406
+    TASK_FAILURE_MASK=failure
+    TASK_FAILURE_COUNT=94
+    TASK_GT_CHUNKS=rollouts/square_rgb_dp/epoch190_collection/square_rgb_dp_gt_good_failure_chunks_all_failures.hdf5
+    TASK_OUTPUT_DIR=trained_models/square_rgb_dp/gt_good_failure_imitation/200demo_406success_good_segments_from_94failures
+    TASK_EVAL_OUTPUT=rollouts/square_rgb_dp/gt_good_failure_imitation/200demo_406success_good_segments_from_94failures
     TASK_HORIZON=400
     ;;
   can)
     TASK_DP_CHECKPOINT=trained_models/can_rgb_dp/can_ph_rgb_dp_official_s1/models/model_epoch_50.pth
     TASK_DEMO_DATASET=datasets/can/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/can_rgb_dp/epoch50_collection/can_rgb_dp_rollouts_rgb2.hdf5
+    TASK_SUCCESS_COUNT=467
     TASK_FAILURE_MASK=failure
     TASK_FAILURE_COUNT=33
-    TASK_GT_CHUNKS=rollouts/can_rgb_dp/epoch50_collection/can_rgb_dp_gt_good_failure_chunks.hdf5
-    TASK_OUTPUT_DIR=trained_models/can_rgb_dp/gt_good_failure_imitation/200demo_100success_33failure
-    TASK_EVAL_OUTPUT=rollouts/can_rgb_dp/gt_good_failure_imitation/200demo_100success_33failure
+    TASK_GT_CHUNKS=rollouts/can_rgb_dp/epoch50_collection/can_rgb_dp_gt_good_failure_chunks_all_failures.hdf5
+    TASK_OUTPUT_DIR=trained_models/can_rgb_dp/gt_good_failure_imitation/200demo_467success_good_segments_from_33failures
+    TASK_EVAL_OUTPUT=rollouts/can_rgb_dp/gt_good_failure_imitation/200demo_467success_good_segments_from_33failures
     TASK_HORIZON=400
     ;;
   transport)
     TASK_DP_CHECKPOINT=trained_models/transport_rgb_dp/transport_ph_rgb_dp_official_s1/models/model_epoch_200.pth
     TASK_DEMO_DATASET=datasets/transport/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/transport_rgb_dp/epoch200_collection/transport_rgb_dp_rollouts_rgb4.hdf5
-    TASK_FAILURE_MASK=failure_50
-    TASK_FAILURE_COUNT=50
-    TASK_GT_CHUNKS=rollouts/transport_rgb_dp/epoch200_collection/transport_rgb_dp_gt_good_failure_chunks.hdf5
-    TASK_OUTPUT_DIR=trained_models/transport_rgb_dp/gt_good_failure_imitation/200demo_100success_50failure
-    TASK_EVAL_OUTPUT=rollouts/transport_rgb_dp/gt_good_failure_imitation/200demo_100success_50failure
+    TASK_SUCCESS_COUNT=422
+    TASK_FAILURE_MASK=failure
+    TASK_FAILURE_COUNT=78
+    TASK_GT_CHUNKS=rollouts/transport_rgb_dp/epoch200_collection/transport_rgb_dp_gt_good_failure_chunks_all_failures.hdf5
+    TASK_OUTPUT_DIR=trained_models/transport_rgb_dp/gt_good_failure_imitation/200demo_422success_good_segments_from_78failures
+    TASK_EVAL_OUTPUT=rollouts/transport_rgb_dp/gt_good_failure_imitation/200demo_422success_good_segments_from_78failures
     TASK_HORIZON=700
     ;;
   tool_hang)
     TASK_DP_CHECKPOINT=trained_models/tool_hang_rgb_dp/tool_hang_ph_rgb_dp_official_s1/models/model_epoch_200.pth
     TASK_DEMO_DATASET=datasets/tool_hang/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/tool_hang_rgb_dp/epoch200_collection/tool_hang_rgb_dp_rollouts_rgb2.hdf5
-    TASK_FAILURE_MASK=failure_50
-    TASK_FAILURE_COUNT=50
-    TASK_GT_CHUNKS=rollouts/tool_hang_rgb_dp/epoch200_collection/tool_hang_rgb_dp_gt_good_failure_chunks.hdf5
-    TASK_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/gt_good_failure_imitation/200demo_100success_50failure
-    TASK_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/gt_good_failure_imitation/200demo_100success_50failure
+    TASK_SUCCESS_COUNT=132
+    TASK_FAILURE_MASK=failure
+    TASK_FAILURE_COUNT=168
+    TASK_GT_CHUNKS=rollouts/tool_hang_rgb_dp/epoch200_collection/tool_hang_rgb_dp_gt_good_failure_chunks_all_failures.hdf5
+    TASK_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/gt_good_failure_imitation/200demo_132success_good_segments_from_168failures
+    TASK_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/gt_good_failure_imitation/200demo_132success_good_segments_from_168failures
     TASK_HORIZON=700
     ;;
   *)
@@ -74,7 +78,8 @@ PYTHON=${ROBOMIMIC_PYTHON:-/home/ryan/miniconda3/envs/robomimic_stable/bin/pytho
 DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
 DEMO_DATASET=${DEMO_DATASET:-$TASK_DEMO_DATASET}
 ROLLOUT_DATASET=${ROLLOUT_DATASET:-$TASK_ROLLOUT_DATASET}
-SUCCESS_MASK=${SUCCESS_MASK:-success_100}
+SUCCESS_MASK=${SUCCESS_MASK:-success}
+SUCCESS_COUNT=${SUCCESS_COUNT:-$TASK_SUCCESS_COUNT}
 FAILURE_MASK=${FAILURE_MASK:-$TASK_FAILURE_MASK}
 FAILURE_COUNT=${FAILURE_COUNT:-$TASK_FAILURE_COUNT}
 GT_GOOD_FAILURE_CHUNKS=${GT_GOOD_FAILURE_CHUNKS:-$TASK_GT_CHUNKS}
@@ -102,6 +107,8 @@ validate_chunks() {
     "$TASK" \
     "$SUCCESS_MASK" \
     "$FAILURE_MASK" \
+    "$SUCCESS_COUNT" \
+    "$FAILURE_COUNT" \
     "${GT_GOOD_PREDICTION_HORIZON:-16}" \
     "$EXPECTED_FILTER_VERSION" <<'PYCHECK'
 import sys
@@ -115,16 +122,34 @@ import h5py
     task,
     success_mask,
     failure_mask,
+    success_count,
+    failure_count,
     prediction_horizon,
     filter_version,
 ) = sys.argv[1:]
 artifact_path = Path(artifact).expanduser().resolve()
 if not artifact_path.is_file():
     raise FileNotFoundError(artifact_path)
+source_path = Path(source).expanduser().resolve()
+with h5py.File(source_path, "r") as source_handle:
+    expected_mask_counts = {
+        success_mask: int(success_count),
+        failure_mask: int(failure_count),
+    }
+    for mask, expected_count in expected_mask_counts.items():
+        mask_key = f"mask/{mask}"
+        if mask_key not in source_handle:
+            raise KeyError(f"{source_path} has no {mask_key}")
+        actual_count = len(source_handle[mask_key])
+        if actual_count != expected_count:
+            raise ValueError(
+                f"{source_path} {mask_key} contains {actual_count} rollouts; "
+                f"expected {expected_count}"
+            )
 with h5py.File(artifact_path, "r") as handle:
     expected = {
         "task": task,
-        "source_path": str(Path(source).expanduser().resolve()),
+        "source_path": str(source_path),
         "source_success_mask": success_mask,
         "source_failure_mask": failure_mask,
         "prediction_horizon": int(prediction_horizon),
@@ -270,6 +295,8 @@ ensure_chunks() {
 
 run_imitation() {
   local stage=$1
+  # Merge human demos, all successes, and retained failure chunks into one
+  # sequence-level uniform sample pool. The three weights are inclusion flags.
   AUTO_PREPARE_FILTERS=0 \
   DP_CHECKPOINT="$DP_CHECKPOINT" \
   DEMO_DATASET="$DEMO_DATASET" \
@@ -279,19 +306,20 @@ run_imitation() {
   SUCCESS_FILTER_KEY="$SUCCESS_MASK" \
   MIXED_IMITATION_SUCCESS_FILTER_KEY="$SUCCESS_MASK" \
   MIXED_IMITATION_FAILURE_FILTER_KEY=gt_good_failure \
+  SUCCESS_FILTER_SIZE="$SUCCESS_COUNT" \
   FAILURE_FILTER_SIZE="$FAILURE_COUNT" \
   MIXED_IMITATION_FAILURE_DEMO_START_ONLY=1 \
   MIXED_IMITATION_FAILURE_SAMPLE_START_OFFSET=1 \
   MIXED_IMITATION_FAILURE_ANTI_FAILURE_LABEL=0.0 \
-  ACTOR_UNIFORM_SAMPLE_POOL="${GT_GOOD_ACTOR_UNIFORM_SAMPLE_POOL:-0}" \
-  ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE="${GT_GOOD_ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE:-1}" \
-  MIXED_IMITATION_DEMO_WEIGHT="${GT_GOOD_IMITATION_DEMO_WEIGHT:-1.0}" \
-  MIXED_IMITATION_SUCCESS_WEIGHT="${GT_GOOD_IMITATION_SUCCESS_WEIGHT:-1.0}" \
-  MIXED_IMITATION_FAILURE_WEIGHT="${GT_GOOD_IMITATION_FAILURE_WEIGHT:-0.02}" \
+  ACTOR_UNIFORM_SAMPLE_POOL=1 \
+  ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE=0 \
+  MIXED_IMITATION_DEMO_WEIGHT=1.0 \
+  MIXED_IMITATION_SUCCESS_WEIGHT=1.0 \
+  MIXED_IMITATION_FAILURE_WEIGHT=1.0 \
   MIXED_IMITATION_OUTPUT_DIR="$GT_GOOD_FAILURE_OUTPUT_DIR" \
   IMITATION_OUTPUT_DIR="$GT_GOOD_FAILURE_OUTPUT_DIR" \
-  MIXED_IMITATION_MODE_NAME=gt_good_failure_mixed_imitation_learning \
-  MIXED_IMITATION_EXPERIMENT_NAME="${TASK}_rgb_dp_gt_good_failure_imitation" \
+  MIXED_IMITATION_MODE_NAME=gt_good_failure_imitation_learning \
+  MIXED_IMITATION_EXPERIMENT_NAME="${TASK}_rgb_dp_gt_good_failure_all_rollouts_imitation" \
   EVAL_OUTPUT="$EVAL_OUTPUT" \
   HORIZON="$HORIZON" \
   ./run_rgb_dp_mixed_imitation.sh "$TASK" "$stage"
