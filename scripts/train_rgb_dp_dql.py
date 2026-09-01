@@ -32,19 +32,23 @@ import robomimic.utils.torch_utils as TorchUtils
 
 from train_rgb_dp_idql import (
     REWARD_DEFINITIONS,
+    TEMPORAL_CRITIC_ARCHITECTURE,
+    TEMPORAL_ONE_STEP_MARKER,
     action_normalization_stats_match,
     actor_trainability,
     align_shared_batch_actions,
     atomic_torch_save,
     batch_scaled_step_count,
     build_single_loader,
+    configure_critic_targets,
     configure_actor_optimizer,
+    copy_deployed_encoder_state,
     dataset_audit,
     initialize_actor_from_deployed_ema,
     jsonable,
+    make_temporal_one_step_value_networks,
     make_tensorboard_writer,
     make_step_lr_scheduler,
-    mean_metrics,
     parameter_count,
     replace_with_hardlink,
     RiseLateFusionMLP,
@@ -58,10 +62,8 @@ from rgb_dp_distributed import (
     all_reduce_gradients,
     broadcast_module_buffers,
     broadcast_module_state,
-    capture_process_rng_state,
     gather_rank_runtime_states,
     initialize_distributed,
-    mean_distributed_scalars,
     modules_have_mutable_batch_norm,
     restore_process_rng_state,
     seed_process,
@@ -71,7 +73,7 @@ from rgb_dp_distributed import (
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = (
     ROOT
-    / "datasets/square/idql/square_rgb_dp_idql_200demo_100success_50failure_task_reward.hdf5"
+    / "datasets/square/idql/square_rgb_dp_idql_200demo_406success_94failure_terminal_success.hdf5"
 )
 DEFAULT_CHECKPOINT = (
     ROOT
@@ -79,7 +81,7 @@ DEFAULT_CHECKPOINT = (
 )
 DEFAULT_OUTPUT = (
     ROOT
-    / "trained_models/square_rgb_dp/dql/200demo_100success_50failure_task_reward"
+    / "trained_models/square_rgb_dp/dql/200demo_406success_94failure_terminal_success_reward"
 )
 
 
@@ -238,6 +240,88 @@ def make_dql_value_networks(
     return critics, targets, None
 
 
+def make_dql_rise_v2_value_networks(
+    actor_algo,
+    *,
+    hidden_dims: tuple[int, ...],
+    latent_dim: int,
+    action_hidden_dim: int,
+    num_attention_heads: int,
+    num_action_conv_layers: int,
+    dropout: float,
+    num_critics: int,
+    critic_group_norm: bool,
+    late_fusion_key: str | None,
+    observation_horizon: int,
+    temporal_num_layers: int,
+    temporal_num_heads: int,
+    temporal_feedforward_dim: int,
+    temporal_dropout: float,
+    fusion_mode: str,
+) -> tuple[nn.ModuleList, nn.ModuleList, list[dict[str, int]]]:
+    """Build the same two-frame RISE-v2 Q architecture used by IDQL."""
+    critics, unused_targets, unused_vf = make_temporal_one_step_value_networks(
+        actor_algo,
+        hidden_dims=hidden_dims,
+        latent_dim=int(latent_dim),
+        action_hidden_dim=int(action_hidden_dim),
+        num_attention_heads=int(num_attention_heads),
+        num_action_conv_layers=int(num_action_conv_layers),
+        dropout=float(dropout),
+        num_critics=int(num_critics),
+        critic_group_norm=bool(critic_group_norm),
+        late_fusion_key=late_fusion_key,
+        observation_horizon=int(observation_horizon),
+        temporal_num_layers=int(temporal_num_layers),
+        temporal_num_heads=int(temporal_num_heads),
+        temporal_feedforward_dim=int(temporal_feedforward_dim),
+        temporal_dropout=float(temporal_dropout),
+        fusion_mode=str(fusion_mode),
+        dynamics_enabled=False,
+    )
+    del unused_targets, unused_vf
+    encoder_initialization = [
+        copy_deployed_encoder_state(critic, actor_algo) for critic in critics
+    ]
+    targets = copy.deepcopy(critics)
+    configure_critic_targets(targets)
+    return critics, targets, encoder_initialization
+
+
+def make_dql_critic_optimizer(
+    critics: nn.ModuleList,
+    *,
+    learning_rate: float,
+    encoder_learning_rate: float,
+) -> torch.optim.Optimizer:
+    """Use the IDQL learning-rate split for every independent RISE-v2 Q."""
+    encoder_parameters = [
+        parameter
+        for critic in critics
+        for parameter in critic.nets["encoder"].parameters()
+    ]
+    encoder_ids = {id(parameter) for parameter in encoder_parameters}
+    other_parameters = [
+        parameter
+        for parameter in critics.parameters()
+        if id(parameter) not in encoder_ids
+    ]
+    return torch.optim.Adam(
+        [
+            {
+                "params": other_parameters,
+                "lr": float(learning_rate),
+                "group_name": "critic",
+            },
+            {
+                "params": encoder_parameters,
+                "lr": float(encoder_learning_rate),
+                "group_name": "encoder",
+            },
+        ]
+    )
+
+
 @contextmanager
 def evaluating(module: nn.Module):
     """Temporarily use inference-mode normalization without disabling autograd."""
@@ -289,19 +373,32 @@ def process_dql_critic_batch(
     raw_batch: dict,
     actor_algo,
     obs_normalization_stats,
+    *,
+    critic_observation_horizon: int = 2,
+    validate_actions: bool = True,
 ) -> dict:
-    """Extract an aligned one-step transition with the full DP state stack."""
-    observation_horizon = int(
+    """Extract an aligned two-frame transition for the RISE-v2 DQL critic."""
+    actor_observation_horizon = int(
         actor_algo.algo_config.horizon.observation_horizon
     )
-    current_index = observation_horizon - 1
+    current_index = actor_observation_horizon - 1
+    critic_observation_horizon = int(critic_observation_horizon)
+    history_start = current_index - critic_observation_horizon + 1
+    if history_start < 0:
+        raise ValueError(
+            "critic observation horizon exceeds the actor observation history"
+        )
     critic_batch = {
         "obs": {
-            key: raw_batch["obs"][key][:, :observation_horizon]
+            key: raw_batch["obs"][key][
+                :, history_start : current_index + 1
+            ]
             for key in actor_algo.obs_shapes
         },
         "next_obs": {
-            key: raw_batch["next_obs"][key][:, :observation_horizon]
+            key: raw_batch["next_obs"][key][
+                :, :critic_observation_horizon
+            ]
             for key in actor_algo.obs_shapes
         },
         "actions": raw_batch["actions"][:, current_index],
@@ -324,18 +421,29 @@ def process_dql_critic_batch(
             "DQL critic requires single-step actions [B, action_dim], got "
             f"{tuple(actions.shape)}"
         )
-    if not torch.isfinite(actions).all():
-        raise ValueError("DQL critic actions contain non-finite values")
-    tolerance = 1e-3
-    action_min = float(actions.min())
-    action_max = float(actions.max())
-    if action_min < -1.0 - tolerance or action_max > 1.0 + tolerance:
+    if validate_actions:
+        if not torch.isfinite(actions).all():
+            raise ValueError("DQL critic actions contain non-finite values")
+        tolerance = 1e-3
+        action_min = float(actions.min())
+        action_max = float(actions.max())
+        if action_min < -1.0 - tolerance or action_max > 1.0 + tolerance:
+            raise ValueError(
+                "DQL critic actions are outside the pretrained DP normalized space: "
+                f"min={action_min:.6f}, max={action_max:.6f}"
+            )
+    critic_batch["actions"] = actions.clamp(-1.0, 1.0)
+    invalid_history = {
+        f"{group}/{key}": tuple(value.shape)
+        for group in ("obs", "next_obs")
+        for key, value in critic_batch[group].items()
+        if int(value.shape[1]) != critic_observation_horizon
+    }
+    if invalid_history:
         raise ValueError(
-            "DQL critic actions are outside the pretrained DP normalized space: "
-            f"min={action_min:.6f}, max={action_max:.6f}"
+            "DQL critic observations have the wrong temporal history: "
+            f"{invalid_history}"
         )
-    if action_min < -1.0 or action_max > 1.0:
-        critic_batch["actions"] = actions.clamp(-1.0, 1.0)
     return critic_batch
 
 
@@ -592,19 +700,13 @@ def compute_critic_loss(
 def choose_q_values(
     predictions: list[torch.Tensor],
     q_head: str,
-    distributed_context: DistributedContext | None = None,
 ) -> tuple[torch.Tensor, int]:
     if q_head == "min":
         return torch.cat(predictions, dim=1).min(dim=1, keepdim=True).values, -1
     if q_head == "random":
-        index_tensor = torch.randint(
-            len(predictions),
-            (),
-            device=predictions[0].device,
-        )
-        if distributed_context is not None and distributed_context.enabled:
-            dist.broadcast(index_tensor, src=0)
-        index = int(index_tensor)
+        # Rank-local head sampling is ordinary data-parallel stochasticity. A
+        # broadcast here needlessly serialized every actor update.
+        index = int(np.random.randint(len(predictions)))
     else:
         index = int(q_head.removeprefix("q")) - 1
         if not 0 <= index < len(predictions):
@@ -621,13 +723,11 @@ def diffusion_q_loss(
     critics: nn.ModuleList,
     actor_observations: dict[str, torch.Tensor],
     critic_observations: dict[str, torch.Tensor],
-    dataset_actions: torch.Tensor,
     goal_observations,
     num_inference_steps: int,
     q_head: str,
     denominator_floor: float,
     clip_actions: bool,
-    distributed_context: DistributedContext | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Official Diffusion-QL cross-head normalized policy-improvement loss."""
     chunks = sample_action_chunks(
@@ -652,7 +752,6 @@ def diffusion_q_loss(
         policy_q, head_index = choose_q_values(
             policy_predictions,
             q_head,
-            distributed_context=distributed_context,
         )
         with torch.no_grad():
             if head_index < 0:
@@ -663,21 +762,7 @@ def diffusion_q_loss(
                 other_index = (head_index + 1) % len(policy_predictions)
                 normalization_q = policy_predictions[other_index]
             denominator = normalization_q.abs().mean()
-            if distributed_context is not None and distributed_context.enabled:
-                dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
-                denominator.mul_(1.0 / float(distributed_context.world_size))
             denominator.clamp_min_(float(denominator_floor))
-            dataset_predictions = [
-                critic(
-                    obs_dict=critic_observations,
-                    acts=dataset_actions,
-                    goal_dict=goal_observations,
-                )
-                for critic in critics
-            ]
-            dataset_q = torch.cat(dataset_predictions, dim=1).min(
-                dim=1, keepdim=True
-            ).values
         q_loss = -policy_q.mean() / denominator
     finally:
         restore_requires_grad(critics, previous_grad_state)
@@ -685,7 +770,6 @@ def diffusion_q_loss(
     return q_loss, {
         "actor/q_loss": q_loss.detach(),
         "actor/policy_q_mean": policy_q.mean().detach(),
-        "actor/dataset_abs_q_mean": dataset_q.abs().mean().detach(),
         "actor/normalization_q_abs_mean": normalization_q.abs().mean().detach(),
         "actor/q_denominator": denominator.detach(),
         "actor/q_head_index": policy_q.new_tensor(float(head_index)),
@@ -701,7 +785,6 @@ def actor_train_step(
     critic_batch: dict,
     args: argparse.Namespace,
     global_step: int,
-    distributed_context: DistributedContext | None = None,
     gradient_sync_fn=None,
     defer_scalar_conversion: bool = False,
 ) -> dict[str, Any]:
@@ -733,13 +816,11 @@ def actor_train_step(
                 critic_batch["obs"],
                 q_batch_size,
             ),
-            dataset_actions=critic_batch["actions"][:q_batch_size],
             goal_observations=goal_observations,
             num_inference_steps=int(args.dql_num_inference_steps),
             q_head=str(args.dql_q_head),
             denominator_floor=float(args.dql_q_denominator_floor),
             clip_actions=bool(args.dql_clip_actions),
-            distributed_context=distributed_context,
         )
 
     active_eta = float(args.dql_eta) if q_guidance_active else 0.0
@@ -807,183 +888,64 @@ def soft_update_targets(
                     target_buffer.copy_(source_buffer)
 
 
-def make_train_validation_loaders(
-    dataset,
-    args: argparse.Namespace,
-    loader_generator: torch.Generator,
-    distributed_context: DistributedContext | None = None,
-):
-    """Create a fixed episode-level validation view of the shared dataset."""
-    validation_fraction = float(args.validation_fraction)
-    if not 0.0 <= validation_fraction < 1.0:
-        raise ValueError("validation_fraction must be in [0, 1)")
-    if validation_fraction == 0.0:
-        return None, None, {
-            "validation_fraction": 0.0,
-            "validation_is_held_out": False,
-            "train_transitions": int(len(dataset)),
-            "validation_transitions": 0,
-            "train_episodes": int(len(dataset.demos)),
-            "validation_episodes": 0,
-        }
+def _local_scalar_tensor(value: Any, device: torch.device) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(f"metric is not scalar: {tuple(value.shape)}")
+        return value.detach().reshape(()).to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+    scalar = torch.as_tensor(value, device=device, dtype=torch.float32)
+    if scalar.numel() != 1:
+        raise ValueError(f"metric is not scalar: {tuple(scalar.shape)}")
+    return scalar.reshape(())
 
-    demos = list(dataset.demos)
-    if len(demos) < 2:
-        raise ValueError("episode-level validation requires at least two episodes")
-    split_rng = np.random.RandomState(int(args.seed) + 1701)
-    shuffled = list(demos)
-    split_rng.shuffle(shuffled)
-    validation_count = min(
-        len(shuffled) - 1,
-        max(1, int(round(validation_fraction * len(shuffled)))),
-    )
-    validation_demos = set(shuffled[:validation_count])
-    validation_indices = []
-    for index in range(len(dataset)):
-        demo = dataset._index_to_demo_id[index]
-        if demo in validation_demos:
-            validation_indices.append(index)
-    if bool(args.validation_holdout):
-        train_indices = [
-            index
-            for index in range(len(dataset))
-            if dataset._index_to_demo_id[index] not in validation_demos
-        ]
-    else:
-        # Default: preserve the exact all-transition training set shared by
-        # DQL, IDQL, and chunked IDQL. The validation view is diagnostic.
-        train_indices = list(range(len(dataset)))
-    if not train_indices or not validation_indices:
-        raise RuntimeError("episode-level train/validation split is empty")
 
-    loader_kwargs: dict[str, Any] = {}
-    if int(args.num_workers) > 0:
-        loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
-        loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
-    common = {
-        "batch_size": int(args.batch_size),
-        "num_workers": int(args.num_workers),
-        "pin_memory": bool(args.pin_memory and args.device == "cuda"),
-        **loader_kwargs,
-    }
-    train_dataset = torch.utils.data.Subset(dataset, train_indices)
-    distributed_enabled = bool(
-        distributed_context is not None and distributed_context.enabled
-    )
-    train_sampler = None
-    if distributed_enabled:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_dataset,
-            num_replicas=int(distributed_context.world_size),
-            rank=int(distributed_context.rank),
-            shuffle=True,
-            seed=int(args.seed),
-            drop_last=False,
-        )
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        drop_last=(
-            len(train_sampler)
-            if train_sampler is not None
-            else len(train_indices)
-        )
-        >= int(args.batch_size),
-        generator=loader_generator,
-        **common,
-    )
-    validation_loader = None
-    if not distributed_enabled or distributed_context.is_main_process:
-        validation_loader = torch.utils.data.DataLoader(
-            torch.utils.data.Subset(dataset, validation_indices),
-            shuffle=False,
-            drop_last=False,
-            **common,
-        )
-    return train_loader, validation_loader, {
-        "validation_fraction": validation_fraction,
-        "split_unit": "episode",
-        "split_seed": int(args.seed) + 1701,
-        "validation_is_held_out": bool(args.validation_holdout),
-        "train_transitions": int(len(train_indices)),
-        "validation_transitions": int(len(validation_indices)),
-        "train_episodes": int(
-            len(demos) - validation_count
-            if bool(args.validation_holdout)
-            else len(demos)
-        ),
-        "validation_episodes": int(validation_count),
-        "distributed_training_shards": (
-            int(distributed_context.world_size)
-            if distributed_enabled
-            else 1
-        ),
-        "validation_rank_zero_only": bool(distributed_enabled),
-    }
+class LocalScalarMetricAccumulator:
+    """Accumulate rank-zero epoch metrics without per-step host or rank sync."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.sums: dict[str, torch.Tensor] = {}
+        self.counts: dict[str, int] = {}
+
+    @torch.no_grad()
+    def update(self, metrics: dict[str, Any]) -> None:
+        for key, value in metrics.items():
+            scalar = _local_scalar_tensor(value, self.device)
+            if key in self.sums:
+                self.sums[key].add_(scalar)
+                self.counts[key] += 1
+            else:
+                self.sums[key] = scalar.clone()
+                self.counts[key] = 1
+
+    @torch.no_grad()
+    def means(self) -> dict[str, float]:
+        if not self.sums:
+            return {}
+        keys = sorted(self.sums)
+        values = torch.stack(
+            [self.sums[key] / float(self.counts[key]) for key in keys]
+        ).cpu().tolist()
+        return {key: float(value) for key, value in zip(keys, values)}
 
 
 @torch.no_grad()
-def evaluate_critic_loader(
-    *,
-    loader,
-    actor_algo,
-    critics: nn.ModuleList,
-    critic_targets: nn.ModuleList,
-    obs_normalization_stats,
-    args: argparse.Namespace,
-    process_device: torch.device | None = None,
-) -> dict[str, float] | None:
-    if loader is None:
-        return None
-    critic_was_training = critics.training
-    critics.eval()
-    critic_targets.eval().requires_grad_(False)
-    records = []
-    saved_rng = (
-        capture_process_rng_state(process_device)
-        if process_device is not None
-        else rng_state()
-    )
-    try:
-        for batch_index, raw_batch in enumerate(loader):
-            if (
-                int(args.validation_batches) > 0
-                and batch_index >= int(args.validation_batches)
-            ):
-                break
-            raw_batch = align_shared_batch_actions(raw_batch)
-            critic_batch = process_dql_critic_batch(
-                raw_batch,
-                actor_algo,
-                obs_normalization_stats,
-            )
-            next_actor_observations = prepare_next_actor_observations(
-                actor_algo,
-                raw_batch,
-                obs_normalization_stats,
-            )
-            loss, info = compute_critic_loss(
-                actor_algo=actor_algo,
-                critics=critics,
-                critic_targets=critic_targets,
-                critic_batch=critic_batch,
-                next_actor_observations=next_actor_observations,
-                discount=float(args.discount),
-                use_huber=bool(args.use_huber),
-                num_inference_steps=int(args.dql_num_inference_steps),
-                num_target_candidates=int(args.dql_target_num_candidates),
-                clip_actions=bool(args.dql_clip_actions),
-            )
-            records.append(scalar_metrics({**info, "critic/loss": loss}))
-    finally:
-        if process_device is not None:
-            restore_process_rng_state(saved_rng, process_device)
-        else:
-            restore_rng_state(saved_rng)
-        critics.train(critic_was_training)
-        critic_targets.eval().requires_grad_(False)
-    return mean_metrics(records) if records else None
+def materialize_local_scalar_metrics(
+    metrics: dict[str, Any],
+    device: torch.device,
+) -> dict[str, float]:
+    """Transfer packed rank-local log scalars to the host only when logging."""
+    if not metrics:
+        return {}
+    keys = sorted(metrics)
+    values = torch.stack(
+        [_local_scalar_tensor(metrics[key], device) for key in keys]
+    ).cpu().tolist()
+    return {key: float(value) for key, value in zip(keys, values)}
 
 
 def dql_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
@@ -1002,7 +964,7 @@ def dql_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
         "robot_policy_adaptations": [
             "pretrained_rgb_diffusion_policy_initialization",
             "pretrained_groupnorm_critic_encoder_initialization",
-            "critic_uses_full_actor_observation_horizon",
+            "critic_uses_two_frame_RISE_v2_observation_history",
             "actor_predicts_a_chunk_but_q_scores_first_executable_action",
             (
                 "source_environment_task_reward"
@@ -1031,7 +993,6 @@ def checkpoint_payload(
     global_samples_seen: int,
     history: list[dict],
     loader_generator: torch.Generator,
-    best_validation_critic_loss: float,
     rank_runtime_states: list[dict[str, Any]] | None = None,
     distributed_context: DistributedContext | None = None,
 ) -> dict[str, Any]:
@@ -1044,10 +1005,11 @@ def checkpoint_payload(
         else 1
     )
     return {
-        "stacked_pretrained_dql_critic": True,
+        "stacked_pretrained_dql_critic": False,
         # Reuse the raw-RGB actor / critic evaluator shared with IDQL.
         "rise_style_rgb_idql": True,
         "rise_style_rgb_dql": True,
+        TEMPORAL_ONE_STEP_MARKER: True,
         "hybrid_dp_chunk_actor_iql": True,
         "visual_critic_idql": True,
         "actor_model": actor_algo.serialize(),
@@ -1064,7 +1026,6 @@ def checkpoint_payload(
         "step": int(global_step),
         "global_samples_seen": int(global_samples_seen),
         "history": history,
-        "best_validation_critic_loss": float(best_validation_critic_loss),
         "pretrained_dp_checkpoint": str(args.checkpoint),
         "task": str(args.task),
         "dataset": str(args.dataset),
@@ -1081,12 +1042,28 @@ def checkpoint_payload(
         "actor_training_objective": "diffusion_bc_plus_normalized_q_maximization",
         "actor_data_mode": "all_human_success_failure_rows",
         "critic_training_objective": "diffusion_ql_clipped_double_q_td",
-        "critic_input_mode": "independent_pretrained_dp_observation_encoders",
+        "critic_input_mode": "independent_causal_two_frame_temporal_encoders",
         "critic_action_space": "pretrained_dp_normalized_action_space",
         "critic_horizon": 1,
-        "critic_observation_horizon": int(
-            actor_algo.algo_config.horizon.observation_horizon
+        "critic_chunk_horizon": 1,
+        "critic_architecture": TEMPORAL_CRITIC_ARCHITECTURE,
+        "critic_observation_horizon": int(args.critic_observation_horizon),
+        "critic_latent_dim": int(args.latent_dim),
+        "critic_action_hidden_dim": int(args.action_hidden_dim),
+        "critic_num_attention_heads": int(args.num_attention_heads),
+        "critic_num_action_conv_layers": int(args.num_action_conv_layers),
+        "critic_dropout": float(args.dropout),
+        "critic_temporal_num_layers": int(args.temporal_num_layers),
+        "critic_temporal_num_heads": int(args.temporal_num_heads),
+        "critic_temporal_feedforward_dim": int(
+            args.temporal_feedforward_dim
         ),
+        "critic_temporal_dropout": float(args.temporal_dropout),
+        "critic_rise_v2_fusion_mode": str(args.rise_v2_fusion_mode),
+        "critic_dynamics_target_dim": int(critics[0].dynamics_target_dim),
+        "critic_dynamics_prediction_offsets": (),
+        "latent_dynamics": False,
+        "dynamics_weight": 0.0,
         "critic_encoder_initialized_from_pretrained_dp": True,
         "critic_target_mode": "eval",
         "critic_has_value_net": False,
@@ -1132,8 +1109,10 @@ def checkpoint_payload(
                 else "none"
             ),
             "gradient_sync": "mean_all_reduce_before_optimizer_step",
-            "random_q_head_sync": "rank_zero_broadcast",
-            "q_denominator_sync": "global_mean",
+            "unused_parameter_detection_collective": False,
+            "random_q_head_sync": "none_rank_local_sampling",
+            "q_denominator_sync": "none_rank_local_normalization",
+            "metric_sync": "none_rank_zero_local_logging",
         },
         "distributed_rank_states": rank_runtime_states,
     }
@@ -1152,6 +1131,17 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "schedule_reference_batch_size",
         "steps_per_epoch",
         "critic_hidden_dims",
+        "critic_observation_horizon",
+        "latent_dim",
+        "action_hidden_dim",
+        "num_attention_heads",
+        "num_action_conv_layers",
+        "dropout",
+        "temporal_num_layers",
+        "temporal_num_heads",
+        "temporal_feedforward_dim",
+        "temporal_dropout",
+        "rise_v2_fusion_mode",
         "num_critics",
         "critic_group_norm",
         "critic_late_fusion_key",
@@ -1159,6 +1149,7 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "target_tau",
         "actor_lr",
         "critic_lr",
+        "encoder_lr",
         "lr_scheduler",
         "lr_warmup_steps",
         "resolved_lr_warmup_steps",
@@ -1177,8 +1168,6 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "dql_actor_ema_update_every",
         "actor_max_gradient_norm",
         "critic_max_gradient_norm",
-        "validation_fraction",
-        "validation_holdout",
     )
     for key in exact_keys:
         if key not in previous:
@@ -1206,10 +1195,8 @@ def train(args: argparse.Namespace) -> dict:
         raise FileNotFoundError(args.checkpoint)
     if int(args.num_critics) < 2:
         raise ValueError("Diffusion-QL requires at least two critics")
-    if not bool(args.critic_group_norm):
-        raise ValueError(
-            "stable RGB DQL requires --critic-group-norm for every task"
-        )
+    if int(args.critic_observation_horizon) != 2:
+        raise ValueError("RISE-v2 DQL requires exactly two critic frames")
     if float(args.dql_eta) < 0.0:
         raise ValueError("dql_eta must be non-negative")
     if int(args.dql_q_batch_size) < 0:
@@ -1224,8 +1211,6 @@ def train(args: argparse.Namespace) -> dict:
         raise ValueError("dql_actor_ema_update_every must be positive")
     if distributed.is_main_process:
         args.output_dir.mkdir(parents=True, exist_ok=True)
-    if distributed.enabled:
-        dist.barrier()
 
     device = distributed.device
     # Build identical models before installing independent rank-local streams.
@@ -1241,21 +1226,11 @@ def train(args: argparse.Namespace) -> dict:
     if actor_algo.ema is not None and not initialized_from_ema:
         raise RuntimeError("failed to initialize actor from deployed EMA")
 
-    dataset, original_loader, loader_generator, _ = build_single_loader(
+    dataset, loader, loader_generator, _ = build_single_loader(
         args,
         actor_policy,
         dp_checkpoint,
     )
-    loader, validation_loader, split_audit = make_train_validation_loaders(
-        dataset,
-        args,
-        loader_generator,
-        distributed_context=distributed,
-    )
-    if loader is None:
-        loader = original_loader
-    else:
-        del original_loader
     if args.steps_per_epoch is None:
         args.steps_per_epoch = int(len(loader))
         args.steps_per_epoch_source = "auto_DataLoader_length"
@@ -1296,24 +1271,39 @@ def train(args: argparse.Namespace) -> dict:
         raise ValueError("pretrained DP checkpoint has no action normalization stats")
     obs_normalization_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
 
-    observation_horizon = int(
-        actor_algo.algo_config.horizon.observation_horizon
+    critics, critic_targets, encoder_initialization = (
+        make_dql_rise_v2_value_networks(
+            actor_algo,
+            hidden_dims=tuple(int(value) for value in args.critic_hidden_dims),
+            latent_dim=int(args.latent_dim),
+            action_hidden_dim=int(args.action_hidden_dim),
+            num_attention_heads=int(args.num_attention_heads),
+            num_action_conv_layers=int(args.num_action_conv_layers),
+            dropout=float(args.dropout),
+            num_critics=int(args.num_critics),
+            critic_group_norm=bool(args.critic_group_norm),
+            late_fusion_key=args.critic_late_fusion_key,
+            observation_horizon=int(args.critic_observation_horizon),
+            temporal_num_layers=int(args.temporal_num_layers),
+            temporal_num_heads=int(args.temporal_num_heads),
+            temporal_feedforward_dim=int(args.temporal_feedforward_dim),
+            temporal_dropout=float(args.temporal_dropout),
+            fusion_mode=str(args.rise_v2_fusion_mode),
+        )
     )
-    critics, critic_targets, unused_value_net = make_dql_value_networks(
-        actor_algo,
-        hidden_dims=tuple(int(value) for value in args.critic_hidden_dims),
-        observation_horizon=observation_horizon,
-        num_critics=int(args.num_critics),
-        late_fusion_key=args.critic_late_fusion_key,
-    )
-    del unused_value_net
     critics = critics.float().to(device)
     critic_targets = critic_targets.float().to(device)
-    critic_targets.requires_grad_(False)
-    critic_optimizer = torch.optim.Adam(
-        critics.parameters(),
-        lr=float(args.critic_lr),
+    configure_critic_targets(critic_targets)
+    critic_optimizer = make_dql_critic_optimizer(
+        critics,
+        learning_rate=float(args.critic_lr),
+        encoder_learning_rate=float(args.encoder_lr),
     )
+    critic_parameters = [
+        parameter
+        for group in critic_optimizer.param_groups
+        for parameter in group["params"]
+    ]
     critic_lr_scheduler = make_step_lr_scheduler(
         critic_optimizer,
         scheduler_type=args.lr_scheduler,
@@ -1326,7 +1316,6 @@ def train(args: argparse.Namespace) -> dict:
     global_step = 0
     global_samples_seen = 0
     history: list[dict] = []
-    best_validation_critic_loss = float("inf")
     if args.resume_checkpoint is not None:
         checkpoint = torch.load(
             args.resume_checkpoint,
@@ -1347,7 +1336,11 @@ def train(args: argparse.Namespace) -> dict:
                 f"{saved_distributed.get('world_size')} requested="
                 f"{distributed.world_size}"
             )
-        if not bool(checkpoint.get("stacked_pretrained_dql_critic", False)):
+        if (
+            not checkpoint.get(TEMPORAL_ONE_STEP_MARKER, False)
+            or checkpoint.get("critic_architecture")
+            != TEMPORAL_CRITIC_ARCHITECTURE
+        ):
             incompatibility = {
                 "resume_checkpoint": str(args.resume_checkpoint),
                 "reason": "critic architecture and stable DQL target semantics changed",
@@ -1358,7 +1351,7 @@ def train(args: argparse.Namespace) -> dict:
                     incompatibility,
                 )
             raise ValueError(
-                "cannot resume a pre-fix DQL checkpoint; use a new DQL_OUTPUT_DIR"
+                "cannot resume a pre-RISE-v2 DQL checkpoint; use a new DQL_OUTPUT_DIR"
             )
         validate_resume_args(args, checkpoint)
         checkpoint_action_stats = checkpoint.get("action_normalization_stats")
@@ -1397,9 +1390,6 @@ def train(args: argparse.Namespace) -> dict:
             )
         )
         history = list(checkpoint.get("history", []))
-        best_validation_critic_loss = float(
-            checkpoint.get("best_validation_critic_loss", float("inf"))
-        )
         rank_runtime_states = checkpoint.get("distributed_rank_states")
         if distributed.enabled and bool(saved_distributed.get("enabled", False)):
             if not isinstance(rank_runtime_states, (list, tuple)):
@@ -1440,7 +1430,7 @@ def train(args: argparse.Namespace) -> dict:
 
     actor_algo.set_train()
     critics.train()
-    critic_targets.eval().requires_grad_(False)
+    configure_critic_targets(critic_targets)
     synchronized_modules: list[nn.Module] = [
         actor_algo.nets,
         critics,
@@ -1455,6 +1445,9 @@ def train(args: argparse.Namespace) -> dict:
                 parameters,
                 distributed,
                 bucket_cap_mb=args.gradient_bucket_cap_mb,
+                # RISE-v2 Qs and the unconditioned DP actor use static graphs;
+                # every optimizer parameter participates on every update.
+                preserve_unused_parameters=False,
             )
         )
         if distributed.enabled
@@ -1467,7 +1460,8 @@ def train(args: argparse.Namespace) -> dict:
         seed_process(int(args.seed) + distributed.rank, device)
     trainability = actor_trainability(actor_algo)
     startup = {
-        "stacked_pretrained_dql_critic": True,
+        "stacked_pretrained_dql_critic": False,
+        "critic_architecture": TEMPORAL_CRITIC_ARCHITECTURE,
         "task": str(args.task),
         "dataset": audit,
         "data_routing": {
@@ -1475,7 +1469,6 @@ def train(args: argparse.Namespace) -> dict:
             "actor_rows": "all_human_success_failure",
             "critic_rows": "all_human_success_failure",
             "source_masking": False,
-            "split": split_audit,
         },
         "loader": {
             "class": dataset.__class__.__name__,
@@ -1485,8 +1478,7 @@ def train(args: argparse.Namespace) -> dict:
                 if args.sparse_dql_loader
                 else "full_obs_and_next_obs_sequences"
             ),
-            "num_loaders": int(distributed.world_size)
-            + int(validation_loader is not None),
+            "num_loaders": int(distributed.world_size),
             "sampler": loader.sampler.__class__.__name__,
             "batch_size": int(args.batch_size),
             "batch_size_per_rank": int(args.batch_size),
@@ -1539,12 +1531,18 @@ def train(args: argparse.Namespace) -> dict:
             "target_critic_parameter_counts": [
                 parameter_count(target) for target in critic_targets
             ],
-            "independent_raw_obs_encoders": False,
+            "independent_raw_obs_encoders": True,
             "independent_pretrained_dp_obs_encoders": True,
             "critic_encoder_initialized_from_pretrained_dp": True,
-            "critic_observation_horizon": observation_horizon,
-            "critic_normalization": "group_norm_from_pretrained_dp",
-            "critic_group_norm": True,
+            "critic_encoder_initialization": encoder_initialization,
+            "critic_architecture": TEMPORAL_CRITIC_ARCHITECTURE,
+            "critic_observation_horizon": int(
+                args.critic_observation_horizon
+            ),
+            "causal_temporal_trunk": True,
+            "state_action_fusion": str(args.rise_v2_fusion_mode),
+            "critic_normalization": "RISE_v2_with_deployed_encoder_GN",
+            "critic_group_norm": bool(args.critic_group_norm),
             "target_critic_mode": "eval",
             "critic_late_fusion_key": args.critic_late_fusion_key,
         },
@@ -1556,6 +1554,7 @@ def train(args: argparse.Namespace) -> dict:
             "target_tau": float(args.target_tau),
             "actor_lr": float(args.actor_lr),
             "critic_lr": float(args.critic_lr),
+            "encoder_lr": float(args.encoder_lr),
             "dql_eta": float(args.dql_eta),
             "dql_bc_weight": float(args.dql_bc_weight),
             "dql_q_batch_size": int(args.dql_q_batch_size),
@@ -1584,13 +1583,15 @@ def train(args: argparse.Namespace) -> dict:
             "backend": distributed.backend,
             "launcher": "torchrun" if distributed.enabled else "python",
             "gradient_sync": "bounded_async_bucketed_mean_all_reduce",
+            "unused_parameter_detection_collective": False,
             "gradient_bucket_cap_mb": float(args.gradient_bucket_cap_mb),
-            "random_q_head_sync": "rank_zero_broadcast",
-            "q_denominator_sync": "global_mean",
-            "validation": "rank_zero_then_broadcast",
+            "random_q_head_sync": "none_rank_local_sampling",
+            "q_denominator_sync": "none_rank_local_normalization",
             "per_step_buffer_broadcast": bool(
                 synchronize_training_buffers
             ),
+            "per_step_metric_collective": False,
+            "metric_source": "rank_zero_local",
             "rank_zero_writes_only": True,
         },
     }
@@ -1600,18 +1601,27 @@ def train(args: argparse.Namespace) -> dict:
         writer = make_tensorboard_writer(args.output_dir)
     else:
         writer = None
+    shared_action_range_validated = False
     for epoch in range(start_epoch + 1, int(args.epochs) + 1):
         if distributed.enabled and hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
         epoch_iterator = iter(loader)
-        epoch_records: list[dict[str, float]] = []
+        metric_accumulator = (
+            LocalScalarMetricAccumulator(device)
+            if distributed.is_main_process
+            else None
+        )
         for step_in_epoch in range(1, int(args.steps_per_epoch) + 1):
             try:
                 raw_batch = next(epoch_iterator)
             except StopIteration:
                 epoch_iterator = iter(loader)
                 raw_batch = next(epoch_iterator)
-            raw_batch = align_shared_batch_actions(raw_batch)
+            raw_batch = align_shared_batch_actions(
+                raw_batch,
+                validate=not shared_action_range_validated,
+            )
+            shared_action_range_validated = True
             if synchronize_training_buffers:
                 broadcast_module_buffers(
                     synchronized_modules,
@@ -1622,12 +1632,17 @@ def train(args: argparse.Namespace) -> dict:
                     actor_algo.optimizers["policy"].param_groups[0]["lr"]
                 ),
                 "lr/critic": float(critic_optimizer.param_groups[0]["lr"]),
+                "lr/encoder": float(critic_optimizer.param_groups[1]["lr"]),
             }
 
             critic_batch = process_dql_critic_batch(
                 raw_batch,
                 actor_algo,
                 obs_normalization_stats,
+                critic_observation_horizon=int(
+                    args.critic_observation_horizon
+                ),
+                validate_actions=step_in_epoch == 1 and epoch == start_epoch + 1,
             )
             with torch.no_grad():
                 next_actor_observations = prepare_next_actor_observations(
@@ -1650,9 +1665,9 @@ def train(args: argparse.Namespace) -> dict:
             )
             critic_loss.backward()
             if gradient_sync_fn is not None:
-                gradient_sync_fn(critic_optimizer.param_groups[0]["params"])
+                gradient_sync_fn(critic_parameters)
             critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
-                critic_optimizer.param_groups[0]["params"],
+                critic_parameters,
                 float(args.critic_max_gradient_norm),
             )
             critic_optimizer.step()
@@ -1669,7 +1684,6 @@ def train(args: argparse.Namespace) -> dict:
                 critic_batch=critic_batch,
                 args=args,
                 global_step=global_step,
-                distributed_context=distributed,
                 gradient_sync_fn=gradient_sync_fn,
                 defer_scalar_conversion=True,
             )
@@ -1691,60 +1705,42 @@ def train(args: argparse.Namespace) -> dict:
             metrics["data/effective_global_batch_rows"] = float(
                 raw_batch["actions"].shape[0] * distributed.world_size
             )
-            metrics = mean_distributed_scalars(metrics, distributed)
-            epoch_records.append(metrics)
-            if writer is not None:
-                for key, value in metrics.items():
-                    writer.add_scalar(key, value, global_step)
-            if (
-                distributed.is_main_process
-                and global_step % int(args.log_every) == 0
-            ):
-                print(
-                    json.dumps(
-                        {
-                            "epoch": epoch,
-                            "step_in_epoch": step_in_epoch,
-                            "global_step": global_step,
-                            **metrics,
-                        }
-                    ),
-                    flush=True,
-                )
-
-        validation_metrics = evaluate_critic_loader(
-            loader=validation_loader,
-            actor_algo=actor_algo,
-            critics=critics,
-            critic_targets=critic_targets,
-            obs_normalization_stats=obs_normalization_stats,
-            args=args,
-            process_device=device,
-        )
-        if distributed.enabled:
-            validation_payload = [
-                validation_metrics if distributed.is_main_process else None
-            ]
-            dist.broadcast_object_list(
-                validation_payload,
-                src=0,
-                device=device,
+            should_log = (
+                global_step % int(args.log_every) == 0
+                or step_in_epoch == int(args.steps_per_epoch)
             )
-            validation_metrics = validation_payload[0]
-        validation_loss = (
-            float(validation_metrics["critic/loss"])
-            if validation_metrics is not None
-            else float("inf")
+            if distributed.is_main_process:
+                metric_accumulator.update(metrics)
+                if should_log:
+                    logged_metrics = materialize_local_scalar_metrics(
+                        metrics,
+                        device,
+                    )
+                    if writer is not None:
+                        for key, value in logged_metrics.items():
+                            writer.add_scalar(key, value, global_step)
+                    print(
+                        json.dumps(
+                            {
+                                "epoch": epoch,
+                                "step_in_epoch": step_in_epoch,
+                                "global_step": global_step,
+                                **logged_metrics,
+                            }
+                        ),
+                        flush=True,
+                    )
+
+        epoch_metrics = (
+            metric_accumulator.means()
+            if distributed.is_main_process
+            else {}
         )
-        is_best_validation = validation_loss < best_validation_critic_loss
-        if is_best_validation:
-            best_validation_critic_loss = validation_loss
         epoch_summary = {
             "epoch": int(epoch),
             "global_step": int(global_step),
             "global_samples_seen": int(global_samples_seen),
-            "metrics": mean_metrics(epoch_records),
-            "validation": validation_metrics,
+            "metrics": epoch_metrics,
         }
         history.append(epoch_summary)
         partial_summary = {
@@ -1753,18 +1749,9 @@ def train(args: argparse.Namespace) -> dict:
             "global_step": int(global_step),
             "global_samples_seen": int(global_samples_seen),
             "last_epoch_metrics": epoch_summary["metrics"],
-            "last_validation_metrics": validation_metrics,
-            "best_validation_critic_loss": (
-                best_validation_critic_loss
-                if np.isfinite(best_validation_critic_loss)
-                else None
-            ),
             "history": history,
             "checkpoints": {
                 "latest": str(args.output_dir / "latest.pt"),
-                "best_critic_loss": str(
-                    args.output_dir / "best_critic_loss.pt"
-                ),
                 "last": str(args.output_dir / "last.pt"),
             },
         }
@@ -1777,7 +1764,6 @@ def train(args: argparse.Namespace) -> dict:
         should_save = (
             epoch % int(args.save_every_epochs) == 0
             or epoch == int(args.epochs)
-            or is_best_validation
         )
         if should_save:
             rank_runtime_states = (
@@ -1799,17 +1785,11 @@ def train(args: argparse.Namespace) -> dict:
                     global_samples_seen=global_samples_seen,
                     history=history,
                     loader_generator=loader_generator,
-                    best_validation_critic_loss=best_validation_critic_loss,
                     rank_runtime_states=rank_runtime_states,
                     distributed_context=distributed,
                 )
                 latest_path = args.output_dir / "latest.pt"
                 atomic_torch_save(payload, latest_path)
-                if is_best_validation:
-                    replace_with_hardlink(
-                        latest_path,
-                        args.output_dir / "best_critic_loss.pt",
-                    )
                 if (
                     int(args.snapshot_every_epochs) > 0
                     and epoch % int(args.snapshot_every_epochs) == 0
@@ -1827,8 +1807,6 @@ def train(args: argparse.Namespace) -> dict:
                     f"step={global_step}",
                     flush=True,
                 )
-        if distributed.enabled:
-            dist.barrier()
 
     if distributed.is_main_process:
         last_path = args.output_dir / "last.pt"
@@ -1855,9 +1833,8 @@ def train(args: argparse.Namespace) -> dict:
     else:
         final_summary = {}
     if writer is not None:
+        writer.flush()
         writer.close()
-    if distributed.enabled:
-        dist.barrier()
     close_dataset = getattr(dataset, "close", None)
     if callable(close_dataset):
         close_dataset()
@@ -1921,7 +1898,7 @@ def parse_args() -> argparse.Namespace:
             "preserving the full action and metadata sequence."
         ),
     )
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=6)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
@@ -1929,17 +1906,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reward-mode",
         choices=tuple(REWARD_DEFINITIONS),
-        default="task",
-        help="Expected dataset reward mode; task is the default.",
+        default="terminal_success",
+        help="Expected dataset reward mode; terminal_success is the default.",
     )
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--target-tau", type=float, default=0.005)
     parser.add_argument("--actor-lr", type=float, default=1e-4)
-    parser.add_argument("--critic-lr", type=float, default=3e-4)
+    parser.add_argument("--critic-lr", type=float, default=1e-4)
+    parser.add_argument("--encoder-lr", type=float, default=1e-5)
     parser.add_argument("--lr-scheduler", choices=("constant", "cosine"), default="cosine")
     parser.add_argument("--lr-warmup-steps", type=int, default=500)
     parser.add_argument("--lr-num-cycles", type=float, default=0.5)
     parser.add_argument("--critic-hidden-dims", type=int, nargs="+", default=(300, 400, 300))
+    parser.add_argument("--critic-observation-horizon", type=int, default=2)
+    parser.add_argument("--latent-dim", type=int, default=300)
+    parser.add_argument("--action-hidden-dim", type=int, default=128)
+    parser.add_argument("--num-attention-heads", type=int, default=4)
+    parser.add_argument("--num-action-conv-layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--temporal-num-layers", type=int, default=2)
+    parser.add_argument("--temporal-num-heads", type=int, default=6)
+    parser.add_argument("--temporal-feedforward-dim", type=int, default=600)
+    parser.add_argument("--temporal-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--rise-v2-fusion-mode",
+        choices=("concat", "film"),
+        default="film",
+    )
     parser.add_argument("--num-critics", type=int, default=2)
     parser.add_argument("--critic-group-norm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -1960,17 +1953,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dql-critic-warmup-steps", type=int, default=1000)
     parser.add_argument("--dql-actor-ema-update-every", type=int, default=5)
     parser.add_argument("--dql-clip-actions", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--validation-fraction", type=float, default=0.1)
-    parser.add_argument(
-        "--validation-holdout",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Exclude validation episodes from training. Disabled by default so "
-            "DQL trains on the same transitions as IDQL and chunked IDQL."
-        ),
-    )
-    parser.add_argument("--validation-batches", type=int, default=32)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--snapshot-every-epochs", type=int, default=10)
@@ -1999,10 +1981,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("actor-max-gradient-norm must be positive")
     if args.critic_max_gradient_norm <= 0.0:
         parser.error("critic-max-gradient-norm must be positive")
-    if not 0.0 <= args.validation_fraction < 1.0:
-        parser.error("validation-fraction must be in [0, 1)")
-    if args.validation_batches < 0:
-        parser.error("validation-batches must be non-negative")
+    if args.log_every <= 0:
+        parser.error("log-every must be positive")
+    if args.save_every_epochs <= 0:
+        parser.error("save-every-epochs must be positive")
     return args
 
 

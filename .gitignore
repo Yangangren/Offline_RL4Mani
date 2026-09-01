@@ -128,6 +128,7 @@ robomimic/exps/
 figures/
 *.txt
 *.yml
+scripts/real_robot_deploy/*
 
 tests/*
 !tests/real_robot/
@@ -138,4 +139,5 @@ tests/real_robot/*
 !tests/real_robot/test_eval_stack_cup_rgb_dp.py
 !tests/test_rgb_dp_idql_launcher.py
 !tests/test_rgb_dp_idql_temporal.py
+!tests/test_rgb_dp_dql_launcher.py
 !tests/test_stack_cup_idql_launchers.py

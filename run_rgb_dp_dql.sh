@@ -18,37 +18,41 @@ TASK=${TASK,,}
 case "$TASK" in
   square)
     TASK_DP_CHECKPOINT=trained_models/square_rgb_dp/square_ph_rgb_dp_official_s1/models/model_epoch_200.pth
-    TASK_IDQL_DATASET=datasets/square/idql/square_rgb_dp_idql_200demo_100success_50failure.hdf5
-    TASK_DQL_OUTPUT_DIR=trained_models/square_rgb_dp/dql/200demo_100success_50failure
-    TASK_EVAL_OUTPUT=rollouts/square_rgb_dp/dql/200demo_100success_50failure
+    TASK_IDQL_DATASET=datasets/square/idql/square_rgb_dp_idql_200demo_406success_94failure.hdf5
+    TASK_TERMINAL_SUCCESS_DATASET=datasets/square/idql/square_rgb_dp_idql_200demo_406success_94failure_terminal_success.hdf5
+    TASK_DQL_OUTPUT_DIR=trained_models/square_rgb_dp/dql/200demo_406success_94failure
+    TASK_EVAL_OUTPUT=rollouts/square_rgb_dp/dql/200demo_406success_94failure
     TASK_CRITIC_GROUP_NORM=1
     TASK_EVAL_HORIZON=400
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
     ;;
   can)
     TASK_DP_CHECKPOINT=trained_models/can_rgb_dp/can_ph_rgb_dp_official_s1/models/model_epoch_50.pth
-    TASK_IDQL_DATASET=datasets/can/idql/can_rgb_dp_idql_200demo_100success_33failure.hdf5
-    TASK_DQL_OUTPUT_DIR=trained_models/can_rgb_dp/dql/200demo_100success_33failure
-    TASK_EVAL_OUTPUT=rollouts/can_rgb_dp/dql/200demo_100success_33failure
-    TASK_CRITIC_GROUP_NORM=1
+    TASK_IDQL_DATASET=datasets/can/idql/can_rgb_dp_idql_200demo_467success_33failure.hdf5
+    TASK_TERMINAL_SUCCESS_DATASET=datasets/can/idql/can_rgb_dp_idql_200demo_467success_33failure_terminal_success.hdf5
+    TASK_DQL_OUTPUT_DIR=trained_models/can_rgb_dp/dql/200demo_467success_33failure
+    TASK_EVAL_OUTPUT=rollouts/can_rgb_dp/dql/200demo_467success_33failure
+    TASK_CRITIC_GROUP_NORM=0
     TASK_EVAL_HORIZON=400
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
     ;;
   transport)
     TASK_DP_CHECKPOINT=trained_models/transport_rgb_dp/transport_ph_rgb_dp_official_s1/models/model_epoch_200.pth
-    TASK_IDQL_DATASET=datasets/transport/idql/transport_rgb_dp_idql_200demo_100success_50failure.hdf5
-    TASK_DQL_OUTPUT_DIR=trained_models/transport_rgb_dp/dql/200demo_100success_50failure
-    TASK_EVAL_OUTPUT=rollouts/transport_rgb_dp/dql/200demo_100success_50failure
-    TASK_CRITIC_GROUP_NORM=1
+    TASK_IDQL_DATASET=datasets/transport/idql/transport_rgb_dp_idql_200demo_422success_78failure.hdf5
+    TASK_TERMINAL_SUCCESS_DATASET=datasets/transport/idql/transport_rgb_dp_idql_200demo_422success_78failure_terminal_success_reward.hdf5
+    TASK_DQL_OUTPUT_DIR=trained_models/transport_rgb_dp/dql/200demo_422success_78failure
+    TASK_EVAL_OUTPUT=rollouts/transport_rgb_dp/dql/200demo_422success_78failure
+    TASK_CRITIC_GROUP_NORM=0
     TASK_EVAL_HORIZON=700
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos,robot1_gripper_qpos
     ;;
   tool_hang)
     TASK_DP_CHECKPOINT=trained_models/tool_hang_rgb_dp/tool_hang_ph_rgb_dp_official_s1/models/model_epoch_200.pth
-    TASK_IDQL_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_100success_50failure.hdf5
-    TASK_DQL_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/dql/200demo_100success_50failure
-    TASK_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/dql/200demo_100success_50failure
-    TASK_CRITIC_GROUP_NORM=1
+    TASK_IDQL_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_132success_168failure.hdf5
+    TASK_TERMINAL_SUCCESS_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_132success_168failure_terminal_success.hdf5
+    TASK_DQL_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/dql/200demo_132success_168failure
+    TASK_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/dql/200demo_132success_168failure
+    TASK_CRITIC_GROUP_NORM=0
     TASK_EVAL_HORIZON=700
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
     ;;
@@ -94,12 +98,17 @@ if [[ -n "${EVAL_GPU_IDS:-}" ]]; then
 fi
 
 DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
-DQL_REWARD_MODE=${DQL_REWARD_MODE:-task}
+DQL_REWARD_MODE=${DQL_REWARD_MODE:-terminal_success}
 case "$DQL_REWARD_MODE" in
   task)
     DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_task_reward.hdf5
     DEFAULT_DQL_OUTPUT_DIR=${TASK_DQL_OUTPUT_DIR}_task_reward
     DEFAULT_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_task_reward
+    ;;
+  terminal_success)
+    DEFAULT_IDQL_DATASET=$TASK_TERMINAL_SUCCESS_DATASET
+    DEFAULT_DQL_OUTPUT_DIR=${TASK_DQL_OUTPUT_DIR}_terminal_success_reward
+    DEFAULT_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_terminal_success_reward
     ;;
   rise)
     DEFAULT_IDQL_DATASET=$TASK_IDQL_DATASET
@@ -107,7 +116,7 @@ case "$DQL_REWARD_MODE" in
     DEFAULT_EVAL_OUTPUT=$TASK_EVAL_OUTPUT
     ;;
   *)
-    echo "Unsupported DQL_REWARD_MODE=$DQL_REWARD_MODE. Use task or rise." >&2
+    echo "Unsupported DQL_REWARD_MODE=$DQL_REWARD_MODE. Use task, terminal_success, or rise." >&2
     exit 2
     ;;
 esac
@@ -143,11 +152,6 @@ DQL_CLIP_ACTIONS_ARG=--dql-clip-actions
 if [[ "${DQL_CLIP_ACTIONS:-1}" == "0" ]]; then
   DQL_CLIP_ACTIONS_ARG=--no-dql-clip-actions
 fi
-VALIDATION_HOLDOUT_ARG=--no-validation-holdout
-if [[ "${VALIDATION_HOLDOUT:-0}" == "1" ]]; then
-  VALIDATION_HOLDOUT_ARG=--validation-holdout
-fi
-
 require_training_data() {
   if [[ ! -f "$DP_CHECKPOINT" ]]; then
     echo "[rgb_dp_dql task=$TASK] DP checkpoint does not exist: $DP_CHECKPOINT" >&2
@@ -198,9 +202,9 @@ run_train() {
     --seed "${SEED:-0}" \
     --epochs "${EPOCHS:-50}" \
     "${steps_per_epoch_args[@]}" \
-    --schedule-reference-batch-size "${DQL_SCHEDULE_REFERENCE_BATCH_SIZE:-100}" \
+    --schedule-reference-batch-size "${BATCH_SIZE:-100}" \
     --batch-size "${BATCH_SIZE:-100}" \
-    --num-workers "${NUM_WORKERS:-4}" \
+    --num-workers "${NUM_WORKERS:-6}" \
     --prefetch-factor "${PREFETCH_FACTOR:-2}" \
     "$PIN_MEMORY_ARG" \
     "$PERSISTENT_WORKERS_ARG" \
@@ -210,11 +214,23 @@ run_train() {
     --discount "${DISCOUNT:-0.99}" \
     --target-tau "${TARGET_TAU:-0.005}" \
     --actor-lr "${ACTOR_LR:-1e-4}" \
-    --critic-lr "${CRITIC_LR:-3e-4}" \
+    --critic-lr "${CRITIC_LR:-1e-4}" \
+    --encoder-lr "${ENCODER_LR:-1e-5}" \
     --lr-scheduler "${LR_SCHEDULER:-cosine}" \
     --lr-warmup-steps "${LR_WARMUP_STEPS:-500}" \
     --lr-num-cycles "${LR_NUM_CYCLES:-0.5}" \
     --critic-hidden-dims ${CRITIC_HIDDEN_DIMS:-300 400 300} \
+    --critic-observation-horizon "${DQL_CRITIC_OBSERVATION_HORIZON:-2}" \
+    --latent-dim "${DQL_LATENT_DIM:-300}" \
+    --action-hidden-dim "${DQL_ACTION_HIDDEN_DIM:-128}" \
+    --num-attention-heads "${DQL_NUM_ATTENTION_HEADS:-4}" \
+    --num-action-conv-layers "${DQL_NUM_ACTION_CONV_LAYERS:-2}" \
+    --dropout "${DQL_DROPOUT:-0.0}" \
+    --temporal-num-layers "${DQL_TEMPORAL_NUM_LAYERS:-2}" \
+    --temporal-num-heads "${DQL_TEMPORAL_NUM_HEADS:-6}" \
+    --temporal-feedforward-dim "${DQL_TEMPORAL_FEEDFORWARD_DIM:-600}" \
+    --temporal-dropout "${DQL_TEMPORAL_DROPOUT:-0.0}" \
+    --rise-v2-fusion-mode "${DQL_RISE_V2_FUSION_MODE:-film}" \
     --num-critics "${NUM_CRITICS:-2}" \
     "$CRITIC_GROUP_NORM_ARG" \
     --critic-late-fusion-key "$CRITIC_LATE_FUSION_KEY" \
@@ -231,9 +247,6 @@ run_train() {
     --dql-critic-warmup-steps "${DQL_CRITIC_WARMUP_STEPS:-1000}" \
     --dql-actor-ema-update-every "${DQL_ACTOR_EMA_UPDATE_EVERY:-5}" \
     "$DQL_CLIP_ACTIONS_ARG" \
-    --validation-fraction "${VALIDATION_FRACTION:-0.1}" \
-    "$VALIDATION_HOLDOUT_ARG" \
-    --validation-batches "${VALIDATION_BATCHES:-32}" \
     --log-every "${LOG_EVERY:-100}" \
     --save-every-epochs "${SAVE_EVERY_EPOCHS:-1}" \
     --snapshot-every-epochs "${SNAPSHOT_EVERY_EPOCHS:-10}"
