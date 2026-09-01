@@ -263,6 +263,14 @@ EVAL_NUM_CANDIDATES_VALUE=${EVAL_NUM_CANDIDATES:-"1"}
 read -r -a EVAL_NUM_CANDIDATE_ARGS <<< "$EVAL_NUM_CANDIDATES_VALUE"
 EVAL_SEEDS_VALUE=${EVAL_SEEDS:-"0 1 2 3 4"}
 read -r -a EVAL_SEED_ARGS <<< "$EVAL_SEEDS_VALUE"
+EVAL_GPU_ARGS=()
+if [[ -n "${EVAL_NUM_GPUS:-}" ]]; then
+  EVAL_GPU_ARGS+=(--num-gpus "$EVAL_NUM_GPUS")
+fi
+if [[ -n "${EVAL_GPU_IDS:-}" ]]; then
+  read -r -a eval_gpu_id_args <<< "$EVAL_GPU_IDS"
+  EVAL_GPU_ARGS+=(--gpu-ids "${eval_gpu_id_args[@]}")
+fi
 
 PIN_MEMORY_ARGS=(--pin-memory)
 if [[ "${PIN_MEMORY:-1}" == "0" ]]; then
@@ -867,7 +875,8 @@ run_eval_grid_resilient() {
     --dp-checkpoint "$EVAL_DP_CHECKPOINT" \
     --expected-task "$TASK" \
     --output-dir "$grid_dir" \
-    --device cuda \
+    --device "${DEVICE:-cuda}" \
+    "${EVAL_GPU_ARGS[@]}" \
     --actor-source "$ACTOR_SOURCE" \
     --n-rollouts "${N_ROLLOUTS:-50}" \
     --horizon "$HORIZON" \
