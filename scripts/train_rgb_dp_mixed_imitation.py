@@ -11,27 +11,35 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 import shutil
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.nn as nn
 
 import robomimic.utils.file_utils as FileUtils
-import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.train_utils as TrainUtils
 
-from train_square_rgb_dp_chunk_actor_iql import (
+from rgb_dp_imitation_utils import (
     actor_train_step,
     actor_trainability_summary,
     build_actor_loader,
     configure_actor_optimizer,
-    cycle,
     initialize_actor_from_deployed_ema,
     jsonable,
     write_json,
+)
+from rgb_dp_distributed import (
+    DistributedContext,
+    all_reduce_gradients,
+    broadcast_module_buffers,
+    broadcast_module_state,
+    initialize_distributed,
+    modules_have_mutable_batch_norm,
+    seed_process,
 )
 
 try:
@@ -81,6 +89,7 @@ def save_policy_checkpoint(
     global_step: int,
     history: list[dict],
     mode_name: str,
+    distributed_context: DistributedContext,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     variable_state = {
@@ -92,6 +101,12 @@ def save_policy_checkpoint(
         "self_imitation": True,
         "posttrain_mode": str(mode_name),
         "success_conditioned": str(mode_name) == "success_conditioned_mixed_quality_imitation_learning",
+        "distributed_training": {
+            "enabled": bool(distributed_context.enabled),
+            "world_size": int(distributed_context.world_size),
+            "backend": str(distributed_context.backend),
+            "rank_zero_writes_only": True,
+        },
     }
     TrainUtils.save_model(
         model=actor_algo,
@@ -286,15 +301,35 @@ def make_summary(
         "critic_trained": False,
         "loaded_pretrained_dp": True,
         "success_conditioning": success_condition_summary(args),
+        "distributed_training": {
+            "enabled": bool(getattr(args, "distributed", False)),
+            "world_size": int(getattr(args, "distributed_world_size", 1)),
+            "backend": str(getattr(args, "distributed_backend_resolved", "none")),
+            "launcher": "torchrun" if bool(getattr(args, "distributed", False)) else "python",
+            "batch_size_per_rank": int(actor_config.train.batch_size),
+            "effective_global_batch_size": int(actor_config.train.batch_size)
+            * int(getattr(args, "distributed_world_size", 1)),
+            "gradient_sync": "bounded_async_bucketed_mean_all_reduce",
+            "gradient_bucket_cap_mb": float(args.gradient_bucket_cap_mb),
+            "rank_zero_writes_only": True,
+        },
         "last_checkpoint": str(last_checkpoint) if last_checkpoint is not None else None,
         "history": history,
     }
 
 
 def train(args: argparse.Namespace) -> dict:
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    distributed = initialize_distributed(args)
+    args.distributed = bool(distributed.enabled)
+    args.distributed_rank = int(distributed.rank)
+    args.distributed_local_rank = int(distributed.local_rank)
+    args.distributed_world_size = int(distributed.world_size)
+    args.distributed_backend_resolved = str(distributed.backend)
+    if distributed.is_main_process:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
     models_dir = args.output_dir / "models"
-    models_dir.mkdir(parents=True, exist_ok=True)
+    if distributed.is_main_process:
+        models_dir.mkdir(parents=True, exist_ok=True)
 
     if bool(args.conditioned_mixed_imitation):
         failure_label = float(args.actor_failure_anti_failure_label)
@@ -304,7 +339,7 @@ def train(args: argparse.Namespace) -> dict:
                 f"(actor_failure_anti_failure_label=1.0), got {failure_label}"
             )
 
-    device = TorchUtils.get_torch_device(try_to_use_cuda=args.device == "cuda")
+    device = distributed.device
 
     dp_ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     checkpoint_config, _ = FileUtils.config_from_checkpoint(
@@ -313,9 +348,9 @@ def train(args: argparse.Namespace) -> dict:
     )
     if args.seed is None:
         args.seed = int(checkpoint_config.train.seed)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
+    # Construct identical policies on every rank before switching to independent
+    # rank-local data and diffusion-noise streams.
+    seed_process(args.seed, device)
 
     actor_policy, _ = FileUtils.policy_from_checkpoint(
         ckpt_dict=dp_ckpt,
@@ -405,6 +440,19 @@ def train(args: argparse.Namespace) -> dict:
         ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
         if "model" not in ckpt:
             raise ValueError(f"resume checkpoint is not a robomimic policy checkpoint: {args.resume_checkpoint}")
+        saved_distributed = (ckpt.get("variable_state", {}) or {}).get(
+            "distributed_training",
+            {},
+        )
+        if bool(saved_distributed.get("enabled", False)) and (
+            not distributed.enabled
+            or int(saved_distributed.get("world_size", 1)) != distributed.world_size
+        ):
+            raise ValueError(
+                "distributed self-imitation checkpoints require the same world "
+                f"size on resume: checkpoint={saved_distributed.get('world_size')} "
+                f"requested={distributed.world_size}"
+            )
         actor_algo.deserialize(ckpt["model"], load_optimizers=True)
         if not bool(args.conditioned_mixed_imitation):
             require_unconditioned_policy(actor_algo, args.resume_checkpoint)
@@ -420,80 +468,112 @@ def train(args: argparse.Namespace) -> dict:
         start_epoch = int(variable_state.get("epoch", 0))
         global_step = int(variable_state.get("global_step", start_epoch * int(args.steps_per_epoch)))
         summary_path = args.output_dir / "partial_summary.json"
-        if summary_path.exists():
+        if distributed.is_main_process and summary_path.exists():
             try:
                 history = list(json.loads(summary_path.read_text()).get("history", []))
             except Exception:
                 history = []
 
+    synchronized_modules: list[nn.Module] = [actor_algo.nets]
+    if actor_algo.ema is not None:
+        synchronized_modules.append(actor_algo.ema.averaged_model)
+    broadcast_module_state(synchronized_modules, distributed)
+    actor_algo.gradient_sync_fn = (
+        (
+            lambda parameters: all_reduce_gradients(
+                parameters,
+                distributed,
+                bucket_cap_mb=float(args.gradient_bucket_cap_mb),
+                preserve_unused_parameters=False,
+            )
+        )
+        if distributed.enabled
+        else None
+    )
+    synchronize_training_buffers = modules_have_mutable_batch_norm(
+        synchronized_modules
+    )
+    if distributed.enabled:
+        seed_process(int(args.seed) + distributed.rank, device)
+
     trainability = actor_trainability_summary(actor_algo)
-    print(json.dumps({"actor_trainability": jsonable(trainability)}, indent=2), flush=True)
-    print(
-        json.dumps(
-            {
-                "mode": infer_mode_name(args),
-                "actor_dataset_size": int(len(actor_dataset)),
-                "actor_action_normalization_source": getattr(
-                    actor_dataset,
-                    "actor_action_normalization_source",
-                    None,
-                ),
-                "actor_initialized_from_deployed_ema": bool(args.actor_initialized_from_deployed_ema),
-                "actor_data": jsonable(actor_config.train.data),
-                "actor_optimization": {
-                    "optimizer_type": str(actor_config.algo.optim_params.policy.optimizer_type),
-                    "initial_learning_rate": float(args.actor_lr),
-                    "scheduler_type": str(
-                        actor_config.algo.optim_params.policy.learning_rate.scheduler_type
-                    ),
-                    "scheduler_enabled": not bool(args.actor_disable_lr_scheduler),
-                    "scheduler_step_every_batch": bool(
-                        actor_config.algo.optim_params.policy.learning_rate.step_every_batch
-                    ),
-                    "scheduler_warmup_steps": int(
-                        actor_config.algo.optim_params.policy.learning_rate.warmup_steps
-                    ),
-                    "weight_decay": float(
-                        actor_config.algo.optim_params.policy.regularization.L2
-                    ),
-                    "batch_size": int(args.actor_batch_size),
-                    "seed": int(args.seed),
-                    "steps_per_epoch": int(args.steps_per_epoch),
-                    "steps_per_epoch_source": str(args.steps_per_epoch_source),
+    if distributed.is_main_process:
+        print(json.dumps({"actor_trainability": jsonable(trainability)}, indent=2), flush=True)
+        print(
+            json.dumps(
+                {
+                    "mode": infer_mode_name(args),
                     "actor_dataset_size": int(len(actor_dataset)),
-                    "drop_last": bool(args.actor_drop_last),
-                    "epochs": int(args.epochs),
-                },
-                "actor_normalization": {
-                    "hdf5_normalize_obs": bool(actor_config.train.hdf5_normalize_obs),
-                    "action_config": jsonable(actor_config.train.action_config),
-                    "action_stats_source": getattr(
+                    "actor_action_normalization_source": getattr(
                         actor_dataset,
                         "actor_action_normalization_source",
                         None,
                     ),
-                    "normalize_source_weights_by_dataset_size": bool(
-                        actor_config.train.normalize_weights_by_ds_size
-                    ),
+                    "actor_initialized_from_deployed_ema": bool(args.actor_initialized_from_deployed_ema),
+                    "actor_data": jsonable(actor_config.train.data),
+                    "actor_optimization": {
+                        "optimizer_type": str(actor_config.algo.optim_params.policy.optimizer_type),
+                        "initial_learning_rate": float(args.actor_lr),
+                        "scheduler_type": str(
+                            actor_config.algo.optim_params.policy.learning_rate.scheduler_type
+                        ),
+                        "scheduler_enabled": not bool(args.actor_disable_lr_scheduler),
+                        "scheduler_step_every_batch": bool(
+                            actor_config.algo.optim_params.policy.learning_rate.step_every_batch
+                        ),
+                        "scheduler_warmup_steps": int(
+                            actor_config.algo.optim_params.policy.learning_rate.warmup_steps
+                        ),
+                        "weight_decay": float(
+                            actor_config.algo.optim_params.policy.regularization.L2
+                        ),
+                        "batch_size": int(args.actor_batch_size),
+                        "seed": int(args.seed),
+                        "steps_per_epoch": int(args.steps_per_epoch),
+                        "steps_per_epoch_source": str(args.steps_per_epoch_source),
+                        "actor_dataset_size": int(len(actor_dataset)),
+                        "drop_last": bool(args.actor_drop_last),
+                        "epochs": int(args.epochs),
+                    },
+                    "actor_normalization": {
+                        "hdf5_normalize_obs": bool(actor_config.train.hdf5_normalize_obs),
+                        "action_config": jsonable(actor_config.train.action_config),
+                        "action_stats_source": getattr(
+                            actor_dataset,
+                            "actor_action_normalization_source",
+                            None,
+                        ),
+                        "normalize_source_weights_by_dataset_size": bool(
+                            actor_config.train.normalize_weights_by_ds_size
+                        ),
+                    },
+                    "actor_sampling": {
+                        "mode": (
+                            "uniform_sample_pool_without_replacement"
+                            if args.actor_uniform_sample_pool
+                            else "weighted_random_with_replacement"
+                        ),
+                        "source_weighting_enabled": not bool(args.actor_uniform_sample_pool),
+                    },
+                    "distributed_training": {
+                        "enabled": bool(distributed.enabled),
+                        "world_size": int(distributed.world_size),
+                        "backend": str(distributed.backend),
+                        "batch_size_per_rank": int(args.actor_batch_size),
+                        "effective_global_batch_size": int(args.actor_batch_size)
+                        * int(distributed.world_size),
+                        "rank_zero_writes_only": True,
+                    },
+                    "success_conditioning": success_condition_summary(args),
+                    "resume_epoch": int(start_epoch),
                 },
-                "actor_sampling": {
-                    "mode": (
-                        "uniform_sample_pool_without_replacement"
-                        if args.actor_uniform_sample_pool
-                        else "weighted_random_with_replacement"
-                    ),
-                    "source_weighting_enabled": not bool(args.actor_uniform_sample_pool),
-                },
-                "success_conditioning": success_condition_summary(args),
-                "resume_epoch": int(start_epoch),
-            },
-            indent=2,
-        ),
-        flush=True,
-    )
+                indent=2,
+            ),
+            flush=True,
+        )
 
     writer = None
-    if args.tensorboard:
+    if distributed.is_main_process and args.tensorboard:
         if SummaryWriter is None:
             print("TensorBoard requested but torch.utils.tensorboard is unavailable.", flush=True)
         else:
@@ -501,44 +581,55 @@ def train(args: argparse.Namespace) -> dict:
             log_dir.mkdir(parents=True, exist_ok=True)
             writer = SummaryWriter(log_dir=str(log_dir))
 
-    actor_iterator = cycle(actor_loader)
     last_checkpoint: Path | None = args.resume_checkpoint
     for epoch in range(start_epoch + 1, int(args.epochs) + 1):
-        epoch_logs = []
+        if distributed.enabled and hasattr(actor_loader.sampler, "set_epoch"):
+            actor_loader.sampler.set_epoch(epoch)
+        actor_iterator = iter(actor_loader)
+        epoch_logs = [] if distributed.is_main_process else None
         for _ in range(int(args.steps_per_epoch)):
+            try:
+                actor_batch = next(actor_iterator)
+            except StopIteration:
+                actor_iterator = iter(actor_loader)
+                actor_batch = next(actor_iterator)
             global_step += 1
-            actor_batch = next(actor_iterator)
+            if synchronize_training_buffers:
+                broadcast_module_buffers(synchronized_modules, distributed)
             actor_log = actor_train_step(
                 actor_policy,
                 actor_batch,
                 global_step,
                 obs_normalization_stats=actor_policy.obs_normalization_stats,
+                materialize_log=distributed.is_main_process,
             )
-            epoch_logs.append(actor_log)
-            if global_step % int(args.log_every) == 0:
+            if distributed.is_main_process:
+                epoch_logs.append(actor_log)
+            if distributed.is_main_process and global_step % int(args.log_every) == 0:
                 payload = {"epoch": int(epoch), "global_step": int(global_step)}
                 payload.update(actor_log)
                 print(json.dumps(jsonable(payload), sort_keys=True), flush=True)
 
-        metrics = numeric_mean(epoch_logs)
+        metrics = numeric_mean(epoch_logs) if distributed.is_main_process else {}
         record = {"epoch": int(epoch), "global_step": int(global_step), "train": metrics}
-        history.append(record)
-        add_scalars(writer, "train", metrics, global_step)
-        if writer is not None:
-            writer.flush()
+        if distributed.is_main_process:
+            history.append(record)
+            add_scalars(writer, "train", metrics, global_step)
+            if writer is not None:
+                writer.flush()
 
-        partial = make_summary(
-            args=args,
-            actor_dataset=actor_dataset,
-            actor_config=actor_config,
-            trainability=trainability,
-            history=history,
-            last_checkpoint=last_checkpoint,
-        )
-        write_json(args.output_dir / "partial_summary.json", partial)
+            partial = make_summary(
+                args=args,
+                actor_dataset=actor_dataset,
+                actor_config=actor_config,
+                trainability=trainability,
+                history=history,
+                last_checkpoint=last_checkpoint,
+            )
+            write_json(args.output_dir / "partial_summary.json", partial)
 
         saved_epoch_checkpoint = None
-        should_save_epoch = bool(args.save_checkpoints) and (
+        should_save_epoch = distributed.is_main_process and bool(args.save_checkpoints) and (
             epoch == int(args.epochs)
             or (int(args.save_every_epochs) > 0 and epoch % int(args.save_every_epochs) == 0)
         )
@@ -553,9 +644,10 @@ def train(args: argparse.Namespace) -> dict:
                 global_step=global_step,
                 history=history,
                 mode_name=infer_mode_name(args),
+                distributed_context=distributed,
             )
 
-        should_save_latest = bool(args.save_checkpoints) and (
+        should_save_latest = distributed.is_main_process and bool(args.save_checkpoints) and (
             epoch == int(args.epochs)
             or (int(args.save_latest_every_epochs) > 0 and epoch % int(args.save_latest_every_epochs) == 0)
         )
@@ -574,6 +666,7 @@ def train(args: argparse.Namespace) -> dict:
                     global_step=global_step,
                     history=history,
                     mode_name=infer_mode_name(args),
+                    distributed_context=distributed,
                 )
             shutil.copyfile(latest, args.output_dir / "last_bak.pth")
             last_checkpoint = latest
@@ -584,16 +677,26 @@ def train(args: argparse.Namespace) -> dict:
     if callable(close_fn):
         close_fn()
 
-    summary = make_summary(
-        args=args,
-        actor_dataset=actor_dataset,
-        actor_config=actor_config,
-        trainability=trainability,
-        history=history,
-        last_checkpoint=last_checkpoint,
-    )
-    write_json(args.output_dir / "summary.json", summary)
-    print(json.dumps(jsonable({k: v for k, v in summary.items() if k != "history"}), indent=2), flush=True)
+    summary = {}
+    if distributed.is_main_process:
+        summary = make_summary(
+            args=args,
+            actor_dataset=actor_dataset,
+            actor_config=actor_config,
+            trainability=trainability,
+            history=history,
+            last_checkpoint=last_checkpoint,
+        )
+        write_json(args.output_dir / "summary.json", summary)
+        print(
+            json.dumps(
+                jsonable({k: v for k, v in summary.items() if k != "history"}),
+                indent=2,
+            ),
+            flush=True,
+        )
+    if distributed.enabled and dist.is_initialized():
+        dist.destroy_process_group()
     return summary
 
 
@@ -609,6 +712,33 @@ def main() -> None:
     parser.add_argument("--mode-name", type=str, default=None)
     parser.add_argument("--description", type=str, default=None)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument(
+        "--distributed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable torchrun data-parallel training. This is also enabled "
+            "automatically when WORLD_SIZE is greater than one."
+        ),
+    )
+    parser.add_argument(
+        "--distributed-backend",
+        choices=("auto", "nccl", "gloo"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--gradient-bucket-cap-mb",
+        type=float,
+        default=100.0,
+        help="Maximum size of each flat gradient all-reduce bucket in MiB.",
+    )
+    parser.add_argument(
+        "--local-rank",
+        "--local_rank",
+        type=int,
+        default=None,
+        help="Local process rank supplied by torchrun; the environment wins.",
+    )
     parser.add_argument(
         "--seed",
         type=int,
@@ -646,7 +776,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--demo-filter-key", type=str, default="")
-    parser.add_argument("--success-filter-key", type=str, default="success_100")
+    parser.add_argument("--success-filter-key", type=str, default="success")
     parser.add_argument("--failure-filter-key", type=str, default="failure")
     parser.add_argument("--actor-demo-weight", type=float, default=1.0)
     parser.add_argument("--actor-success-weight", type=float, default=1.0)

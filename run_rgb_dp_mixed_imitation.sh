@@ -27,6 +27,15 @@ export PYTHONFAULTHANDLER=1
 
 PYTHON=${ROBOMIMIC_PYTHON:-/home/ryan/miniconda3/envs/robomimic_stable/bin/python}
 export ROBOMIMIC_PYTHON="$PYTHON"
+IMITATION_NUM_GPUS=${IMITATION_NUM_GPUS:-1}
+if [[ ! "$IMITATION_NUM_GPUS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "IMITATION_NUM_GPUS must be a positive integer; got '$IMITATION_NUM_GPUS'." >&2
+  exit 2
+fi
+if (( IMITATION_NUM_GPUS > 1 )) && [[ "${DEVICE:-cuda}" != "cuda" ]]; then
+  echo "IMITATION_NUM_GPUS>1 requires DEVICE=cuda." >&2
+  exit 2
+fi
 
 case "$TASK" in
   can)
@@ -36,7 +45,7 @@ case "$TASK" in
     DEFAULT_ROLLOUT_DATASET=rollouts/can_rgb_dp/epoch50_collection/can_rgb_dp_rollouts_rgb2.hdf5
     DEFAULT_FAILURE_FILTER_SIZE=33
     DEFAULT_FAILURE_FILTER_KEY=failure
-    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/mixed_imitation/200demo_100success
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/self_imitation/200demo_all_success
     DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/mixed_imitation/200demo_100success_33failure
     DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/mixed_imitation/200demo_100success_33failure_conditioned
     DEFAULT_EVAL_OUTPUT=rollouts/can_rgb_dp/imitation_eval
@@ -49,7 +58,7 @@ case "$TASK" in
     DEFAULT_ROLLOUT_DATASET=rollouts/square_rgb_dp/epoch190_collection/square_rgb_dp_rollouts_rgb2.hdf5
     DEFAULT_FAILURE_FILTER_SIZE=50
     DEFAULT_FAILURE_FILTER_KEY=failure_50
-    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/square_rgb_dp_self_imitation/200demo_100success
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/square_rgb_dp/self_imitation/200demo_all_success
     DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/square_rgb_dp/mixed_imitation/200demo_100success_50failure
     DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/square_rgb_dp/mixed_imitation/200demo_100success_50failure_human_condition
     DEFAULT_EVAL_OUTPUT=rollouts/square_rgb_dp/imitation_eval
@@ -62,7 +71,7 @@ case "$TASK" in
     DEFAULT_ROLLOUT_DATASET=rollouts/transport_rgb_dp/epoch200_collection/transport_rgb_dp_rollouts_rgb4.hdf5
     DEFAULT_FAILURE_FILTER_SIZE=50
     DEFAULT_FAILURE_FILTER_KEY=failure_50
-    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/transport_rgb_dp/mixed_imitation/200demo_100success
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/transport_rgb_dp/self_imitation/200demo_all_success
     DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/transport_rgb_dp/mixed_imitation/200demo_100success_50failure
     DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/transport_rgb_dp/mixed_imitation/200demo_100success_50failure_conditioned
     DEFAULT_EVAL_OUTPUT=rollouts/transport_rgb_dp/imitation_eval
@@ -75,7 +84,7 @@ case "$TASK" in
     DEFAULT_ROLLOUT_DATASET=rollouts/tool_hang_rgb_dp/epoch200_collection/tool_hang_rgb_dp_rollouts_rgb2.hdf5
     DEFAULT_FAILURE_FILTER_SIZE=50
     DEFAULT_FAILURE_FILTER_KEY=failure_50
-    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/mixed_imitation/200demo_100success
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/self_imitation/200demo_all_success
     DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/mixed_imitation/200demo_100success_50failure
     DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/tool_hang_rgb_dp/mixed_imitation/200demo_100success_50failure_conditioned
     DEFAULT_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/imitation_eval
@@ -87,24 +96,24 @@ case "$TASK" in
     ;;
 esac
 
-STAGE=${1:-train_mixed_imitation_resilient}
-IMITATION_KIND=${IMITATION_KIND:-mixed}
+STAGE=${1:-train_self_imitation_resilient}
+IMITATION_KIND=${IMITATION_KIND:-self}
 case "$STAGE" in
-  train|train_mixed_imitation)
-    STAGE=train
-    IMITATION_KIND=mixed
-        ;;
-  train_resilient|train_mixed_imitation_resilient)
-    STAGE=train_resilient
-    IMITATION_KIND=mixed
-    ;;
-  train_self_imitation)
+  train|train_self_imitation)
     STAGE=train
     IMITATION_KIND=self
     ;;
-  train_self_imitation_resilient)
+  train_resilient|train_self_imitation_resilient)
     STAGE=train_resilient
     IMITATION_KIND=self
+    ;;
+  train_mixed_imitation)
+    STAGE=train
+    IMITATION_KIND=mixed
+    ;;
+  train_mixed_imitation_resilient)
+    STAGE=train_resilient
+    IMITATION_KIND=mixed
     ;;
   check_self)
     STAGE=check
@@ -208,10 +217,13 @@ if [[ "$IMITATION_KIND" == "self" ]]; then
   IMITATION_SAVE_EVERY_EPOCHS=${IMITATION_SAVE_EVERY_EPOCHS:-${SELF_IMITATION_SAVE_EVERY_EPOCHS:-10}}
   IMITATION_SAVE_LATEST_EVERY_EPOCHS=${IMITATION_SAVE_LATEST_EVERY_EPOCHS:-${SELF_IMITATION_SAVE_LATEST_EVERY_EPOCHS:-1}}
   IMITATION_SEED=${IMITATION_SEED:-${SELF_IMITATION_SEED:-${MIXED_IMITATION_SEED:-}}}
-  SUCCESS_FILTER_KEY=${SELF_IMITATION_SUCCESS_FILTER_KEY:-${SUCCESS_FILTER_KEY:-${SUCCESS_SOURCE_FILTER_KEY}_${SUCCESS_FILTER_SUFFIX}}}
+  # Self-imitation consumes the complete existing success mask by default.
+  # A smaller explicit mask can still be selected with
+  # SELF_IMITATION_SUCCESS_FILTER_KEY when reproducing an older experiment.
+  SUCCESS_FILTER_KEY=${SELF_IMITATION_SUCCESS_FILTER_KEY:-${SUCCESS_FILTER_KEY:-$SUCCESS_SOURCE_FILTER_KEY}}
   FAILURE_FILTER_KEY=${FAILURE_FILTER_KEY:-failure}
   IMITATION_MODE_NAME_VALUE="${SELF_IMITATION_MODE_NAME:-${IMITATION_MODE_NAME:-self_imitation_learning}}"
-  IMITATION_EXPERIMENT_NAME_VALUE="${SELF_IMITATION_EXPERIMENT_NAME:-${IMITATION_EXPERIMENT_NAME:-${TASK_RGB_PREFIX}_self_imitation_200demo_${SUCCESS_FILTER_SIZE}success}}"
+  IMITATION_EXPERIMENT_NAME_VALUE="${SELF_IMITATION_EXPERIMENT_NAME:-${IMITATION_EXPERIMENT_NAME:-${TASK_RGB_PREFIX}_self_imitation_200demo_all_success}}"
   IMITATION_DEMO_WEIGHT_VALUE="${SELF_IMITATION_DEMO_WEIGHT:-${IMITATION_DEMO_WEIGHT:-1.0}}"
   IMITATION_SUCCESS_WEIGHT_VALUE="${SELF_IMITATION_SUCCESS_WEIGHT:-${IMITATION_SUCCESS_WEIGHT:-1.0}}"
   IMITATION_FAILURE_WEIGHT_VALUE=0.0
@@ -374,6 +386,10 @@ prepare_fixed_filter() {
 }
 
 prepare_success_filter() {
+  if [[ "$SUCCESS_FILTER_KEY" == "$SUCCESS_SOURCE_FILTER_KEY" ]]; then
+    echo "[prepare_filters] success: using complete existing mask/$SUCCESS_SOURCE_FILTER_KEY" >&2
+    return
+  fi
   prepare_fixed_filter \
     success \
     "$SUCCESS_DATASET" \
@@ -423,7 +439,8 @@ check_datasets() {
     "$CONDITION_LABEL_MODE" \
     "${CONDITIONED_MIXED_IMITATION:-0}" \
     "${MIXED_IMITATION_FAILURE_DEMO_START_ONLY:-0}" \
-    "${MIXED_IMITATION_FAILURE_SAMPLE_START_OFFSET:-0}" <<'PYCHECK'
+    "${MIXED_IMITATION_FAILURE_SAMPLE_START_OFFSET:-0}" \
+    "$IMITATION_NUM_GPUS" <<'PYCHECK'
 import json
 import sys
 from pathlib import Path
@@ -457,7 +474,8 @@ import torch
     conditioned_mixed_imitation,
     failure_demo_start_only,
     failure_sample_start_offset,
-) = sys.argv[1:26]
+    num_gpus,
+) = sys.argv[1:27]
 
 checkpoint_dict = torch.load(checkpoint, map_location="cpu", weights_only=False)
 checkpoint_config = json.loads(checkpoint_dict["config"])
@@ -566,11 +584,18 @@ pooled_num_sequences = sum(
     if weight > 0.0
 )
 effective_batch_size = int(actor_batch_size or checkpoint_train["batch_size"])
-drop_last = pooled_num_sequences >= effective_batch_size
+world_size = int(num_gpus)
+sequences_per_rank = (
+    (pooled_num_sequences + world_size - 1) // world_size
+    if world_size > 1
+    else pooled_num_sequences
+)
+distributed_padding = sequences_per_rank * world_size - pooled_num_sequences
+drop_last = sequences_per_rank >= effective_batch_size
 auto_steps_per_epoch = (
-    pooled_num_sequences // effective_batch_size
+    sequences_per_rank // effective_batch_size
     if drop_last
-    else int(pooled_num_sequences > 0)
+    else int(sequences_per_rank > 0)
 )
 effective_steps_per_epoch = (
     auto_steps_per_epoch if steps_per_epoch == "auto" else int(steps_per_epoch)
@@ -608,9 +633,16 @@ report = {
         ),
         "pooled_num_training_sequences": pooled_num_sequences,
         "source_num_training_sequences": source_num_sequences,
+        "distributed_world_size": world_size,
+        "distributed_sampler_rows_per_rank": sequences_per_rank,
+        "distributed_sampler_padding_rows": distributed_padding,
+        "batch_size_per_rank": effective_batch_size,
+        "effective_global_batch_size": effective_batch_size * world_size,
         "drop_last": drop_last,
         "dropped_sequences_per_epoch": (
-            pooled_num_sequences % effective_batch_size if drop_last else 0
+            (sequences_per_rank % effective_batch_size) * world_size
+            if drop_last
+            else 0
         ),
         "steps_per_epoch": effective_steps_per_epoch,
         "steps_per_epoch_source": "environment_override" if steps_per_epoch != "auto" else "dataloader_length",
@@ -712,14 +744,32 @@ maybe_prepare_filters() {
 
 run_train() {
   local -a resume_args=("$@")
-  "$PYTHON" -B scripts/train_rgb_dp_mixed_imitation.py \
+  local -a distributed_args=()
+  local -a train_launcher=("$PYTHON" -B)
+  if (( IMITATION_NUM_GPUS > 1 )); then
+    train_launcher=(
+      "$PYTHON" -B -m torch.distributed.run
+      --standalone
+      --nnodes=1
+      "--nproc-per-node=$IMITATION_NUM_GPUS"
+    )
+    distributed_args=(
+      --distributed
+      --distributed-backend "${IMITATION_DISTRIBUTED_BACKEND:-auto}"
+      --gradient-bucket-cap-mb "${IMITATION_GRADIENT_BUCKET_CAP_MB:-100}"
+    )
+    export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
+    echo "[rgb_dp_self_imitation] distributed training: GPUs=$IMITATION_NUM_GPUS per-rank-batch=$ACTOR_BATCH_SIZE" >&2
+  fi
+  "${train_launcher[@]}" scripts/train_rgb_dp_mixed_imitation.py \
+    "${distributed_args[@]}" \
     --checkpoint "$DP_CHECKPOINT" \
     --demo-dataset "$DEMO_DATASET" \
     --success-dataset "$SUCCESS_DATASET" \
     --failure-dataset "$FAILURE_DATASET" \
     --output-dir "$IMITATION_OUTPUT_DIR" \
     "${resume_args[@]}" \
-    --device cuda \
+    --device "${DEVICE:-cuda}" \
     "${IMITATION_SEED_ARGS[@]}" \
     --epochs "$IMITATION_EPOCHS" \
     "${IMITATION_STEPS_PER_EPOCH_ARGS[@]}" \
