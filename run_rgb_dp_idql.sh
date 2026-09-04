@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+USER_REAL_ROBOT_ROLLOUT_SOURCE_ROOT_SET=${REAL_ROBOT_ROLLOUT_SOURCE_ROOT+x}
+
 first_arg=${1:-}
 first_arg=${first_arg,,}
 first_arg=${first_arg//-/_}
@@ -18,6 +20,8 @@ TASK_REAL_ROBOT_HUMAN_DATASETS=
 TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=
 TASK_REAL_ROBOT_ROLLOUT_BUILDER=
 TASK_REAL_ROBOT_MIXED_BUILDER=
+TASK_REAL_ROBOT_VALIDATION_DATASET=
+TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=-1
 
 case "$TASK" in
   square)
@@ -116,18 +120,18 @@ case "$TASK" in
     TASK_REAL_ROBOT_MIXED_BUILDER=scripts/real_robot/build_pick_cup_chunk_idql_dataset.py
     ;;
   stack_cup)
-    TASK_DP_CHECKPOINT=trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260822155238/models/model_epoch_200.pth
+    TASK_DP_CHECKPOINT=trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260902111545/models/model_epoch_200.pth
     TASK_EXPERT_DATASET=datasets/real_robot/stack_cup/stack_cup_rgb.hdf5
-    TASK_ROLLOUT_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_epoch200_20hz_rollouts.hdf5
-    TASK_IDQL_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_44demo_26success_14failure_terminal_success.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/idql/44demo_26success_14failure_terminal_success
-    TASK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/idql/44demo_26success_14failure_terminal_success
+    TASK_ROLLOUT_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_epoch200_ddim100_20hz_rollouts.hdf5
+    TASK_IDQL_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_idql_44demo_20success_10failure_ddim100_terminal_success.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/idql/44demo_20success_10failure_ddim100_terminal_success_rise_temporal_v2_dynamics
+    TASK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/idql/44demo_20success_10failure_ddim100_terminal_success_rise_temporal_v2_dynamics
     TASK_EXPERT_MASK=train
     TASK_EXPERT_COUNT=44
     TASK_SUCCESS_MASK=success_train
-    TASK_SUCCESS_COUNT=26
+    TASK_SUCCESS_COUNT=20
     TASK_FAILURE_MASK=failure_train
-    TASK_FAILURE_COUNT=14
+    TASK_FAILURE_COUNT=10
     TASK_CRITIC_GROUP_NORM=0
     TASK_EVAL_HORIZON=600
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
@@ -135,8 +139,10 @@ case "$TASK" in
     TASK_REAL_ROBOT=1
     TASK_REAL_ROBOT_HUMAN_DATASETS=$TASK_EXPERT_DATASET
     TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets/stack_cup/rollout
-    TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_stack_cup_rollout_hdf5.py
+    TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_stack_cup_processed_rollout_hdf5.py
     TASK_REAL_ROBOT_MIXED_BUILDER=scripts/real_robot/build_stack_cup_chunk_idql_dataset.py
+    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_idql_validation_5demo_6success_4failure_ddim100_terminal_success.hdf5
+    TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=2286
     ;;
   *)
     echo "Unsupported TASK=$TASK. Use square, can, transport, tool_hang, pick_cup, or stack_cup." >&2
@@ -180,6 +186,8 @@ EXPERT_DATASET=${EXPERT_DATASET:-$TASK_EXPERT_DATASET}
 ROLLOUT_DATASET=${ROLLOUT_DATASET:-$TASK_ROLLOUT_DATASET}
 REAL_ROBOT_HUMAN_DATASETS=${REAL_ROBOT_HUMAN_DATASETS:-$TASK_REAL_ROBOT_HUMAN_DATASETS}
 REAL_ROBOT_ROLLOUT_SOURCE_ROOT=${REAL_ROBOT_ROLLOUT_SOURCE_ROOT:-$TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT}
+REAL_ROBOT_VALIDATION_DATASET=${REAL_ROBOT_VALIDATION_DATASET:-$TASK_REAL_ROBOT_VALIDATION_DATASET}
+REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=${REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS:-$TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS}
 IDQL_REWARD_MODE=${IDQL_REWARD_MODE:-$TASK_DEFAULT_IDQL_REWARD_MODE}
 case "$IDQL_REWARD_MODE" in
   task)
@@ -232,6 +240,21 @@ SUCCESS_COUNT=${SUCCESS_COUNT:-$TASK_SUCCESS_COUNT}
 FAILURE_MASK=${FAILURE_MASK:-$TASK_FAILURE_MASK}
 FAILURE_COUNT=${FAILURE_COUNT:-$TASK_FAILURE_COUNT}
 
+DEFAULT_IDQL_DYNAMICS_WEIGHT=0.0
+DEFAULT_IDQL_ACTOR_UNET_LR=${ACTOR_LR:-1e-4}
+DEFAULT_IDQL_ACTOR_OBS_ENCODER_LR=${ACTOR_LR:-1e-4}
+DEFAULT_IDQL_ACTOR_OBS_ENCODER_FREEZE_STEPS=0
+DEFAULT_IDQL_CRITIC_ENCODER_FREEZE_STEPS=0
+DEFAULT_IDQL_VF_ENCODER_FREEZE_STEPS=0
+if [[ "$TASK" == "stack_cup" ]]; then
+  DEFAULT_IDQL_DYNAMICS_WEIGHT=0.05
+  DEFAULT_IDQL_ACTOR_UNET_LR=1e-5
+  DEFAULT_IDQL_ACTOR_OBS_ENCODER_LR=1e-5
+  DEFAULT_IDQL_ACTOR_OBS_ENCODER_FREEZE_STEPS=1000
+  DEFAULT_IDQL_CRITIC_ENCODER_FREEZE_STEPS=1000
+  DEFAULT_IDQL_VF_ENCODER_FREEZE_STEPS=1000
+fi
+
 PIN_MEMORY_ARG=--pin-memory
 if [[ "${PIN_MEMORY:-1}" == "0" ]]; then
   PIN_MEMORY_ARG=--no-pin-memory
@@ -281,11 +304,23 @@ require_simulation_stage_task() {
 
 ensure_real_robot_rollout_dataset() {
   if [[ -f "$ROLLOUT_DATASET" && -s "$ROLLOUT_DATASET" ]]; then
-    echo "[rgb_dp_idql task=$TASK] validating converted rollout provenance: $ROLLOUT_DATASET" >&2
-    "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
-      --source-root "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" \
-      --output "$ROLLOUT_DATASET" \
-      --validate-only
+    if [[ "${REAL_ROBOT_ROLLOUT_OUTPUT_ONLY_VALIDATION:-0}" == "1" ]]; then
+      echo "[rgb_dp_idql task=$TASK] output-only rollout validation was explicitly requested: $ROLLOUT_DATASET" >&2
+      "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
+        --output "$ROLLOUT_DATASET" \
+        --validate-output-only
+    elif [[ -d "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" || -n "$USER_REAL_ROBOT_ROLLOUT_SOURCE_ROOT_SET" ]]; then
+      echo "[rgb_dp_idql task=$TASK] validating converted rollout provenance: $ROLLOUT_DATASET" >&2
+      "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
+        --source-root "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" \
+        --output "$ROLLOUT_DATASET" \
+        --validate-only
+    else
+      echo "[rgb_dp_idql task=$TASK] raw rollout source is unavailable; validating the HDF5 and its embedded immutable manifest: $ROLLOUT_DATASET" >&2
+      "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
+        --output "$ROLLOUT_DATASET" \
+        --validate-output-only
+    fi
     return
   fi
   if [[ ! -d "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" ]]; then
@@ -343,10 +378,59 @@ run_real_robot_mixed_builder() {
     "${mode_args[@]}"
 }
 
+run_real_robot_validation_builder() {
+  local validation_only=${1:-0}
+  local -a human_datasets=()
+  local -a human_args=()
+  local -a mode_args=()
+  read -r -a human_datasets <<< "$REAL_ROBOT_HUMAN_DATASETS"
+  if (( ${#human_datasets[@]} == 0 )); then
+    echo "REAL_ROBOT_HUMAN_DATASETS must contain at least one human HDF5 path." >&2
+    exit 2
+  fi
+  if [[ -z "$REAL_ROBOT_VALIDATION_DATASET" ]]; then
+    return
+  fi
+  for dataset_path in "${human_datasets[@]}"; do
+    if [[ ! -f "$dataset_path" || ! -s "$dataset_path" ]]; then
+      echo "[rgb_dp_idql task=$TASK] human dataset does not exist or is empty: $dataset_path" >&2
+      exit 1
+    fi
+    human_args+=(--human-dataset "$dataset_path")
+  done
+  if [[ ! -f "$ROLLOUT_DATASET" || ! -s "$ROLLOUT_DATASET" ]]; then
+    echo "[rgb_dp_idql task=$TASK] rollout dataset does not exist or is empty: $ROLLOUT_DATASET" >&2
+    exit 1
+  fi
+  if [[ "$validation_only" == "1" || ( -f "$REAL_ROBOT_VALIDATION_DATASET" && "${OVERWRITE_DATASET:-0}" != "1" ) ]]; then
+    mode_args=(--validate-only)
+  elif [[ "${OVERWRITE_DATASET:-0}" == "1" ]]; then
+    mode_args=(--overwrite)
+  fi
+  "$PYTHON" -B "$TASK_REAL_ROBOT_MIXED_BUILDER" \
+    --task "$TASK" \
+    "${human_args[@]}" \
+    --rollout-dataset "$ROLLOUT_DATASET" \
+    --output "$REAL_ROBOT_VALIDATION_DATASET" \
+    --selection-role validation \
+    --human-mask valid \
+    --human-count -1 \
+    --expected-human-transitions "$REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS" \
+    --success-mask success_valid \
+    --success-count -1 \
+    --failure-mask failure_valid \
+    --failure-count -1 \
+    --reward-mode "$IDQL_REWARD_MODE" \
+    --actor-condition-mode human_only \
+    --seed "${DATASET_SEED:-0}" \
+    "${mode_args[@]}"
+}
+
 build_dataset() {
   local overwrite_args=()
   if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
     run_real_robot_mixed_builder 0
+    run_real_robot_validation_builder 0
     return
   fi
   if [[ ! -f "$EXPERT_DATASET" ]]; then
@@ -380,6 +464,7 @@ build_dataset() {
 ensure_dataset() {
   if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
     run_real_robot_mixed_builder 0
+    run_real_robot_validation_builder 0
     return
   fi
   if [[ ! -f "$IDQL_DATASET" ]]; then
@@ -393,12 +478,19 @@ run_train() {
   local resume_args=()
   local steps_per_epoch_args=()
   local distributed_args=()
+  local heldout_args=()
   local train_launcher=("$PYTHON" -B)
   if [[ -n "$resume_path" ]]; then
     resume_args=(--resume-checkpoint "$resume_path")
   fi
   if [[ -n "${STEPS_PER_EPOCH:-}" ]]; then
     steps_per_epoch_args=(--steps-per-epoch "$STEPS_PER_EPOCH")
+  fi
+  if [[ "$TASK_REAL_ROBOT" == "1" && -n "$REAL_ROBOT_VALIDATION_DATASET" ]]; then
+    heldout_args=(
+      --validation-dataset "$REAL_ROBOT_VALIDATION_DATASET"
+      --validation-seed "${IDQL_VALIDATION_SEED:-10000}"
+    )
   fi
   if (( IDQL_NUM_GPUS > 1 )); then
     train_launcher=(
@@ -421,6 +513,7 @@ run_train() {
     --dataset "$IDQL_DATASET" \
     --checkpoint "$DP_CHECKPOINT" \
     --output-dir "$IDQL_OUTPUT_DIR" \
+    "${heldout_args[@]}" \
     "${resume_args[@]}" \
     --device "${DEVICE:-cuda}" \
     --seed "${SEED:-0}" \
@@ -439,9 +532,14 @@ run_train() {
     --expectile "${EXPECTILE:-0.9}" \
     --target-tau "${TARGET_TAU:-0.01}" \
     --actor-lr "${ACTOR_LR:-1e-4}" \
+    --actor-unet-lr "${ACTOR_UNET_LR:-$DEFAULT_IDQL_ACTOR_UNET_LR}" \
+    --actor-obs-encoder-lr "${ACTOR_OBS_ENCODER_LR:-$DEFAULT_IDQL_ACTOR_OBS_ENCODER_LR}" \
+    --actor-obs-encoder-freeze-steps "${ACTOR_OBS_ENCODER_FREEZE_STEPS:-$DEFAULT_IDQL_ACTOR_OBS_ENCODER_FREEZE_STEPS}" \
     --critic-lr "${CRITIC_LR:-1e-4}" \
     --encoder-lr "${ENCODER_LR:-1e-5}" \
+    --encoder-freeze-steps "${ENCODER_FREEZE_STEPS:-$DEFAULT_IDQL_CRITIC_ENCODER_FREEZE_STEPS}" \
     --vf-lr "${VF_LR:-1e-4}" \
+    --vf-encoder-freeze-steps "${VF_ENCODER_FREEZE_STEPS:-$DEFAULT_IDQL_VF_ENCODER_FREEZE_STEPS}" \
     --lr-scheduler "${LR_SCHEDULER:-cosine}" \
     --lr-warmup-steps "${LR_WARMUP_STEPS:-500}" \
     --lr-num-cycles "${LR_NUM_CYCLES:-0.5}" \
@@ -457,7 +555,7 @@ run_train() {
     --temporal-feedforward-dim "${IDQL_TEMPORAL_FEEDFORWARD_DIM:-600}" \
     --temporal-dropout "${IDQL_TEMPORAL_DROPOUT:-0.0}" \
     --rise-v2-fusion-mode "${IDQL_RISE_V2_FUSION_MODE:-film}" \
-    --dynamics-weight "${DYNAMICS_WEIGHT:-0.0}" \
+    --dynamics-weight "${DYNAMICS_WEIGHT:-$DEFAULT_IDQL_DYNAMICS_WEIGHT}" \
     --num-critics "${NUM_CRITICS:-2}" \
     "$CRITIC_GROUP_NORM_ARG" \
     --critic-late-fusion-key "$CRITIC_LATE_FUSION_KEY" \

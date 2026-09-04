@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -40,15 +41,19 @@ from scripts.real_robot.stack_cup_common import (  # noqa: E402
     DEFAULT_SOURCE,
     LOW_DIM_KEYS,
     RGB_KEYS,
+    TASK_LABEL,
+    TASK_NAME,
     atomic_write_json,
     dataset_path,
 )
 
 
 DEFAULT_DATASET = dataset_path(DEFAULT_DATASET_DIR)
-DEFAULT_CONFIG_DIR = ROOT / "robomimic/exps/templates/real_robot/stack_cup"
-DEFAULT_MODEL_ROOT = ROOT / "trained_models/real_robot/stack_cup_rgb_dp"
+DEFAULT_CONFIG_DIR = ROOT / f"robomimic/exps/templates/real_robot/{TASK_NAME}"
+DEFAULT_MODEL_ROOT = ROOT / f"trained_models/real_robot/{TASK_NAME}_rgb_dp"
 TEMPLATE = ROOT / "robomimic/exps/templates/diffusion_policy.json"
+DATASET_BUILDER_MODULE = f"scripts.real_robot.build_{TASK_NAME}_dataset"
+DATASET_VALIDATOR_MODULE = f"scripts.real_robot.validate_{TASK_NAME}_dataset"
 
 PYTHON = Path(
     os.environ.get(
@@ -166,7 +171,7 @@ def make_config(
     image_height: int = DEFAULT_IMAGE_HEIGHT,
     image_width: int = DEFAULT_IMAGE_WIDTH,
 ) -> dict[str, Any]:
-    """Create the exact 20 Hz stack-cup production configuration."""
+    """Create the exact 20 Hz real-robot production configuration."""
 
     if options.sampler not in ("ddim", "ddpm"):
         raise ValueError(f"unsupported sampler: {options.sampler}")
@@ -197,7 +202,7 @@ def make_config(
     ):
         raise ValueError("ddim_steps cannot exceed the DDIM training timestep count")
 
-    experiment_name = f"stack_cup_rgb_dp_{options.sampler}_s{options.seed}"
+    experiment_name = f"{TASK_NAME}_rgb_dp_{options.sampler}_s{options.seed}"
     if options.train_mask != "train":
         experiment_name += f"_{_safe_suffix(options.train_mask).lstrip('_')}"
     if options.smoke:
@@ -250,7 +255,7 @@ def make_config(
     config["train"]["hdf5_normalize_obs"] = False
     if options.train_mask not in ("train", "train_clean"):
         raise ValueError(
-            f"unsupported stack-cup training mask: {options.train_mask!r}"
+            f"unsupported {TASK_LABEL} training mask: {options.train_mask!r}"
         )
     config["train"]["hdf5_filter_key"] = options.train_mask
     config["train"]["hdf5_validation_filter_key"] = "valid"
@@ -309,7 +314,7 @@ def make_config(
 def write_config(config: dict[str, Any], config_dir: Path) -> Path:
     path = config_dir.expanduser().resolve() / f"{config['experiment']['name']}.json"
     atomic_write_json(path, config)
-    print(f"[stack-cup RGB-DP] wrote config: {path}", flush=True)
+    print(f"[{TASK_LABEL} RGB-DP] wrote config: {path}", flush=True)
     return path
 
 
@@ -338,7 +343,7 @@ def standard_loader_preflight(config_dict: dict[str, Any]) -> dict[str, Any]:
     ObsUtils.initialize_obs_utils_with_config(config)
 
     if len(config.train.data) != 1:
-        raise ValueError("stack-cup baseline requires exactly one dataset shard")
+        raise ValueError(f"{TASK_LABEL} baseline requires exactly one dataset shard")
     signature = FileUtils.get_shape_metadata_from_dataset(
         dataset_config=config.train.data[0],
         action_keys=config.train.action_keys,
@@ -486,7 +491,7 @@ def _resume_run_dir(config: dict[str, Any]) -> Path:
 def process_env(*, smoke: bool) -> dict[str, str]:
     env = os.environ.copy()
     env.update(COMMON_ENV)
-    env["PYTHONPYCACHEPREFIX"] = "/tmp/robomimic_stack_cup_rgb_dp_pycache"
+    env["PYTHONPYCACHEPREFIX"] = f"/tmp/robomimic_{TASK_NAME}_rgb_dp_pycache"
     env["ROBOMIMIC_SAVE_LATEST_EVERY_N_EPOCHS"] = "1" if smoke else "50"
     return env
 
@@ -495,24 +500,25 @@ def train(config_path: Path, config: dict[str, Any], *, resume: bool) -> Path:
     existing_checkpoint = find_checkpoint(config)
     if existing_checkpoint is not None:
         print(
-            f"[stack-cup RGB-DP] using existing completed checkpoint: "
+            f"[{TASK_LABEL} RGB-DP] using existing completed checkpoint: "
             f"{existing_checkpoint}",
             flush=True,
         )
         return existing_checkpoint
 
     output_root = experiment_root(config)
+    keep_existing_runs = output_root.exists() and not resume
     if resume:
         resume_dir = _resume_run_dir(config)
         print(
-            f"[stack-cup RGB-DP] resuming compatible run: {resume_dir}",
+            f"[{TASK_LABEL} RGB-DP] resuming compatible run: {resume_dir}",
             flush=True,
         )
-    elif output_root.exists():
-        raise FileExistsError(
-            f"experiment exists but has no compatible completed checkpoint at "
-            f"{output_root}; use --name-suffix for a new run, or --resume only "
-            "when the latest run has the same config and dataset fingerprint"
+    elif keep_existing_runs:
+        print(
+            f"[{TASK_LABEL} RGB-DP] retaining existing runs under {output_root}; "
+            "starting this incompatible dataset/config as a new timestamped run",
+            flush=True,
         )
 
     command = [
@@ -530,6 +536,7 @@ def train(config_path: Path, config: dict[str, Any], *, resume: bool) -> Path:
         command,
         cwd=ROOT,
         env=process_env(smoke="_smoke" in config["experiment"]["name"]),
+        input=b"n\n" if keep_existing_runs else None,
         check=True,
     )
     checkpoint = find_checkpoint(config)
@@ -538,7 +545,7 @@ def train(config_path: Path, config: dict[str, Any], *, resume: bool) -> Path:
             "robomimic training returned without the expected epoch checkpoint; "
             f"inspect logs under {output_root}"
         )
-    print(f"[stack-cup RGB-DP] training target: {checkpoint}", flush=True)
+    print(f"[{TASK_LABEL} RGB-DP] training target: {checkpoint}", flush=True)
     return checkpoint
 
 
@@ -567,15 +574,17 @@ def _training_options(args: argparse.Namespace) -> TrainingOptions:
 
 
 def _build_dataset(args: argparse.Namespace) -> dict[str, Any]:
-    """Call the stack-cup converter through its typed public interface."""
+    """Call the task converter through its typed public interface."""
 
-    from scripts.real_robot.build_stack_cup_dataset import BuildOptions, build_dataset
+    builder = importlib.import_module(DATASET_BUILDER_MODULE)
+    BuildOptions = builder.BuildOptions
+    build_dataset = builder.build_dataset
 
     requested = args.dataset.expanduser().resolve()
     expected = dataset_path(requested.parent).resolve()
     if requested != expected:
         raise ValueError(
-            f"stack-cup builder publishes the fixed filename {expected.name!r}; "
+            f"{TASK_LABEL} builder publishes the fixed filename {expected.name!r}; "
             f"requested dataset was {requested}"
         )
     return build_dataset(
@@ -593,13 +602,15 @@ def _build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _validate_dataset(dataset: Path, source: Path) -> dict[str, Any]:
-    from scripts.real_robot.validate_stack_cup_dataset import validate_published_dataset
+    validate_published_dataset = importlib.import_module(
+        DATASET_VALIDATOR_MODULE
+    ).validate_published_dataset
 
     requested = dataset.expanduser().resolve()
     expected = dataset_path(requested.parent).resolve()
     if requested != expected:
         raise ValueError(
-            f"stack-cup published dataset must be named {expected.name!r}, got "
+            f"{TASK_LABEL} published dataset must be named {expected.name!r}, got "
             f"{requested.name!r}"
         )
     return validate_published_dataset(
@@ -647,7 +658,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-every-epochs", type=int, default=50)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--name-suffix", default="")
+    parser.add_argument(
+        "--name-suffix",
+        default="",
+        help="optional suffix appended to the experiment name",
+    )
     parser.add_argument(
         "--train-mask",
         choices=("train", "train_clean"),

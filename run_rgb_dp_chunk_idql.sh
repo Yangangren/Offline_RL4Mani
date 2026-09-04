@@ -13,6 +13,7 @@ USER_SUCCESS_COUNT_SET=${SUCCESS_COUNT+x}
 USER_FAILURE_MASK_SET=${FAILURE_MASK+x}
 USER_FAILURE_COUNT_SET=${FAILURE_COUNT+x}
 USER_REAL_ROBOT_VALIDATION_DATASET_SET=${REAL_ROBOT_VALIDATION_DATASET+x}
+USER_REAL_ROBOT_ROLLOUT_SOURCE_ROOT_SET=${REAL_ROBOT_ROLLOUT_SOURCE_ROOT+x}
 
 first_arg=${1:-}
 first_arg=${first_arg,,}
@@ -168,36 +169,36 @@ case "$TASK" in
     TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=4371
     ;;
   stack_cup)
-    TASK_DP_CHECKPOINT=trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260822155238/models/model_epoch_200.pth
+    TASK_DP_CHECKPOINT=trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260902111545/models/model_epoch_50.pth
     TASK_EXPERT_DATASET=datasets/real_robot/stack_cup/stack_cup_rgb.hdf5
-    TASK_ROLLOUT_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_epoch200_20hz_rollouts.hdf5
-    TASK_IDQL_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_44demo_26success_14failure_terminal_success.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/idql/44demo_26success_14failure_terminal_success
-    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/chunk_idql/44demo_26success_14failure_h8_dynamics_human_condition_terminal_success
+    TASK_ROLLOUT_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_epoch200_ddim100_20hz_rollouts.hdf5
+    TASK_IDQL_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_44demo_20success_10failure_ddim100_terminal_success.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/idql/44demo_20success_10failure_ddim100_terminal_success
+    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/chunk_idql/44demo_20success_10failure_ddim100_h8_dynamics_human_success_condition_terminal_success
     TASK_EXPERT_MASK=train
     TASK_EXPERT_COUNT=44
     TASK_SUCCESS_MASK=success_train
-    TASK_SUCCESS_COUNT=26
+    TASK_SUCCESS_COUNT=20
     TASK_FAILURE_MASK=failure_train
-    TASK_FAILURE_COUNT=14
+    TASK_FAILURE_COUNT=10
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
     TASK_CHUNK_EPOCHS=50
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
-    TASK_CHUNK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/chunk_idql/44demo_26success_14failure_h8_dynamics_human_condition_terminal_success
+    TASK_CHUNK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/chunk_idql/44demo_20success_10failure_ddim100_h8_dynamics_human_success_condition_terminal_success
     TASK_COMPOSED_DP_CHECKPOINT=$TASK_DP_CHECKPOINT
-    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/chunk_idql/44demo_26success_14failure_h8_dynamics_human_condition_terminal_success_epoch200_actor
+    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/chunk_idql/44demo_20success_10failure_ddim100_h8_dynamics_human_success_condition_terminal_success_epoch200_actor
     TASK_EVAL_HORIZON=600
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
     TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     TASK_REAL_ROBOT=1
     TASK_REAL_ROBOT_HUMAN_DATASETS=$TASK_EXPERT_DATASET
     TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets/stack_cup/rollout
-    TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_stack_cup_rollout_hdf5.py
+    TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_stack_cup_processed_rollout_hdf5.py
     TASK_REAL_ROBOT_MIXED_BUILDER=scripts/real_robot/build_stack_cup_chunk_idql_dataset.py
-    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_validation_5demo_6success_4failure_terminal_success.hdf5
-    TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=2643
+    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_validation_5demo_6success_4failure_ddim100_terminal_success.hdf5
+    TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=2286
     ;;
   *)
     echo "Unsupported TASK=$TASK. Use square, can, transport, tool_hang, pick_cup, or stack_cup." >&2
@@ -883,11 +884,23 @@ ensure_collection_rgb_dataset() {
 
 ensure_real_robot_rollout_dataset() {
   if [[ -f "$ROLLOUT_DATASET" && -s "$ROLLOUT_DATASET" ]]; then
-    echo "[rgb_dp_chunk_idql task=$TASK] validating converted rollout provenance: $ROLLOUT_DATASET" >&2
-    "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
-      --source-root "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" \
-      --output "$ROLLOUT_DATASET" \
-      --validate-only
+    if [[ "${REAL_ROBOT_ROLLOUT_OUTPUT_ONLY_VALIDATION:-0}" == "1" ]]; then
+      echo "[rgb_dp_chunk_idql task=$TASK] output-only rollout validation was explicitly requested: $ROLLOUT_DATASET" >&2
+      "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
+        --output "$ROLLOUT_DATASET" \
+        --validate-output-only
+    elif [[ -d "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" || -n "$USER_REAL_ROBOT_ROLLOUT_SOURCE_ROOT_SET" ]]; then
+      echo "[rgb_dp_chunk_idql task=$TASK] validating converted rollout provenance: $ROLLOUT_DATASET" >&2
+      "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
+        --source-root "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" \
+        --output "$ROLLOUT_DATASET" \
+        --validate-only
+    else
+      echo "[rgb_dp_chunk_idql task=$TASK] raw rollout source is unavailable; validating the HDF5 and its embedded immutable manifest: $ROLLOUT_DATASET" >&2
+      "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
+        --output "$ROLLOUT_DATASET" \
+        --validate-output-only
+    fi
     return
   fi
   if [[ ! -d "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" ]]; then

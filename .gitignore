@@ -143,3 +143,4 @@ tests/real_robot/*
 !tests/test_rgb_dp_mixed_imitation_launcher.py
 !tests/test_rgb_dp_failure_filter_imitation_launcher.py
 !tests/test_stack_cup_idql_launchers.py
+analysis/*

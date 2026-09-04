@@ -91,6 +91,14 @@ def parse_args(argv: Sequence[str] | None = None) -> core.BuildOptions:
     parser.add_argument("--episode-limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument(
+        "--validate-output-only",
+        action="store_true",
+        help=(
+            "validate the HDF5 and embedded manifest when the raw rollout "
+            "handoff is no longer mounted"
+        ),
+    )
     args = parser.parse_args(argv)
     return core.BuildOptions(
         source_root=args.source_root,
@@ -104,6 +112,7 @@ def parse_args(argv: Sequence[str] | None = None) -> core.BuildOptions:
         episode_limit=args.episode_limit,
         overwrite=args.overwrite,
         validate_only=args.validate_only,
+        validate_output_only=args.validate_output_only,
     )
 
 

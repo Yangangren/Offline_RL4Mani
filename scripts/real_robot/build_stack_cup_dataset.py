@@ -11,6 +11,7 @@ the dataset contract because its camera gap violates the 0.5 second age bound.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -42,14 +43,19 @@ from scripts.real_robot.stack_cup_common import (  # noqa: E402
     DEFAULT_IMAGE_WIDTH,
     DEFAULT_MAX_IMAGE_AGE_SEC,
     DEFAULT_SOURCE,
+    ENV_NAME,
     EXCLUDED_EPISODES,
+    EXPECTED_INCLUDED_EPISODES,
     IMAGE_HZ,
     LOW_DIM_KEYS,
     ROTATION_SCALE_RAD,
     RGB_KEYS,
     SCHEMA_VERSION,
+    TASK_LABEL,
+    TASK_NAME,
     TRANSLATION_SCALE_M,
     VALIDATION_EPISODE_NUMBERS,
+    OUTCOME_MANUAL_REVIEW,
     StackCupEpisodeRow,
     as_float_array,
     atomic_write_json,
@@ -63,6 +69,9 @@ from scripts.real_robot.stack_cup_common import (  # noqa: E402
     source_identity,
     strictly_increasing,
 )
+
+
+VALIDATOR_MODULE = "scripts.real_robot.validate_stack_cup_dataset"
 
 
 @dataclass(frozen=True)
@@ -204,13 +213,118 @@ def _validate_collection_contract(episode_dir: Path, row: StackCupEpisodeRow) ->
         raise ValueError(f"{collector_path} base frame must be panda_link0")
 
 
+def _deduplicate_policy_actions(
+    episode_dir: Path,
+    actions_path: Path,
+    raw_actions: np.ndarray,
+    poses: np.ndarray,
+    target_times: np.ndarray,
+    source_times: np.ndarray,
+    source_indices: np.ndarray,
+    steps: np.ndarray,
+    offsets_ms: np.ndarray,
+) -> tuple[np.ndarray, ...]:
+    """Recover one exact row per executed action from the wall-clock export."""
+
+    if np.any(np.diff(source_indices) < 0):
+        raise ValueError(f"{actions_path} source indices move backward")
+    selected: list[int] = []
+    for source_index in np.unique(source_indices):
+        positions = np.flatnonzero(source_indices == source_index)
+        reference = int(positions[0])
+        for position in positions[1:]:
+            position = int(position)
+            if not (
+                np.array_equal(raw_actions[position], raw_actions[reference])
+                and np.array_equal(poses[position], poses[reference])
+                and source_times[position] == source_times[reference]
+            ):
+                raise ValueError(
+                    f"{actions_path} repeated source_index={source_index} has "
+                    "inconsistent action, pose, or timestamp"
+                )
+        selected.append(int(positions[np.argmin(np.abs(offsets_ms[positions]))]))
+    selection = np.asarray(selected, dtype=np.int64)
+    values = (
+        raw_actions[selection],
+        poses[selection],
+        target_times[selection],
+        source_times[selection],
+        source_indices[selection],
+        steps[selection],
+        offsets_ms[selection],
+        selection,
+    )
+    strictly_increasing(values[3], name=f"{actions_path} deduplicated source times")
+
+    run_path = episode_dir / "snapshots/run.json"
+    run = _require_object(load_json(run_path), name=str(run_path))
+    chunks = _require_nonempty_list(run.get("chunks"), name=f"{run_path}.chunks")
+    source_actions: list[np.ndarray] = []
+    expected_source_index = 0
+    for chunk_position, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict):
+            raise ValueError(f"{run_path}.chunks[{chunk_position}] must be an object")
+        chunk_actions = np.asarray(chunk.get("raw_actions"), dtype=np.float64)
+        if chunk_actions.ndim != 2 or chunk_actions.shape[1] != 7:
+            raise ValueError(
+                f"{run_path}.chunks[{chunk_position}].raw_actions has shape "
+                f"{chunk_actions.shape}, expected (N, 7)"
+            )
+        start = int(chunk.get("start_action_index", -1))
+        end = int(chunk.get("end_action_index", -1))
+        if start != expected_source_index or end != start + chunk_actions.shape[0]:
+            raise ValueError(f"{run_path} has a non-contiguous chunk range")
+        source_actions.extend(chunk_actions)
+        expected_source_index = end
+    source_action_array = np.asarray(source_actions, dtype=np.float64)
+    if source_action_array.shape != (int(run.get("actions_completed", -1)), 7):
+        raise ValueError(f"{run_path} action count differs from its chunk records")
+    deduplicated_actions = values[0]
+    deduplicated_indices = values[4]
+    if np.any(deduplicated_indices < 0) or np.any(
+        deduplicated_indices >= source_action_array.shape[0]
+    ):
+        raise ValueError(f"{actions_path} source index is outside the run action log")
+    if not np.array_equal(
+        deduplicated_actions.astype(np.float32),
+        source_action_array[deduplicated_indices].astype(np.float32),
+    ):
+        raise ValueError(f"{actions_path} actions differ from snapshots/run.json")
+
+    close_threshold = float(
+        run.get("arguments", {}).get("gripper_close_threshold", 0.0)
+    )
+    open_threshold = float(
+        run.get("arguments", {}).get("gripper_open_threshold", 0.5)
+    )
+    if close_threshold >= open_threshold:
+        raise ValueError(f"{run_path} has invalid gripper thresholds")
+    logical_before = np.empty(source_action_array.shape[0], dtype=np.float32)
+    logical_state = 1.0
+    for source_index, prediction in enumerate(source_action_array[:, 6]):
+        logical_before[source_index] = logical_state
+        if prediction <= close_threshold:
+            logical_state = -1.0
+        elif prediction >= open_threshold:
+            logical_state = 1.0
+    return (*values, logical_before[deduplicated_indices])
+
 def load_episode_payload(
     source_root: Path,
     row: StackCupEpisodeRow,
     *,
     max_image_age_sec: float,
+    policy_rollout: bool = False,
 ) -> EpisodePayload:
-    """Validate and load one included episode without scaling its actions."""
+    """Validate and load one included episode without scaling its actions.
+
+    ``policy_rollout`` consumes the postprocessed policy-rollout handoff. That
+    handoff contains an exact 20 Hz wall-clock grid, but rows can repeat one
+    executed controller action while the next diffusion chunk is inferred.
+    The immutable ``source_index`` provenance is therefore deduplicated here
+    so offline RL sees executed actions rather than synthetic repeats.
+    """
 
     if row.excluded:
         raise ValueError(
@@ -218,7 +332,8 @@ def load_episode_payload(
             f"{EXCLUDED_EPISODES[row.episode_number]}"
         )
     episode_dir = resolve_episode_dir(source_root, row)
-    _validate_collection_contract(episode_dir, row)
+    if not policy_rollout:
+        _validate_collection_contract(episode_dir, row)
     actions_path = episode_dir / "actions.json"
     frames_path = episode_dir / "frames.json"
     actions_document = _require_object(load_json(actions_path), name=str(actions_path))
@@ -249,28 +364,54 @@ def load_episode_payload(
     for index, raw_sample in enumerate(samples):
         if not isinstance(raw_sample, dict):
             raise ValueError(f"{actions_path}.samples[{index}] must be an object")
-        action = as_float_array(
+        stored_action = as_float_array(
             raw_sample.get("action"),
             shape=(7,),
             name=f"{actions_path}.samples[{index}].action",
         )
+        if policy_rollout:
+            action = as_float_array(
+                raw_sample.get("raw_action"),
+                shape=(7,),
+                name=f"{actions_path}.samples[{index}].raw_action",
+            )
+            expected_physical = action * np.asarray(
+                [
+                    TRANSLATION_SCALE_M,
+                    TRANSLATION_SCALE_M,
+                    TRANSLATION_SCALE_M,
+                    ROTATION_SCALE_RAD,
+                    ROTATION_SCALE_RAD,
+                    ROTATION_SCALE_RAD,
+                    1.0,
+                ],
+                dtype=np.float64,
+            )
+            if not np.allclose(
+                stored_action, expected_physical, atol=5e-7, rtol=1e-6
+            ):
+                raise ValueError(
+                    f"{actions_path}.samples[{index}] physical action differs "
+                    "from the normalized policy proposal and controller scales"
+                )
         if np.any(action < -1.000001) or np.any(action > 1.000001):
             raise ValueError(
                 f"{actions_path}.samples[{index}].action is outside normalized [-1,1]"
             )
-        if action[6] not in (-1.0, 0.0, 1.0):
+        if not policy_rollout and action[6] not in (-1.0, 0.0, 1.0):
             raise ValueError(
                 f"{actions_path}.samples[{index}] has invalid gripper event {action[6]}"
             )
-        raw_motion = as_float_array(
-            raw_sample.get("raw_action"),
-            shape=(6,),
-            name=f"{actions_path}.samples[{index}].raw_action",
-        )
-        if not np.allclose(action[:6], raw_motion, atol=5e-7, rtol=0.0):
-            raise ValueError(
-                f"{actions_path}.samples[{index}] action motion differs from raw_action"
+        if not policy_rollout:
+            raw_motion = as_float_array(
+                raw_sample.get("raw_action"),
+                shape=(6,),
+                name=f"{actions_path}.samples[{index}].raw_action",
             )
+            if not np.allclose(action[:6], raw_motion, atol=5e-7, rtol=0.0):
+                raise ValueError(
+                    f"{actions_path}.samples[{index}] action motion differs from raw_action"
+                )
         clip = raw_sample.get("clip")
         if clip not in (None, []):
             raise ValueError(f"{actions_path}.samples[{index}] reports clipping: {clip}")
@@ -327,23 +468,72 @@ def load_episode_payload(
     raw_actions_array = np.stack(raw_actions)
     poses_array = np.stack(poses)
     target_times = np.asarray(action_target_times, dtype=np.float64)
+    source_times_array = np.asarray(action_source_times, dtype=np.float64)
+    source_indices_array = np.asarray(action_source_indices, dtype=np.int64)
+    steps_array = np.asarray(action_steps, dtype=np.int64)
+    offsets_array = np.asarray(action_offsets_ms, dtype=np.float64)
+    source_array_indices = np.arange(len(samples), dtype=np.int64)
     strictly_increasing(target_times, name=f"{actions_path} target times")
     if target_times.size > 1 and not np.allclose(
         np.diff(target_times), 1.0 / ACTION_HZ, atol=5e-6, rtol=0.0
     ):
         raise ValueError(f"{actions_path} target clock is not exact {ACTION_HZ} Hz")
 
-    gripper_observations, dense_gripper_targets = densify_gripper_events(
-        raw_actions_array[:, 6]
-    )
-    dense_actions = raw_actions_array.copy()
-    dense_actions[:, 6] = dense_gripper_targets
-    close_index, close_position = _first_event_pose(
-        samples, event_sign=-1, name=str(actions_path)
-    )
-    _, release_position = _first_event_pose(
-        samples, event_sign=1, start=close_index + 1, name=str(actions_path)
-    )
+    if policy_rollout:
+        (
+            raw_actions_array,
+            poses_array,
+            target_times,
+            source_times_array,
+            source_indices_array,
+            steps_array,
+            offsets_array,
+            source_array_indices,
+            gripper_observations,
+        ) = _deduplicate_policy_actions(
+            episode_dir,
+            actions_path,
+            raw_actions_array,
+            poses_array,
+            target_times,
+            source_times_array,
+            source_indices_array,
+            steps_array,
+            offsets_array,
+        )
+        dense_actions = raw_actions_array.copy()
+        alignment_times = source_times_array
+    else:
+        gripper_observations, dense_gripper_targets = densify_gripper_events(
+            raw_actions_array[:, 6]
+        )
+        dense_actions = raw_actions_array.copy()
+        dense_actions[:, 6] = dense_gripper_targets
+        alignment_times = target_times
+    if policy_rollout:
+        close_candidates = np.flatnonzero(raw_actions_array[:, 6] <= 0.0)
+        close_index = int(close_candidates[0]) if close_candidates.size else -1
+        release_candidates = np.flatnonzero(
+            (np.arange(raw_actions_array.shape[0]) > close_index)
+            & (raw_actions_array[:, 6] >= 0.5)
+        )
+        close_position = (
+            poses_array[close_index, :3].astype(np.float32)
+            if close_index >= 0
+            else np.full(3, np.nan, dtype=np.float32)
+        )
+        release_position = (
+            poses_array[int(release_candidates[0]), :3].astype(np.float32)
+            if release_candidates.size
+            else np.full(3, np.nan, dtype=np.float32)
+        )
+    else:
+        close_index, close_position = _first_event_pose(
+            samples, event_sign=-1, name=str(actions_path)
+        )
+        _, release_position = _first_event_pose(
+            samples, event_sign=1, start=close_index + 1, name=str(actions_path)
+        )
 
     frame_indices: list[int] = []
     frame_nominal_times: list[float] = []
@@ -424,7 +614,7 @@ def load_episode_payload(
         np.asarray(wrist_capture_times, dtype=np.float64),
     )
     strictly_increasing(paired_capture_times, name=f"{frames_path} paired capture times")
-    mapping = np.searchsorted(paired_capture_times, target_times, side="right") - 1
+    mapping = np.searchsorted(paired_capture_times, alignment_times, side="right") - 1
     causal = mapping >= 0
     if not np.any(causal):
         raise ValueError(f"{actions_path} has no action after a causal RGB pair")
@@ -434,8 +624,8 @@ def load_episode_payload(
     keep = slice(first_causal, None)
     selected_positions = mapping[keep].astype(np.int64)
     selected_pair_times = paired_capture_times[selected_positions]
-    kept_target_times = target_times[keep]
-    image_ages = kept_target_times - selected_pair_times
+    kept_alignment_times = alignment_times[keep]
+    image_ages = kept_alignment_times - selected_pair_times
     if np.any(image_ages < -1e-6):
         raise ValueError(f"{actions_path} selected a future RGB frame")
     maximum_age = float(np.max(image_ages))
@@ -452,12 +642,12 @@ def load_episode_payload(
         actions=dense_actions[keep],
         raw_gripper_events=raw_actions_array[keep, 6],
         gripper_observations=gripper_observations[keep],
-        source_action_array_indices=np.arange(len(samples), dtype=np.int64)[keep],
-        action_target_times=kept_target_times,
-        action_source_times=np.asarray(action_source_times, dtype=np.float64)[keep],
-        action_source_indices=np.asarray(action_source_indices, dtype=np.int64)[keep],
-        action_steps=np.asarray(action_steps, dtype=np.int64)[keep],
-        action_offsets_ms=np.asarray(action_offsets_ms, dtype=np.float64)[keep],
+        source_action_array_indices=source_array_indices[keep],
+        action_target_times=target_times[keep],
+        action_source_times=source_times_array[keep],
+        action_source_indices=source_indices_array[keep],
+        action_steps=steps_array[keep],
+        action_offsets_ms=offsets_array[keep],
         eef_poses=poses_array[keep],
         selected_frame_positions=selected_positions,
         selected_frame_indices=selected_indices,
@@ -629,8 +819,11 @@ def write_dataset(
     identity: dict[str, Any],
     all_source_rows: Sequence[StackCupEpisodeRow],
 ) -> dict[str, Any]:
-    if len(payloads) != 49:
-        raise ValueError(f"expected 49 included payloads, got {len(payloads)}")
+    if len(payloads) != EXPECTED_INCLUDED_EPISODES:
+        raise ValueError(
+            f"expected {EXPECTED_INCLUDED_EPISODES} included payloads, "
+            f"got {len(payloads)}"
+        )
     masks = _mask_keys(payloads)
     excluded_rows = [row for row in all_source_rows if row.excluded]
     excluded = [
@@ -643,8 +836,8 @@ def write_dataset(
         }
         for row in excluded_rows
     ]
-    if len(excluded) != 1 or excluded[0]["episode_number"] != 7:
-        raise ValueError("the source audit did not resolve hard-excluded episode 007")
+    if {item["episode_number"] for item in excluded} != set(EXCLUDED_EPISODES):
+        raise ValueError("the source audit did not resolve the configured exclusions")
 
     episode_summaries = [_episode_summary(payload, masks) for payload in payloads]
     created_at = datetime.now(timezone.utc).isoformat()
@@ -679,10 +872,7 @@ def write_dataset(
         },
         "outcome": {
             "source_machine_label": False,
-            "manual_review": (
-                "all included terminal main-RGB frames were reviewed and show the "
-                "pink cup nested in the white cup"
-            ),
+            "manual_review": OUTCOME_MANUAL_REVIEW,
             "robomimic_compatibility_label": (
                 "reward=1 and done=1 only on the final retained row; earlier rows are 0"
             ),
@@ -711,7 +901,7 @@ def write_dataset(
         "episodes": episode_summaries,
     }
     env_args = {
-        "env_name": "StackCupReal-v0",
+        "env_name": ENV_NAME,
         "env_version": CONVERSION_VERSION,
         "type": 2,
         "env_kwargs": {
@@ -720,7 +910,7 @@ def write_dataset(
             "camera_names": ["main", "wrist"],
             "camera_height": options.image_height,
             "camera_width": options.image_width,
-            "task": "stack_cup",
+            "task": TASK_NAME,
         },
     }
 
@@ -891,9 +1081,7 @@ def validate_published_dataset(
 ) -> dict[str, Any]:
     """Validate the committed dataset through the independent contract checker."""
 
-    from scripts.real_robot.validate_stack_cup_dataset import (
-        validate_published_dataset as validate,
-    )
+    validate = importlib.import_module(VALIDATOR_MODULE).validate_published_dataset
 
     return validate(output_dir, source_root=source_root)
 
@@ -914,7 +1102,7 @@ def build_dataset(options: BuildOptions) -> dict[str, Any]:
         rtol=0.0,
     ):
         raise ValueError(
-            "stack-cup conversion uses the fixed 0.5 s image-age contract; "
+            f"{TASK_LABEL} conversion uses the fixed 0.5 s image-age contract; "
             f"got {options.max_image_age_sec}"
         )
     _compression_kwargs(options.compression)
@@ -934,7 +1122,7 @@ def build_dataset(options: BuildOptions) -> dict[str, Any]:
     payloads: list[EpisodePayload] = []
     for row in rows:
         print(
-            f"[stack_cup dataset] auditing episode {row.episode_number:03d} "
+            f"[{TASK_NAME} dataset] auditing episode {row.episode_number:03d} "
             f"({row.run_id})",
             flush=True,
         )
@@ -959,7 +1147,7 @@ def build_dataset(options: BuildOptions) -> dict[str, Any]:
             identity=identity,
             all_source_rows=all_source_rows,
         )
-        from scripts.real_robot.validate_stack_cup_dataset import validate_dataset
+        validate_dataset = importlib.import_module(VALIDATOR_MODULE).validate_dataset
 
         validate_dataset(temporary, source_root=source_root)
         final_was_backed_up = False

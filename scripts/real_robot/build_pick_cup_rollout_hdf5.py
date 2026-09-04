@@ -127,6 +127,7 @@ class BuildOptions:
     episode_limit: int | None = None
     overwrite: bool = False
     validate_only: bool = False
+    validate_output_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -1760,6 +1761,17 @@ def validate_dataset(
             raise RolloutConversionError(f"{path}: invalid conversion manifest") from exc
         if manifest.get("checkpoint_sha256") != EXPECTED_CHECKPOINT_SHA256:
             raise RolloutConversionError(f"{path}: checkpoint identity differs")
+        if (
+            manifest.get("collection_contract_sha256")
+            != EXPECTED_CONTRACT_SHA256
+        ):
+            raise RolloutConversionError(
+                f"{path}: collection contract identity differs"
+            )
+        if Path(str(manifest.get("source_root", ""))).resolve() != Path(
+            DEFAULT_SOURCE
+        ).resolve():
+            raise RolloutConversionError(f"{path}: declared source root differs")
         if manifest.get("conversion_version") != CONVERSION_VERSION or (
             manifest.get("observation", {}).get("rgb")
             != RGB_ALIGNMENT_DESCRIPTION
@@ -1917,6 +1929,19 @@ def validate_dataset(
             manifest_item = manifest_by_id.get(episode_id)
             if not isinstance(manifest_item, Mapping):
                 raise RolloutConversionError(f"{path}:{key}: manifest provenance absent")
+            if manifest_item.get("outcome") != outcome:
+                raise RolloutConversionError(
+                    f"{path}:{key}: manifest outcome differs"
+                )
+            if (
+                str(demo.attrs.get("checkpoint_sha256", ""))
+                != EXPECTED_CHECKPOINT_SHA256
+                or str(demo.attrs.get("contract_sha256", ""))
+                != EXPECTED_CONTRACT_SHA256
+            ):
+                raise RolloutConversionError(
+                    f"{path}:{key}: checkpoint/contract identity differs"
+                )
             expected_repeated_edges = list(
                 ALLOWED_REPEATED_STATE_TIMESTAMP_EDGES.get(episode_id, ())
             )
@@ -2110,6 +2135,10 @@ def validate_dataset(
             ) or np.any(image_age > 0.5 + 1e-6):
                 raise RolloutConversionError(f"{path}:{key}: per-row RGB image age differs")
             samples += count
+        if episode_ids != set(manifest_by_id):
+            raise RolloutConversionError(
+                f"{path}: manifest and materialized episode identities differ"
+            )
         if expected_sources is not None and episode_ids != {
             source.episode_id for source in expected_sources
         }:
@@ -2161,6 +2190,14 @@ def validate_dataset(
 def build_dataset(options: BuildOptions) -> dict[str, Any]:
     source_root = options.source_root.expanduser().resolve()
     output = options.output.expanduser().resolve()
+    if options.validate_only and options.validate_output_only:
+        raise ValueError(
+            "--validate-only and --validate-output-only are mutually exclusive"
+        )
+    if options.validate_output_only:
+        report = validate_dataset(output)
+        report["raw_source_checked"] = False
+        return report
     if options.expected_actions <= 0 or options.action_horizon <= 0:
         raise ValueError("expected actions and action horizon must be positive")
     if options.episode_limit is not None and options.episode_limit <= 0:
@@ -2262,6 +2299,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> BuildOptions:
     parser.add_argument("--episode-limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument(
+        "--validate-output-only",
+        action="store_true",
+        help=(
+            "validate the self-contained HDF5 and embedded immutable manifest "
+            "without requiring the raw rollout directory"
+        ),
+    )
     args = parser.parse_args(argv)
     return BuildOptions(
         source_root=args.source_root,
@@ -2271,6 +2316,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> BuildOptions:
         episode_limit=args.episode_limit,
         overwrite=args.overwrite,
         validate_only=args.validate_only,
+        validate_output_only=args.validate_output_only,
     )
 
 

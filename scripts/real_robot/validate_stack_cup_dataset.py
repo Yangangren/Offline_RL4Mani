@@ -36,9 +36,17 @@ DEFAULT_SOURCE = StackCupCommon.DEFAULT_SOURCE
 DEFAULT_DATASET_DIR = StackCupCommon.DEFAULT_DATASET_DIR
 DATASET_FILENAME = StackCupCommon.DATASET_FILENAME
 
-EXPECTED_SOURCE_EPISODES = frozenset(range(1, 51)) - {7}
-EXPECTED_VALID_EPISODES = frozenset({4, 24, 27, 40, 46})
+TASK_NAME = StackCupCommon.TASK_NAME
+TASK_LABEL = StackCupCommon.TASK_LABEL
+ENV_NAME = StackCupCommon.ENV_NAME
+OUTCOME_MANUAL_REVIEW = StackCupCommon.OUTCOME_MANUAL_REVIEW
+EXPECTED_SOURCE_EPISODES = (
+    StackCupCommon.EXPECTED_EPISODE_NUMBERS
+    - frozenset(StackCupCommon.EXCLUDED_EPISODES)
+)
+EXPECTED_VALID_EPISODES = StackCupCommon.VALIDATION_EPISODE_NUMBERS
 EXPECTED_TRAIN_EPISODES = EXPECTED_SOURCE_EPISODES - EXPECTED_VALID_EPISODES
+EXPECTED_EXCLUDED_EPISODES = frozenset(StackCupCommon.EXCLUDED_EPISODES)
 
 RGB_KEYS = ("main_image", "wrist_image")
 LOW_DIM_KEYS = (
@@ -233,16 +241,13 @@ def _require_manifest_contract(manifest: Mapping[str, Any], *, path: Path) -> No
         for item in exclusions
         if isinstance(item, Mapping)
     }
-    if excluded_numbers != {7}:
-        raise ValueError(f"{path} manifest must record episode 007 as the sole exclusion")
+    if excluded_numbers != EXPECTED_EXCLUDED_EPISODES:
+        raise ValueError(f"{path} manifest exclusions do not match the task contract")
 
     outcome = manifest.get("outcome")
     expected_outcome = {
         "source_machine_label": False,
-        "manual_review": (
-            "all included terminal main-RGB frames were reviewed and show the "
-            "pink cup nested in the white cup"
-        ),
+        "manual_review": OUTCOME_MANUAL_REVIEW,
         "robomimic_compatibility_label": (
             "reward=1 and done=1 only on the final retained row; earlier rows are 0"
         ),
@@ -261,8 +266,8 @@ def _validate_environment(
     env_args = _json_attr(data.attrs, "env_args", location=data.name)
     if not isinstance(env_args, dict):
         raise ValueError(f"{data.name} env_args must be an object")
-    if env_args.get("env_name") != "StackCupReal-v0":
-        raise ValueError(f"{data.name} env_name must be StackCupReal-v0")
+    if env_args.get("env_name") != ENV_NAME:
+        raise ValueError(f"{data.name} env_name must be {ENV_NAME}")
     if env_args.get("env_version") != CONVERSION_VERSION:
         raise ValueError(f"{data.name} env_version mismatch")
     if int(env_args.get("type", -1)) != 2:
@@ -276,7 +281,7 @@ def _validate_environment(
         "camera_names": ["main", "wrist"],
         "camera_height": image_height,
         "camera_width": image_width,
-        "task": "stack_cup",
+        "task": TASK_NAME,
     }
     for key, value in expected.items():
         if kwargs.get(key) != value:
@@ -295,7 +300,7 @@ def _validate_masks(
     mask = dataset["mask"]
     if set(mask.keys()) != EXPECTED_MASK_KEYS:
         raise ValueError(
-            f"{mask.name} keys {sorted(mask.keys())} do not match the stack-cup contract"
+            f"{mask.name} keys {sorted(mask.keys())} do not match the {TASK_LABEL} contract"
         )
     masks: dict[str, list[str]] = {}
     for name in sorted(EXPECTED_MASK_KEYS):
@@ -311,15 +316,32 @@ def _validate_masks(
     expected_valid = {_demo_key(number) for number in EXPECTED_VALID_EPISODES}
     expected_train = expected_all - expected_valid
     if demo_keys != expected_all or set(masks["all"]) != expected_all:
-        raise ValueError("mask/all and /data must contain exactly episodes 001-050 except 007")
+        exclusion_text = ""
+        if EXPECTED_EXCLUDED_EPISODES:
+            exclusion_text = " excluding " + ",".join(
+                f"{number:03d}" for number in sorted(EXPECTED_EXCLUDED_EPISODES)
+            )
+        raise ValueError(
+            "mask/all and /data do not match the configured episodes"
+            f"{exclusion_text}"
+        )
     if set(masks["valid"]) != expected_valid:
         raise ValueError("mask/valid does not match the fixed validation episodes")
     if set(masks["train"]) != expected_train:
         raise ValueError("mask/train does not match all minus the fixed validation set")
     if set(masks["train"]).intersection(masks["valid"]):
         raise ValueError("train and valid masks overlap")
-    if len(masks["all"]) != 49 or len(masks["train"]) != 44 or len(masks["valid"]) != 5:
-        raise ValueError("all/train/valid masks must contain 49/44/5 episodes")
+    expected_counts = (len(expected_all), len(expected_train), len(expected_valid))
+    actual_counts = (
+        len(masks["all"]),
+        len(masks["train"]),
+        len(masks["valid"]),
+    )
+    if actual_counts != expected_counts:
+        raise ValueError(
+            "all/train/valid mask counts do not match the task contract: "
+            f"actual={actual_counts}, expected={expected_counts}"
+        )
 
     expected_qa_pass = {
         key for key, metadata in demo_metadata.items() if metadata["qa_status"] == "PASS"
@@ -334,16 +356,13 @@ def _validate_masks(
         for key in expected_train
         if key in expected_clean
     }
-    if set(masks["qa_pass"]) != expected_qa_pass or len(masks["qa_pass"]) != 38:
+    if set(masks["qa_pass"]) != expected_qa_pass:
         raise ValueError("mask/qa_pass does not exactly encode QA PASS episodes")
-    if set(masks["clean"]) != expected_clean or len(masks["clean"]) != 37:
+    if set(masks["clean"]) != expected_clean:
         raise ValueError(
             "mask/clean must be QA PASS intersect invalid_windows==0"
         )
-    if (
-        set(masks["train_clean"]) != expected_train_clean
-        or len(masks["train_clean"]) != 32
-    ):
+    if set(masks["train_clean"]) != expected_train_clean:
         raise ValueError(
             "mask/train_clean must be train intersect QA PASS intersect invalid_windows==0"
         )
@@ -366,7 +385,7 @@ def _validate_episode_structure(
     key = demo.name.rsplit("/", 1)[-1]
     number = _episode_number(key)
     if number not in EXPECTED_SOURCE_EPISODES:
-        raise ValueError(f"{demo.name} is not an allowed stack-cup source episode")
+        raise ValueError(f"{demo.name} is not an allowed {TASK_LABEL} source episode")
     if int(demo.attrs.get("source_episode_number", -1)) != number:
         raise ValueError(f"{demo.name} source_episode_number does not match its key")
     count = int(demo.attrs.get("num_samples", -1))
@@ -408,7 +427,7 @@ def _validate_episode_structure(
         raise ValueError(f"{demo.name} is missing /obs")
     obs = demo["obs"]
     if set(obs.keys()) != set((*RGB_KEYS, *LOW_DIM_KEYS)):
-        raise ValueError(f"{obs.name} keys do not match the stack-cup observation schema")
+        raise ValueError(f"{obs.name} keys do not match the {TASK_LABEL} observation schema")
     image_shape = (count, image_height, image_width, 3)
     for image_key in RGB_KEYS:
         _require_dataset(obs, image_key, shape=image_shape, dtype=np.uint8)
@@ -438,7 +457,7 @@ def _validate_episode_structure(
         raise ValueError(f"{demo.name} is missing /provenance")
     provenance = demo["provenance"]
     if set(provenance.keys()) != EXPECTED_PROVENANCE_KEYS:
-        raise ValueError(f"{provenance.name} keys do not match the stack-cup contract")
+        raise ValueError(f"{provenance.name} keys do not match the {TASK_LABEL} contract")
     for provenance_key in EXPECTED_PROVENANCE_KEYS:
         _require_dataset(provenance, provenance_key, shape=(count,))
 
@@ -685,11 +704,11 @@ def validate_dataset(
     *,
     source_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Validate one stack-cup HDF5 shard, optionally against its raw source."""
+    """Validate one task HDF5 shard, optionally against its raw source."""
 
     path = path.expanduser().resolve()
     if not path.is_file():
-        raise FileNotFoundError(f"stack-cup dataset does not exist: {path}")
+        raise FileNotFoundError(f"{TASK_LABEL} dataset does not exist: {path}")
     source_root = (
         None if source_root is None else source_root.expanduser().resolve()
     )
@@ -736,7 +755,16 @@ def validate_dataset(
         demo_keys = set(data.keys())
         expected_demo_keys = {_demo_key(number) for number in EXPECTED_SOURCE_EPISODES}
         if demo_keys != expected_demo_keys:
-            raise ValueError(f"{path} must contain exactly 49 source episodes excluding 007")
+            exclusion_text = ""
+            if EXPECTED_EXCLUDED_EPISODES:
+                exclusion_text = " excluding " + ",".join(
+                    f"{number:03d}"
+                    for number in sorted(EXPECTED_EXCLUDED_EPISODES)
+                )
+            raise ValueError(
+                f"{path} demo inventory does not match the {TASK_LABEL} contract"
+                f"{exclusion_text}"
+            )
 
         episodes: list[dict[str, Any]] = []
         demo_metadata: dict[str, dict[str, Any]] = {}
@@ -828,7 +856,7 @@ def validate_published_dataset(
     commit_path = _dataset_commit_path(dataset_dir)
     if not commit_path.is_file():
         raise FileNotFoundError(
-            f"published stack-cup dataset is missing commit marker: {commit_path}"
+            f"published {TASK_LABEL} dataset is missing commit marker: {commit_path}"
         )
     try:
         commit = json.loads(commit_path.read_text())

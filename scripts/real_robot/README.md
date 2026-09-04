@@ -52,12 +52,16 @@ prepare the fingerprinted production config:
 ```
 
 The fixed masks contain 49 usable episodes: 44 in `train` and episodes
-004/024/027/040/046 in `valid`. The same shard provides `train_clean`, a
-32-episode strict subset whose source QA passed and whose precomputed model
-windows contain no invalid entries.
+004/024/027/040/046 in `valid`. The current corpus is published at
+`datasets/real_robot/stack_cup/stack_cup_rgb.hdf5`. It also provides
+`train_clean`, a 24-episode strict subset whose source QA passed and whose
+precomputed model windows contain no invalid entries. The launcher fingerprints
+this replacement, so it will not reuse a completed run trained on the old file.
 
 Launch the default expanded-data baseline. The epoch count is written
-explicitly here even though 250 is also the launcher default:
+explicitly here even though 250 is also the launcher default. The canonical
+experiment name is `stack_cup_rgb_dp_ddim_s1`; an incompatible existing run is
+kept and the rerun is written to a new timestamped subdirectory:
 
 ```bash
 /home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
@@ -171,13 +175,11 @@ must not be used as a real-robot execution client.
 
 ## 20 Hz mixed-data one-step IDQL
 
-The one-step launcher also exposes `pick_cup`. It deliberately reuses the
-same deterministic 99-episode fitting split and `terminal_success` rewards in
-the original file without the `_human_success_condition` suffix. Its stored
-actor condition remains `human_only`; the chunk launcher uses a separate file
-so an existing HDF5 is never silently reinterpreted.
-Before training, the launcher revalidates both the converted rollout source
-and the mixed external-link dataset.
+The one-step launcher exposes both `pick_cup` and `stack_cup`. It uses an
+unconditioned diffusion actor and one-step `rise_temporal_v2` Q/V networks;
+stored `actor_condition` labels are provenance only and are not actor inputs in
+this recipe. Before training, the launcher revalidates the converted rollout
+source and every mixed external-link dataset.
 
 Validate or rebuild the data contract, then start the default 50-epoch run:
 
@@ -194,55 +196,79 @@ The launcher's generic `eval`, `eval_grid_resilient`, and composed evaluation
 stages are rejected for `pick_cup` because they instantiate robomimic
 simulation rather than the guarded real-robot client.
 
-## Stack-cup mixed-data IDQL
-
-Both IDQL launchers expose the repaired rollout corpus as `stack_cup`. The raw
-source is `/home/ryan/datasets/stack_cup/rollout/{success,failure}`. Conversion
-requires all 50 finalized episodes, the deployed epoch-200 checkpoint identity,
-600 normalized actions per source episode, all 3,750 digest-verified inference
-inputs, and the exact 32-success / 18-failure outcome partition.
-
-Camera reconstruction preserves the causal 5 Hz / 20 Hz contract. Logger
-startup rows are trimmed only when an exact golden NPZ proves a rosbag startup
-drop and every later row is within the 0.5-second age bound. The two audited
-adjacent equal robot-state timestamps are accepted only in their exact episode
-and edge; backward or any additional repeated timestamp is rejected. The
-production rollout output has 29,826 retained transitions, including 26/6
-success train/valid episodes and 14/4 failure train/valid episodes.
-
-The mixed fitting file is
-`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_44demo_26success_14failure_terminal_success_human_success_condition.hdf5`.
-It contains 84 episodes and 45,668 transitions: 21,793 from the 44 human
-`train` episodes, 15,494 from 26 successful rollout-train episodes, and 8,381
-from 14 failed rollout-train episodes. It uses external HDF5 links and virtual
-shifted `next_obs`, so the image data are not copied into the small mixed file.
-The chunk launcher additionally builds
-`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_validation_5demo_6success_4failure_terminal_success_human_success_condition.hdf5`,
-containing the five held-out human episodes and the 6/4 held-out successful /
-failed rollouts (8,594 windows). It is evaluated in full after every chunk
-training epoch, with the best held-out actor checkpoint retained as
-`best_validation.pt`. One-step IDQL remains unchanged.
-
-Build or revalidate the rollout and mixed datasets through either launcher:
+For StackCup, the fitting file contains the 44 human training demonstrations,
+20 `success_train` rollouts, and 10 `failure_train` rollouts (35,626 windows).
+The disjoint validation file contains all five human validation episodes, six
+`success_valid` rollouts, and four `failure_valid` rollouts (8,190 windows).
+Training evaluates the full held-out split after every epoch, measures actor
+loss using EMA weights, and writes the lowest-loss checkpoint to
+`best_validation.pt`. The default StackCup recipe uses dynamics weight `0.05`,
+actor U-Net and observation-encoder learning rates of `1e-5`, and freezes the
+actor, Q, and V observation encoders for the first 1,000 reference-batch
+updates. Start it with:
 
 ```bash
-bash run_rgb_dp_chunk_idql.sh stack_cup build_dataset
 bash run_rgb_dp_idql.sh stack_cup build_dataset
-```
-
-Start the default first chunked run (joint actor, not frozen) or the one-step
-comparison. Both use the same selected episodes and terminal-success targets;
-only chunk IDQL stores the `human_success` actor condition:
-
-```bash
-bash run_rgb_dp_chunk_idql.sh stack_cup train_chunk_idql
 bash run_rgb_dp_idql.sh stack_cup train_resilient
 ```
 
-Both initialize the actor from
-`trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260822155238/models/model_epoch_200.pth`
-and use `robot0_gripper_state` for critic late fusion. Generic simulation eval
-and collection stages are rejected for this real-robot task.
+## Stack-cup mixed-data chunk IDQL
+
+The chunk-IDQL launcher exposes the current rollout corpus as `stack_cup`. The
+raw source is `/home/ryan/datasets/stack_cup/rollout`. Conversion requires all
+40 finalized episodes, the deployed epoch-200 checkpoint identity, the complete
+published checksum manifest, and the exact 26-success / 14-failure outcome
+partition. The checkpoint configuration stores DDIM-10, while the collection
+server identity proves that this corpus used the runtime DDIM-100 override.
+
+Camera reconstruction preserves the causal 5 Hz image / 20 Hz action contract.
+The processed handoff repeats source actions on a wall-clock grid during
+DDIM-100 inference gaps; these synthetic repeats are not training samples. The
+converter keeps one verified row per immutable source action index and selects
+the latest causal image pair at the original source timestamp, with a maximum
+allowed image age of 0.5 seconds. The production rollout output has 23,468
+retained executed-action transitions: 31 pre-causal startup actions are dropped
+and 54 missing internal source indices are recorded without interpolation.
+
+The mixed fitting file is
+`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_44demo_20success_10failure_ddim100_terminal_success_human_success_condition.hdf5`.
+It contains 74 episodes and 35,626 transitions: 18,062 from the 44 human
+`train` episodes, 11,710 from 20 successful rollout-train episodes, and 5,854
+from 10 failed rollout-train episodes. It uses external HDF5 links and virtual
+shifted `next_obs`, so the image data are not copied into the small mixed file.
+The chunk launcher additionally builds
+`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_validation_5demo_6success_4failure_ddim100_terminal_success_human_success_condition.hdf5`,
+containing the five held-out human episodes and the 6/4 held-out successful /
+failed rollouts (8,190 transitions). It is evaluated in full after every chunk
+training epoch, with the best held-out actor checkpoint retained as
+`best_validation.pt`.
+
+Build or revalidate the rollout and mixed datasets through the chunk launcher:
+
+```bash
+bash run_rgb_dp_chunk_idql.sh stack_cup build_dataset
+```
+
+If the raw rollout handoff is not mounted, an existing converted rollout file
+is accepted only after an output-only audit of its embedded immutable manifest,
+checkpoint identity, exact episode/mask counts, normalized actions,
+reward/terminal semantics, observation shapes, and per-row timing provenance.
+Raw source hashes are additionally rechecked whenever the rollout directory is
+available. Set `REAL_ROBOT_ROLLOUT_OUTPUT_ONLY_VALIDATION=1` to request this
+mode explicitly; an explicit `REAL_ROBOT_ROLLOUT_SOURCE_ROOT` override remains
+fail-closed and is never silently downgraded to output-only validation.
+
+Start the default chunked run (joint actor and critic, not separate training):
+
+```bash
+bash run_rgb_dp_chunk_idql.sh stack_cup train_chunk_idql
+```
+
+It initializes the actor from
+`trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260902111545/models/model_epoch_50.pth`,
+uses `rise_temporal_v2`, and uses `robot0_gripper_state` for critic late fusion.
+Generic simulation eval and collection stages are rejected for this
+real-robot task.
 
 ## Data contract
 

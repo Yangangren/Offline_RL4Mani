@@ -125,6 +125,21 @@ def configure_batch_semantics(args: argparse.Namespace, world_size: int) -> None
         reference_batch_size,
         effective_batch_size,
     )
+    args.resolved_actor_obs_encoder_freeze_steps = batch_scaled_step_count(
+        args.actor_obs_encoder_freeze_steps,
+        reference_batch_size,
+        effective_batch_size,
+    )
+    args.resolved_encoder_freeze_steps = batch_scaled_step_count(
+        args.encoder_freeze_steps,
+        reference_batch_size,
+        effective_batch_size,
+    )
+    args.resolved_vf_encoder_freeze_steps = batch_scaled_step_count(
+        args.vf_encoder_freeze_steps,
+        reference_batch_size,
+        effective_batch_size,
+    )
 
 
 def jsonable(value: Any) -> Any:
@@ -222,16 +237,46 @@ def configure_actor_optimizer(
     actor_algo,
     learning_rate: float,
     *,
+    obs_encoder_learning_rate: float | None = None,
     scheduler_type: str = "constant",
     warmup_steps: int = 0,
     total_steps: int = 1,
     num_cycles: float = 0.5,
 ) -> None:
-    for parameter in actor_algo.nets["policy"].parameters():
-        parameter.requires_grad_(True)
+    policy = actor_algo.nets["policy"]
+    if set(policy.keys()) != {"noise_pred_net", "obs_encoder"}:
+        raise RuntimeError(
+            "one-step IDQL expected the original plain DP actor modules; got "
+            f"{tuple(policy.keys())}"
+        )
+    if obs_encoder_learning_rate is None:
+        for parameter in policy.parameters():
+            parameter.requires_grad_(True)
+        parameter_groups = [
+            {
+                "params": list(policy.parameters()),
+                "lr": float(learning_rate),
+                "group_name": "policy",
+            }
+        ]
+    else:
+        parameter_groups = []
+        for name, group_learning_rate in (
+            ("noise_pred_net", float(learning_rate)),
+            ("obs_encoder", float(obs_encoder_learning_rate)),
+        ):
+            parameters = list(policy[name].parameters())
+            for parameter in parameters:
+                parameter.requires_grad_(True)
+            parameter_groups.append(
+                {
+                    "params": parameters,
+                    "lr": group_learning_rate,
+                    "group_name": name,
+                }
+            )
     actor_algo.optimizers["policy"] = torch.optim.Adam(
-        actor_algo.nets["policy"].parameters(),
-        lr=float(learning_rate),
+        parameter_groups,
     )
     actor_algo.lr_schedulers["policy"] = make_step_lr_scheduler(
         actor_algo.optimizers["policy"],
@@ -264,6 +309,15 @@ def actor_trainability(actor_algo) -> dict[str, Any]:
             parameter.requires_grad
             for parameter in policy["obs_encoder"].parameters()
         ),
+        "optimizer_groups": {
+            str(group.get("group_name", "unknown")): {
+                "learning_rate": float(group["lr"]),
+                "parameter_count": int(
+                    sum(parameter.numel() for parameter in group["params"])
+                ),
+            }
+            for group in actor_algo.optimizers["policy"].param_groups
+        },
     }
     if not result["all_trainable"] or not result["all_in_optimizer"]:
         raise RuntimeError(f"full DP actor is not trainable: {result}")
@@ -1265,6 +1319,25 @@ def make_temporal_critic_optimizer(
     )
 
 
+def set_actor_obs_encoder_trainable(actor_algo, trainable: bool) -> None:
+    """Freeze only the online actor encoder; the diffusion U-Net keeps training."""
+    actor_algo.nets["policy"]["obs_encoder"].requires_grad_(bool(trainable))
+
+
+def set_critic_encoders_trainable(
+    critics: nn.ModuleList,
+    trainable: bool,
+) -> None:
+    """Freeze only online Q visual encoders, never temporal or value heads."""
+    for critic in critics:
+        critic.nets["encoder"].requires_grad_(bool(trainable))
+
+
+def set_vf_encoder_trainable(vf: nn.Module, trainable: bool) -> None:
+    """Freeze only V's visual encoder, never its temporal or value heads."""
+    vf.nets["encoder"].requires_grad_(bool(trainable))
+
+
 def rise_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
     if args.reward_mode == "task":
         reward_alignment = "source_environment_task_reward"
@@ -1893,6 +1966,239 @@ def dataset_audit(
     }
 
 
+def mixed_dataset_source_episodes(path: Path) -> set[tuple[str, str]]:
+    """Return immutable source episode identifiers from a mixed HDF5."""
+    records: set[tuple[str, str]] = set()
+    with h5py.File(path, "r") as handle:
+        for episode_key, episode in handle["data"].items():
+            source_file = episode.attrs.get("rise_source_file")
+            source_demo = episode.attrs.get("rise_source_demo")
+            if isinstance(source_file, bytes):
+                source_file = source_file.decode("utf-8")
+            if isinstance(source_demo, bytes):
+                source_demo = source_demo.decode("utf-8")
+            if not source_file or not source_demo:
+                raise ValueError(
+                    f"{path}:data/{episode_key} is missing source provenance"
+                )
+            identifier = (
+                str(Path(str(source_file)).expanduser().resolve()),
+                str(source_demo),
+            )
+            if identifier in records:
+                raise ValueError(
+                    f"{path} contains source episode more than once: {identifier}"
+                )
+            records.add(identifier)
+    return records
+
+
+def audit_validation_dataset_split(
+    training_dataset: Path,
+    validation_dataset: Path,
+) -> dict[str, int]:
+    """Prove held-out evaluation shares no source episodes with fitting."""
+    if training_dataset == validation_dataset:
+        raise ValueError("validation dataset must differ from training dataset")
+    training_records = mixed_dataset_source_episodes(training_dataset)
+    validation_records = mixed_dataset_source_episodes(validation_dataset)
+    overlap = sorted(training_records.intersection(validation_records))
+    if overlap:
+        raise ValueError(
+            "training and validation mixed datasets share source episodes: "
+            f"{overlap[:10]}"
+        )
+    if not validation_records:
+        raise ValueError("validation dataset contains no source episodes")
+    return {
+        "training_source_episodes": int(len(training_records)),
+        "validation_source_episodes": int(len(validation_records)),
+        "overlap_source_episodes": 0,
+    }
+
+
+def _local_scalar_tensor(value: Any, device: torch.device) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(f"metric is not scalar: {tuple(value.shape)}")
+        return value.detach().reshape(()).to(device=device, dtype=torch.float32)
+    scalar = torch.as_tensor(value, device=device, dtype=torch.float32)
+    if scalar.numel() != 1:
+        raise ValueError(f"metric is not scalar: {tuple(scalar.shape)}")
+    return scalar.reshape(())
+
+
+class WeightedScalarMetricAccumulator:
+    """Accumulate validation means weighted by held-out window count."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.keys: tuple[str, ...] = ()
+        self.weighted_sums: torch.Tensor | None = None
+        self.total_weight = 0
+
+    @torch.no_grad()
+    def update(self, metrics: dict[str, Any], weight: int) -> None:
+        if int(weight) <= 0:
+            raise ValueError("validation metric weight must be positive")
+        keys = tuple(sorted(metrics))
+        if self.keys and keys != self.keys:
+            raise ValueError("validation metric keys changed between batches")
+        values = torch.stack(
+            [_local_scalar_tensor(metrics[key], self.device) for key in keys]
+        )
+        weighted = values * float(weight)
+        if self.weighted_sums is None:
+            self.keys = keys
+            self.weighted_sums = weighted.clone()
+        else:
+            self.weighted_sums.add_(weighted)
+        self.total_weight += int(weight)
+
+    @torch.no_grad()
+    def means(self) -> dict[str, float]:
+        if self.weighted_sums is None or self.total_weight == 0:
+            return {}
+        values = (self.weighted_sums / float(self.total_weight)).cpu().tolist()
+        return {key: float(value) for key, value in zip(self.keys, values)}
+
+
+@contextmanager
+def fork_rng_with_seed(seed: int, device: torch.device):
+    """Temporarily seed validation crops without perturbing training RNG."""
+    cuda_devices: list[int] = []
+    cuda_index: int | None = None
+    if device.type == "cuda":
+        cuda_index = (
+            int(device.index)
+            if device.index is not None
+            else int(torch.cuda.current_device())
+        )
+        cuda_devices = [cuda_index]
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.random.default_generator.manual_seed(int(seed))
+        if cuda_index is not None:
+            torch.cuda.default_generators[cuda_index].manual_seed(int(seed))
+        yield
+
+
+def actor_validation_step(
+    actor_algo,
+    raw_batch: dict,
+    epoch: int,
+    obs_normalization_stats,
+) -> dict[str, Any]:
+    """Evaluate the deployed EMA actor without optimizer or EMA updates."""
+    if actor_algo.ema is None:
+        raise RuntimeError("held-out actor validation requires EMA actor weights")
+    online_nets = actor_algo.nets
+    ema_nets = actor_algo.ema.averaged_model
+    ema_was_training = bool(ema_nets.training)
+    try:
+        actor_algo.nets = ema_nets
+        ema_nets.eval()
+        actor_batch = actor_algo.process_batch_for_training(raw_batch)
+        actor_batch = actor_algo.postprocess_batch_for_training(
+            actor_batch,
+            obs_normalization_stats=obs_normalization_stats,
+        )
+        info = actor_algo.train_on_batch(actor_batch, epoch=epoch, validate=True)
+        log = actor_algo.log_info(info, materialize=False)
+    finally:
+        actor_algo.nets = online_nets
+        ema_nets.train(ema_was_training)
+    allowed_types = (int, float, np.number, torch.Tensor)
+    return {
+        f"actor/{key}" if not str(key).startswith("actor/") else str(key): (
+            value if isinstance(value, torch.Tensor) else float(value)
+        )
+        for key, value in log.items()
+        if isinstance(value, allowed_types)
+        and not str(key).startswith("Optimizer/")
+    }
+
+
+@torch.no_grad()
+def evaluate_validation_epoch(
+    *,
+    args: argparse.Namespace,
+    epoch: int,
+    loader,
+    actor_algo,
+    critics: nn.ModuleList,
+    critic_targets: nn.ModuleList,
+    vf: nn.Module,
+    dynamics_target_encoder: VisualDynamicsTargetEncoder | None,
+    obs_normalization_stats,
+    device: torch.device,
+) -> dict[str, float]:
+    """Run deterministic, full-coverage held-out actor and critic evaluation."""
+    accumulator = WeightedScalarMetricAccumulator(device)
+    batch_count = 0
+    window_count = 0
+    actor_was_training = bool(actor_algo.nets.training)
+    critic_modes = [bool(module.training) for module in critics]
+    vf_was_training = bool(vf.training)
+    actor_algo.set_eval()
+    critics.eval()
+    critic_targets.eval()
+    vf.eval()
+    if dynamics_target_encoder is not None:
+        dynamics_target_encoder.eval()
+    try:
+        with fork_rng_with_seed(int(args.validation_seed), device):
+            for raw_batch in loader:
+                raw_batch = align_shared_batch_actions(raw_batch)
+                rows = int(raw_batch["actions"].shape[0])
+                metrics = actor_validation_step(
+                    actor_algo,
+                    raw_batch,
+                    epoch,
+                    obs_normalization_stats,
+                )
+                critic_batch = process_critic_batch(
+                    raw_batch,
+                    actor_algo,
+                    obs_normalization_stats,
+                    critic_observation_horizon=args.critic_observation_horizon,
+                )
+                _, _, critic_info = compute_temporal_one_step_losses(
+                    critics,
+                    critic_targets,
+                    vf,
+                    dynamics_target_encoder,
+                    critic_batch,
+                    discount=args.discount,
+                    expectile=args.expectile,
+                    use_huber=args.use_huber,
+                    dynamics_weight=args.dynamics_weight,
+                )
+                metrics.update(critic_info)
+                accumulator.update(
+                    {f"validation/{key}": value for key, value in metrics.items()},
+                    rows,
+                )
+                batch_count += 1
+                window_count += rows
+    finally:
+        if actor_was_training:
+            actor_algo.set_train()
+        else:
+            actor_algo.set_eval()
+        for module, was_training in zip(critics, critic_modes):
+            module.train(was_training)
+        vf.train(vf_was_training)
+        configure_critic_targets(critic_targets)
+        if dynamics_target_encoder is not None:
+            configure_target_encoder(dynamics_target_encoder)
+    if batch_count == 0 or window_count == 0:
+        raise ValueError("validation loader produced no held-out windows")
+    result = accumulator.means()
+    result["validation/batches"] = float(batch_count)
+    result["validation/windows"] = float(window_count)
+    return result
+
+
 def scalar_metrics(values: dict[str, Any]) -> dict[str, float]:
     output: dict[str, float] = {}
     for key, value in values.items():
@@ -1992,6 +2298,12 @@ def checkpoint_payload(
         "pretrained_dp_checkpoint": str(args.checkpoint),
         "task": str(args.task),
         "dataset": str(args.dataset),
+        "validation_dataset": (
+            str(args.validation_dataset)
+            if args.validation_dataset is not None
+            else None
+        ),
+        "validation_seed": int(args.validation_seed),
         "single_dataloader": distributed_world_size == 1,
         "sampling": (
             "distributed_shuffled_SequenceDataset_indices"
@@ -2001,6 +2313,15 @@ def checkpoint_payload(
         "reward_mode": str(args.reward_mode),
         "reward_definition": REWARD_DEFINITIONS[args.reward_mode],
         "actor_training_objective": "diffusion_bc_full_chunk",
+        "actor_grouped_optimizer": bool(args.actor_grouped_optimizer),
+        "actor_unet_lr": float(args.actor_unet_lr),
+        "actor_obs_encoder_lr": float(args.actor_obs_encoder_lr),
+        "actor_obs_encoder_freeze_steps": int(
+            args.actor_obs_encoder_freeze_steps
+        ),
+        "resolved_actor_obs_encoder_freeze_steps": int(
+            args.resolved_actor_obs_encoder_freeze_steps
+        ),
         "actor_source_mask": "none_all_shared_batch_rows",
         "actor_data_mode": "all_human_success_failure_rows",
         "critic_training_objective": (
@@ -2053,6 +2374,14 @@ def checkpoint_payload(
         "num_critics": int(args.num_critics),
         "critic_group_norm": bool(args.critic_group_norm),
         "critic_late_fusion_key": args.critic_late_fusion_key,
+        "critic_encoder_freeze_steps": int(args.encoder_freeze_steps),
+        "resolved_critic_encoder_freeze_steps": int(
+            args.resolved_encoder_freeze_steps
+        ),
+        "vf_encoder_freeze_steps": int(args.vf_encoder_freeze_steps),
+        "resolved_vf_encoder_freeze_steps": int(
+            args.resolved_vf_encoder_freeze_steps
+        ),
         "action_dim": int(actor_algo.ac_dim),
         "action_normalization_stats": copy.deepcopy(action_normalization_stats),
         "observation_horizon": int(actor_algo.algo_config.horizon.observation_horizon),
@@ -2117,6 +2446,8 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "dataset",
         "checkpoint",
         "task",
+        "validation_dataset",
+        "validation_seed",
         "reward_mode",
         "seed",
         "batch_size",
@@ -2143,9 +2474,18 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "expectile",
         "target_tau",
         "actor_lr",
+        "actor_grouped_optimizer",
+        "actor_unet_lr",
+        "actor_obs_encoder_lr",
+        "actor_obs_encoder_freeze_steps",
+        "resolved_actor_obs_encoder_freeze_steps",
         "critic_lr",
         "encoder_lr",
+        "encoder_freeze_steps",
+        "resolved_encoder_freeze_steps",
         "vf_lr",
+        "vf_encoder_freeze_steps",
+        "resolved_vf_encoder_freeze_steps",
         "lr_scheduler",
         "lr_warmup_steps",
         "resolved_lr_warmup_steps",
@@ -2176,6 +2516,8 @@ def train(args: argparse.Namespace) -> dict:
         )
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
+    if args.validation_dataset is not None and not args.validation_dataset.is_file():
+        raise FileNotFoundError(args.validation_dataset)
     if not 0.5 <= float(args.expectile) < 1.0:
         raise ValueError("expectile must be in [0.5, 1.0)")
     if int(args.num_critics) < 2:
@@ -2232,7 +2574,12 @@ def train(args: argparse.Namespace) -> dict:
         )
     configure_actor_optimizer(
         actor_algo,
-        args.actor_lr,
+        args.actor_unet_lr,
+        obs_encoder_learning_rate=(
+            args.actor_obs_encoder_lr
+            if args.actor_grouped_optimizer
+            else None
+        ),
         scheduler_type=args.lr_scheduler,
         warmup_steps=args.resolved_lr_warmup_steps,
         total_steps=args.lr_total_steps,
@@ -2245,6 +2592,33 @@ def train(args: argparse.Namespace) -> dict:
         expected_task=args.task,
         expected_reward_mode=args.reward_mode,
     )
+    validation_dataset = None
+    validation_loader = None
+    validation_audit = None
+    validation_split_audit = None
+    if args.validation_dataset is not None and distributed.is_main_process:
+        validation_args = copy.copy(args)
+        validation_args.dataset = args.validation_dataset
+        validation_args.seed = int(args.validation_seed)
+        validation_args.distributed_world_size = 1
+        validation_args.distributed_rank = 0
+        validation_dataset, validation_loader, _, _ = build_single_loader(
+            validation_args,
+            actor_policy,
+            dp_checkpoint,
+            shuffle=False,
+            drop_last=False,
+        )
+        validation_audit = dataset_audit(
+            args.validation_dataset,
+            len(validation_dataset),
+            expected_task=args.task,
+            expected_reward_mode=args.reward_mode,
+        )
+        validation_split_audit = audit_validation_dataset_split(
+            args.dataset,
+            args.validation_dataset,
+        )
     action_stats = dp_checkpoint["action_normalization_stats"]
     obs_normalization_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
 
@@ -2571,6 +2945,16 @@ def train(args: argparse.Namespace) -> dict:
             "exact_state_match_verified": True,
         },
         "dataset": audit,
+        "validation": {
+            "enabled": validation_loader is not None,
+            "dataset": validation_audit,
+            "split_audit": validation_split_audit,
+            "seed": int(args.validation_seed),
+            "rank_zero_only": True,
+            "full_coverage": True,
+            "actor_weights": "ema",
+            "selection_metric": "validation/actor/Loss",
+        },
         "data_routing": {
             "shared_loader": True,
             "actor_rows": "all_human_success_failure_no_mask",
@@ -2642,9 +3026,25 @@ def train(args: argparse.Namespace) -> dict:
             "expectile": float(args.expectile),
             "target_tau": float(args.target_tau),
             "actor_lr": float(args.actor_lr),
+            "actor_unet_lr": float(args.actor_unet_lr),
+            "actor_obs_encoder_lr": float(args.actor_obs_encoder_lr),
+            "actor_obs_encoder_freeze_steps": int(
+                args.actor_obs_encoder_freeze_steps
+            ),
+            "resolved_actor_obs_encoder_freeze_steps": int(
+                args.resolved_actor_obs_encoder_freeze_steps
+            ),
             "critic_lr": float(args.critic_lr),
             "encoder_lr": float(args.encoder_lr),
+            "encoder_freeze_steps": int(args.encoder_freeze_steps),
+            "resolved_encoder_freeze_steps": int(
+                args.resolved_encoder_freeze_steps
+            ),
             "vf_lr": float(args.vf_lr),
+            "vf_encoder_freeze_steps": int(args.vf_encoder_freeze_steps),
+            "resolved_vf_encoder_freeze_steps": int(
+                args.resolved_vf_encoder_freeze_steps
+            ),
             "lr_scheduler": str(args.lr_scheduler),
             "lr_warmup_steps": int(args.lr_warmup_steps),
             "resolved_lr_warmup_steps": int(args.resolved_lr_warmup_steps),
@@ -2704,6 +3104,21 @@ def train(args: argparse.Namespace) -> dict:
         else float(args.max_gradient_norm)
     )
 
+    best_validation_loss: float | None = None
+    best_validation_epoch: int | None = None
+    for completed_epoch in history:
+        candidate = completed_epoch.get("metrics", {}).get(
+            "validation/actor/Loss"
+        )
+        if candidate is None or not np.isfinite(float(candidate)):
+            continue
+        if (
+            best_validation_loss is None
+            or float(candidate) < best_validation_loss
+        ):
+            best_validation_loss = float(candidate)
+            best_validation_epoch = int(completed_epoch.get("epoch", -1))
+
     for epoch in range(start_epoch + 1, int(args.epochs) + 1):
         if distributed.enabled and hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
@@ -2716,14 +3131,44 @@ def train(args: argparse.Namespace) -> dict:
                 epoch_iterator = iter(loader)
                 raw_batch = next(epoch_iterator)
             raw_batch = align_shared_batch_actions(raw_batch)
+            actor_obs_encoder_trainable = global_step >= int(
+                args.resolved_actor_obs_encoder_freeze_steps
+            )
+            critic_encoders_trainable = global_step >= int(
+                args.resolved_encoder_freeze_steps
+            )
+            vf_encoder_trainable = global_step >= int(
+                args.resolved_vf_encoder_freeze_steps
+            )
+            set_actor_obs_encoder_trainable(
+                actor_algo,
+                actor_obs_encoder_trainable,
+            )
+            set_critic_encoders_trainable(
+                critics,
+                critic_encoders_trainable,
+            )
+            set_vf_encoder_trainable(vf, vf_encoder_trainable)
             if synchronize_training_buffers:
                 broadcast_module_buffers(
                     training_buffer_modules,
                     distributed,
                 )
+            actor_learning_rates = {
+                str(group.get("group_name", "policy")): float(group["lr"])
+                for group in actor_algo.optimizers["policy"].param_groups
+            }
+            actor_policy_lr = (
+                actor_learning_rates["policy"]
+                if "policy" in actor_learning_rates
+                else actor_learning_rates["noise_pred_net"]
+            )
             learning_rates_used = {
-                "actor": float(
-                    actor_algo.optimizers["policy"].param_groups[0]["lr"]
+                "actor_unet": actor_learning_rates.get(
+                    "noise_pred_net", actor_policy_lr
+                ),
+                "actor_obs_encoder": actor_learning_rates.get(
+                    "obs_encoder", actor_policy_lr
                 ),
                 "critic": float(critic_optimizers[0].param_groups[0]["lr"]),
                 "encoder": float(critic_optimizers[0].param_groups[1]["lr"]),
@@ -2787,7 +3232,17 @@ def train(args: argparse.Namespace) -> dict:
             global_step += 1
             metrics = dict(critic_info)
             metrics.update(actor_info)
-            metrics["lr/actor"] = learning_rates_used["actor"]
+            metrics["actor/obs_encoder_trainable"] = float(
+                actor_obs_encoder_trainable
+            )
+            metrics["critic/encoder_trainable"] = float(
+                critic_encoders_trainable
+            )
+            metrics["vf/encoder_trainable"] = float(vf_encoder_trainable)
+            metrics["lr/actor_unet"] = learning_rates_used["actor_unet"]
+            metrics["lr/actor_obs_encoder"] = learning_rates_used[
+                "actor_obs_encoder"
+            ]
             metrics["lr/critic"] = learning_rates_used["critic"]
             metrics["lr/encoder"] = learning_rates_used["encoder"]
             metrics["lr/vf"] = learning_rates_used["vf"]
@@ -2824,11 +3279,51 @@ def train(args: argparse.Namespace) -> dict:
                     flush=True,
                 )
 
+        epoch_metrics = mean_metrics(epoch_records)
+        new_best_validation = False
+        if validation_loader is not None:
+            validation_metrics = evaluate_validation_epoch(
+                args=args,
+                epoch=epoch,
+                loader=validation_loader,
+                actor_algo=actor_algo,
+                critics=critics,
+                critic_targets=critic_targets,
+                vf=vf,
+                dynamics_target_encoder=dynamics_target_encoder,
+                obs_normalization_stats=obs_normalization_stats,
+                device=device,
+            )
+            epoch_metrics.update(validation_metrics)
+            if writer is not None:
+                for key, value in validation_metrics.items():
+                    writer.add_scalar(key, value, global_step)
+            selection_loss = validation_metrics.get("validation/actor/Loss")
+            if selection_loss is None or not np.isfinite(float(selection_loss)):
+                raise ValueError(
+                    "held-out validation did not produce a finite EMA actor loss"
+                )
+            if (
+                best_validation_loss is None
+                or float(selection_loss) < best_validation_loss
+            ):
+                best_validation_loss = float(selection_loss)
+                best_validation_epoch = int(epoch)
+                new_best_validation = True
+        if distributed.enabled:
+            best_flag = torch.tensor(
+                [int(new_best_validation)],
+                device=device,
+                dtype=torch.int64,
+            )
+            dist.broadcast(best_flag, src=0)
+            new_best_validation = bool(best_flag.item())
+
         epoch_summary = {
             "epoch": int(epoch),
             "global_step": int(global_step),
             "global_samples_seen": int(global_samples_seen),
-            "metrics": mean_metrics(epoch_records),
+            "metrics": epoch_metrics,
         }
         history.append(epoch_summary)
         partial_summary = {
@@ -2838,9 +3333,19 @@ def train(args: argparse.Namespace) -> dict:
             "global_samples_seen": int(global_samples_seen),
             "last_epoch_metrics": epoch_summary["metrics"],
             "history": history,
+            "best_validation": {
+                "metric": "validation/actor/Loss",
+                "value": best_validation_loss,
+                "epoch": best_validation_epoch,
+            },
             "checkpoints": {
                 "latest": str(args.output_dir / "latest.pt"),
                 "last": str(args.output_dir / "last.pt"),
+                "best_validation": (
+                    str(args.output_dir / "best_validation.pt")
+                    if best_validation_epoch is not None
+                    else None
+                ),
             },
         }
         if distributed.is_main_process:
@@ -2849,6 +3354,7 @@ def train(args: argparse.Namespace) -> dict:
         should_save = (
             epoch % int(args.save_every_epochs) == 0
             or epoch == int(args.epochs)
+            or new_best_validation
         )
         if should_save:
             rank_runtime_states = (
@@ -2879,6 +3385,11 @@ def train(args: argparse.Namespace) -> dict:
                 )
                 latest_path = args.output_dir / "latest.pt"
                 atomic_torch_save(payload, latest_path)
+                if new_best_validation:
+                    replace_with_hardlink(
+                        latest_path,
+                        args.output_dir / "best_validation.pt",
+                    )
                 if (
                     int(args.snapshot_every_epochs) > 0
                     and epoch % int(args.snapshot_every_epochs) == 0
@@ -2926,6 +3437,13 @@ def train(args: argparse.Namespace) -> dict:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument(
+        "--validation-dataset",
+        type=Path,
+        default=None,
+        help="Optional disjoint mixed HDF5 evaluated in full after every epoch.",
+    )
+    parser.add_argument("--validation-seed", type=int, default=10_000)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
@@ -3012,9 +3530,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expectile", type=float, default=0.9)
     parser.add_argument("--target-tau", type=float, default=0.01)
     parser.add_argument("--actor-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--actor-unet-lr",
+        type=float,
+        default=None,
+        help="Diffusion U-Net LR; defaults to --actor-lr for compatibility.",
+    )
+    parser.add_argument(
+        "--actor-obs-encoder-lr",
+        type=float,
+        default=None,
+        help="Actor observation-encoder LR; defaults to --actor-lr.",
+    )
+    parser.add_argument(
+        "--actor-obs-encoder-freeze-steps",
+        type=int,
+        default=0,
+        help="Reference-batch optimizer steps to freeze the actor encoder.",
+    )
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--encoder-lr", type=float, default=1e-5)
+    parser.add_argument(
+        "--encoder-freeze-steps",
+        type=int,
+        default=0,
+        help="Reference-batch optimizer steps to freeze online Q encoders.",
+    )
     parser.add_argument("--vf-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--vf-encoder-freeze-steps",
+        type=int,
+        default=0,
+        help="Reference-batch optimizer steps to freeze the V encoder.",
+    )
     parser.add_argument(
         "--lr-scheduler",
         choices=("constant", "cosine"),
@@ -3064,10 +3612,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--snapshot-every-epochs", type=int, default=0)
     args = parser.parse_args()
-    for key in ("dataset", "checkpoint", "output_dir", "resume_checkpoint"):
+    for key in (
+        "dataset",
+        "validation_dataset",
+        "checkpoint",
+        "output_dir",
+        "resume_checkpoint",
+    ):
         value = getattr(args, key)
         if value is not None:
             setattr(args, key, value.expanduser().resolve())
+    args.actor_grouped_optimizer = bool(
+        args.actor_unet_lr is not None
+        or args.actor_obs_encoder_lr is not None
+        or int(args.actor_obs_encoder_freeze_steps) > 0
+    )
+    if args.actor_unet_lr is None:
+        args.actor_unet_lr = float(args.actor_lr)
+    if args.actor_obs_encoder_lr is None:
+        args.actor_obs_encoder_lr = float(args.actor_lr)
+    for key in (
+        "actor_obs_encoder_freeze_steps",
+        "encoder_freeze_steps",
+        "vf_encoder_freeze_steps",
+    ):
+        if int(getattr(args, key)) < 0:
+            parser.error(f"--{key.replace('_', '-')} must be non-negative")
     if args.hdf5_cache_mode == "none":
         args.hdf5_cache_mode = None
     if not args.critic_late_fusion_key:

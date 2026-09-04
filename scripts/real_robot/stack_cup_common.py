@@ -16,7 +16,13 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[2]
+TASK_NAME = "stack_cup"
+TASK_LABEL = "stack-cup"
+ENV_NAME = "StackCupReal-v0"
 DEFAULT_SOURCE = Path("/home/ryan/datasets/stack_cup/human_demo")
+# The current human corpus lives at the canonical task path. Checkpoint configs
+# retain their own immutable dataset fingerprint, so incompatible completed
+# runs cannot be reused accidentally.
 DEFAULT_DATASET_DIR = ROOT / "datasets/real_robot/stack_cup"
 DATASET_FILENAME = "stack_cup_rgb.hdf5"
 DATASET_COMMIT_FILENAME = "dataset_commit.json"
@@ -52,6 +58,11 @@ EXCLUDED_EPISODES = {
     ),
 }
 VALIDATION_EPISODE_NUMBERS = frozenset({4, 24, 27, 40, 46})
+EXPECTED_INCLUDED_EPISODES = 49
+OUTCOME_MANUAL_REVIEW = (
+    "all included terminal main-RGB frames were reviewed and show the "
+    "pink cup nested in the white cup"
+)
 
 _EPISODE_PATTERN = re.compile(r"^episode_(\d{3})__(.+)$")
 _SOURCE_METADATA_FILENAMES = (
@@ -291,7 +302,7 @@ def read_episode_rows(source_root: Path) -> list[StackCupEpisodeRow]:
 
     if seen != EXPECTED_EPISODE_NUMBERS:
         raise ValueError(
-            "stack-cup handoff must contain exactly episodes 001..050; "
+            f"{TASK_LABEL} handoff has an unexpected episode inventory; "
             f"missing={sorted(EXPECTED_EPISODE_NUMBERS - seen)}, "
             f"unexpected={sorted(seen - EXPECTED_EPISODE_NUMBERS)}"
         )
@@ -302,8 +313,11 @@ def read_episode_rows(source_root: Path) -> list[StackCupEpisodeRow]:
 
 def included_rows(source_root: Path) -> list[StackCupEpisodeRow]:
     rows = [row for row in read_episode_rows(source_root) if not row.excluded]
-    if len(rows) != 49:
-        raise ValueError(f"expected 49 included stack-cup episodes, got {len(rows)}")
+    if len(rows) != EXPECTED_INCLUDED_EPISODES:
+        raise ValueError(
+            f"expected {EXPECTED_INCLUDED_EPISODES} included {TASK_LABEL} "
+            f"episodes, got {len(rows)}"
+        )
     return rows
 
 

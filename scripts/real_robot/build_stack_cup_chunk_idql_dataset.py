@@ -17,12 +17,12 @@ from scripts.real_robot import build_pick_cup_chunk_idql_dataset as core
 DEFAULT_HUMAN_DATASET = ROOT / "datasets/real_robot/stack_cup/stack_cup_rgb.hdf5"
 DEFAULT_ROLLOUT_DATASET = (
     ROOT
-    / "datasets/real_robot/stack_cup/idql/stack_cup_epoch200_20hz_rollouts.hdf5"
+    / "datasets/real_robot/stack_cup/idql/stack_cup_epoch200_ddim100_20hz_rollouts.hdf5"
 )
 DEFAULT_OUTPUT = (
     ROOT
     / "datasets/real_robot/stack_cup/idql/"
-    "stack_cup_chunk_idql_44demo_26success_14failure_terminal_success.hdf5"
+    "stack_cup_chunk_idql_44demo_20success_10failure_ddim100_terminal_success.hdf5"
 )
 
 
@@ -32,11 +32,11 @@ def configure_core() -> None:
     core.DEFAULT_ROLLOUT_DATASET = DEFAULT_ROLLOUT_DATASET
     core.DEFAULT_OUTPUT = DEFAULT_OUTPUT
     core.TASK = "stack_cup"
-    core.BUILDER_VERSION = "stack_cup_chunk_idql_mixed_v1"
+    core.BUILDER_VERSION = "stack_cup_chunk_idql_mixed_v2"
     core.DEFAULT_HUMAN_COUNT = 44
-    core.DEFAULT_EXPECTED_HUMAN_TRANSITIONS = 21_793
-    core.DEFAULT_SUCCESS_COUNT = 26
-    core.DEFAULT_FAILURE_COUNT = 14
+    core.DEFAULT_EXPECTED_HUMAN_TRANSITIONS = 18_062
+    core.DEFAULT_SUCCESS_COUNT = 20
+    core.DEFAULT_FAILURE_COUNT = 10
     core.DEFAULT_HUMAN_DATASETS_HELP = (
         "Stack-cup human HDF5 (defaults to the Episode-007-excluded train split)."
     )
