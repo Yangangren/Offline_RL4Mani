@@ -6417,10 +6417,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         print(json.dumps(result, indent=2), flush=True)
         return result
 
+    # Stage the CUDA-tagged DP checkpoint on CPU so every torchrun rank does
+    # not restore its serialized copy onto cuda:0.
+    dp_checkpoint = torch.load(
+        pretrained_dp_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
     actor_policy, dp_checkpoint = FileUtils.policy_from_checkpoint(
-        ckpt_path=pretrained_dp_checkpoint, device=device, verbose=False
+        ckpt_dict=dp_checkpoint, device=device, verbose=False
     )
     dp_action_stats = dp_checkpoint.get("action_normalization_stats")
+    # The serialized weights have been copied into the local-rank actor.
+    dp_checkpoint.pop("model", None)
     reference_state = resume_state or source_for_warm_start
     reference_action_stats = (
         reference_state.get("action_normalization_stats")

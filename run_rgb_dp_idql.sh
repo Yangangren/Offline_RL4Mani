@@ -124,8 +124,8 @@ case "$TASK" in
     TASK_EXPERT_DATASET=datasets/real_robot/stack_cup/stack_cup_rgb.hdf5
     TASK_ROLLOUT_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_epoch200_ddim100_20hz_rollouts.hdf5
     TASK_IDQL_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_idql_44demo_20success_10failure_ddim100_terminal_success.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/idql/44demo_20success_10failure_ddim100_terminal_success_rise_temporal_v2_dynamics
-    TASK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/idql/44demo_20success_10failure_ddim100_terminal_success_rise_temporal_v2_dynamics
+    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/idql/44demo_20success_10failure_ddim100_terminal_success_rise_temporal_v2
+    TASK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/idql/44demo_20success_10failure_ddim100_terminal_success_rise_temporal_v2
     TASK_EXPERT_MASK=train
     TASK_EXPERT_COUNT=44
     TASK_SUCCESS_MASK=success_train
@@ -246,8 +246,8 @@ DEFAULT_IDQL_ACTOR_OBS_ENCODER_LR=${ACTOR_LR:-1e-4}
 DEFAULT_IDQL_ACTOR_OBS_ENCODER_FREEZE_STEPS=0
 DEFAULT_IDQL_CRITIC_ENCODER_FREEZE_STEPS=0
 DEFAULT_IDQL_VF_ENCODER_FREEZE_STEPS=0
-if [[ "$TASK" == "stack_cup" ]]; then
-  DEFAULT_IDQL_DYNAMICS_WEIGHT=0.05
+
+if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
   DEFAULT_IDQL_ACTOR_UNET_LR=1e-5
   DEFAULT_IDQL_ACTOR_OBS_ENCODER_LR=1e-5
   DEFAULT_IDQL_ACTOR_OBS_ENCODER_FREEZE_STEPS=1000

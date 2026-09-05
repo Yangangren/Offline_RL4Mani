@@ -2532,8 +2532,15 @@ def train(args: argparse.Namespace) -> dict:
     # are installed after initialization and any resume state is loaded.
     seed_process(args.seed, device)
 
+    # Stage the CUDA-tagged DP checkpoint on CPU so every torchrun rank does
+    # not restore its serialized copy onto cuda:0.
+    dp_checkpoint = torch.load(
+        args.checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
     actor_policy, dp_checkpoint = FileUtils.policy_from_checkpoint(
-        ckpt_path=str(args.checkpoint),
+        ckpt_dict=dp_checkpoint,
         device=device,
         verbose=False,
     )
@@ -2545,6 +2552,8 @@ def train(args: argparse.Namespace) -> dict:
         raise RuntimeError(
             "trainable actor does not exactly match the pretrained deployed EMA"
         )
+    # The serialized weights have been copied into the local-rank actor.
+    dp_checkpoint.pop("model", None)
 
     dataset, loader, loader_generator, config = build_single_loader(
         args,

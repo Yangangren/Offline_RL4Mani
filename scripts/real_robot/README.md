@@ -93,6 +93,31 @@ motion MAE/RMSE, physical translation and rotation RMSE, and gripper sign
 accuracy per slot. These remain open-loop imitation diagnostics, not robot
 success measurements.
 
+## Move-spoon DDIM-100 rollout processing
+
+The finalized MoveSpoon rollout handoff is read from
+`/home/ryan/datasets/move_spoon/rollout`. Convert and source-validate it with:
+
+```bash
+/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
+  scripts/real_robot/build_move_spoon_processed_rollout_hdf5.py
+```
+
+The output is
+`datasets/real_robot/move_spoon/idql/move_spoon_epoch200_ddim100_20hz_rollouts.hdf5`.
+The converter verifies the published checksums and exact deployed checkpoint,
+dataset, server, and DDIM-100 identities. It removes repeated wall-clock rows,
+retains the exact normalized controller proposal for each immutable source
+action, and chooses the latest causal main/wrist RGB pair at that source time.
+
+The deterministic validation masks contain five successes and four failures.
+They are stratified across the three collection placement regimes (episodes
+1-25, 26-29, and 30-40) as well as by outcome. Every episode also stores
+`provenance/source_action_delta_sec` and
+`provenance/dynamics_transition_valid`. The latter is zero at terminals, across
+missing source indices, and whenever the elapsed source-action time exceeds
+0.1 seconds; fixed-20-Hz dynamics objectives must honor this mask.
+
 ## 20 Hz mixed-data chunk IDQL
 
 The real pick-cup chunk-IDQL task is exposed as `pick_cup` in the repository

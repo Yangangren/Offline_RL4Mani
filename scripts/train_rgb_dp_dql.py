@@ -1216,8 +1216,15 @@ def train(args: argparse.Namespace) -> dict:
     # Build identical models before installing independent rank-local streams.
     seed_process(args.seed, device)
 
+    # Checkpoints retain the CUDA device tags they were saved with. Stage on
+    # CPU so every torchrun rank does not restore its copy onto cuda:0.
+    dp_checkpoint = torch.load(
+        args.checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
     actor_policy, dp_checkpoint = FileUtils.policy_from_checkpoint(
-        ckpt_path=str(args.checkpoint),
+        ckpt_dict=dp_checkpoint,
         device=device,
         verbose=False,
     )
@@ -1225,6 +1232,7 @@ def train(args: argparse.Namespace) -> dict:
     initialized_from_ema = initialize_actor_from_deployed_ema(actor_algo)
     if actor_algo.ema is not None and not initialized_from_ema:
         raise RuntimeError("failed to initialize actor from deployed EMA")
+    dp_checkpoint.pop("model", None)
 
     dataset, loader, loader_generator, _ = build_single_loader(
         args,
