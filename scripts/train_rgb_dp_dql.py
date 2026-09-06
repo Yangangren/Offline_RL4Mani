@@ -971,7 +971,7 @@ def dql_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
                 if reward_mode == "task"
                 else "canonical_first_success_terminal_reward"
                 if reward_mode == "terminal_success"
-                else "human_demo_reward_1_and_deployment_rollout_reward_0"
+                else "canonical_signed_terminal_outcome_reward"
             ),
             "differentiable_q_sampling_can_use_fewer_reverse_steps_for_memory",
         ],

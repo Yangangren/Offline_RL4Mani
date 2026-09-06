@@ -200,7 +200,7 @@ must not be used as a real-robot execution client.
 
 ## 20 Hz mixed-data one-step IDQL
 
-The one-step launcher exposes both `pick_cup` and `stack_cup`. It uses an
+The one-step launcher trains `pick_cup` and `stack_cup`. It uses an
 unconditioned diffusion actor and one-step `rise_temporal_v2` Q/V networks;
 stored `actor_condition` labels are provenance only and are not actor inputs in
 this recipe. Before training, the launcher revalidates the converted rollout
@@ -221,52 +221,63 @@ The launcher's generic `eval`, `eval_grid_resilient`, and composed evaluation
 stages are rejected for `pick_cup` because they instantiate robomimic
 simulation rather than the guarded real-robot client.
 
-For StackCup, the fitting file contains the 44 human training demonstrations,
-20 `success_train` rollouts, and 10 `failure_train` rollouts (35,626 windows).
-The disjoint validation file contains all five human validation episodes, six
-`success_valid` rollouts, and four `failure_valid` rollouts (8,190 windows).
-Training evaluates the full held-out split after every epoch, measures actor
-loss using EMA weights, and writes the lowest-loss checkpoint to
-`best_validation.pt`. The default StackCup recipe uses dynamics weight `0.05`,
-actor U-Net and observation-encoder learning rates of `1e-5`, and freezes the
-actor, Q, and V observation encoders for the first 1,000 reference-batch
-updates. Start it with:
+For StackCup, build or validate the action-state-v3 lineage and start training
+with:
 
 ```bash
 bash run_rgb_dp_idql.sh stack_cup build_dataset
 bash run_rgb_dp_idql.sh stack_cup train_resilient
 ```
 
+The StackCup rollout has an exact pre-command pose and logical gripper state at
+every 20 Hz action, but only one exact two-frame camera request per H8 proposal.
+The one-step converter therefore holds that exact camera pair across the eight
+actions and uses consecutive pre-command low-dimensional states after substep
+zero. It excludes every substep-7 bootstrap transition because it crosses the
+variable DDIM inference pause, while retaining the final terminal row. This
+admits 526 of 600 transitions per rollout. These substep-1-through-7 inputs are
+explicitly marked as composite training states, not new request captures.
+
 ## Stack-cup mixed-data chunk IDQL
 
-The chunk-IDQL launcher exposes the current rollout corpus as `stack_cup`. The
-raw source is `/home/ryan/datasets/stack_cup/rollout`. Conversion requires all
-40 finalized episodes, the deployed epoch-200 checkpoint identity, the complete
-published checksum manifest, and the exact 26-success / 14-failure outcome
-partition. The checkpoint configuration stores DDIM-10, while the collection
-server identity proves that this corpus used the runtime DDIM-100 override.
+The chunk-IDQL launcher exposes the current proposal-v3 corpus as `stack_cup`.
+The source `/home/ryan/datasets/stack_cup/rollout` contains 40 finalized policy
+rollouts and 49 selected human demonstrations. Conversion verifies the complete
+published checksum manifest, the deployed epoch-200 checkpoint, the exact
+26-success / 14-failure rollout partition, and the runtime DDIM-100 override.
 
-Camera reconstruction preserves the causal 5 Hz image / 20 Hz action contract.
-The processed handoff repeats source actions on a wall-clock grid during
-DDIM-100 inference gaps; these synthetic repeats are not training samples. The
-converter keeps one verified row per immutable source action index and selects
-the latest causal image pair at the original source timestamp, with a maximum
-allowed image age of 0.5 seconds. The production rollout output has 23,468
-retained executed-action transitions: 31 pre-causal startup actions are dropped
-and 54 missing internal source indices are recorded without interpolation.
+Every policy rollout has 600 recorded normalized actions grouped into 75 exact
+H8 proposals. Each proposal stores the original `chunk_XXXX_input.npz` as an
+exact two-frame `request_obs` tensor for both cameras and all three low-dimensional
+state keys. The sparse loader admits only the 75 proposal starts and directly
+uses `request_obs`; it never reconstructs those observations from adjacent
+action rows. The next critic observation is the exact next request. Dense
+dynamics therefore has one honest target at offset 8; the final proposal target
+is marked unavailable. Human demonstrations retain causal action-time
+observations. The mixed chunk-IDQL builder admits every selected human action
+row as a stride-one H8 start; terminal-adjacent rows are shortened by the
+existing action mask. Rollouts remain restricted to their exact recorded
+proposal starts.
+
+The diffusion actor still uses its normal full 16-step denoising objective at
+each admitted row. There is no `actor_action_loss_mask` and no change to the
+Diffusion Policy loss implementation.
 
 The mixed fitting file is
-`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_44demo_20success_10failure_ddim100_terminal_success_human_success_condition.hdf5`.
-It contains 74 episodes and 35,626 transitions: 18,062 from the 44 human
-`train` episodes, 11,710 from 20 successful rollout-train episodes, and 5,854
-from 10 failed rollout-train episodes. It uses external HDF5 links and virtual
-shifted `next_obs`, so the image data are not copied into the small mixed file.
+`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_request_v3_44demo_20success_10failure_ddim100_terminal_success_human_success_condition.hdf5`.
+It contains 74 episodes and 33,506 stored action rows: 15,506 human, 12,000
+successful rollout, and 6,000 failed rollout. The sparse loader admits 17,756
+H8 decisions: 15,506 overlapping human starts, 1,500 exact successful-rollout
+proposals, and 750 exact failed-rollout proposals. The file uses external HDF5
+links and virtual shifted `next_obs`, so the image data are not copied into the
+small mixed file.
 The chunk launcher additionally builds
-`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_validation_5demo_6success_4failure_ddim100_terminal_success_human_success_condition.hdf5`,
+`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_request_v3_validation_5demo_6success_4failure_ddim100_terminal_success_human_success_condition.hdf5`,
 containing the five held-out human episodes and the 6/4 held-out successful /
-failed rollouts (8,190 transitions). It is evaluated in full after every chunk
-training epoch, with the best held-out actor checkpoint retained as
-`best_validation.pt`.
+failed rollouts (7,538 stored rows and 2,288 admitted H8 decisions: 1,538 human
+starts plus 750 exact rollout proposals). It is
+evaluated in full after every epoch using EMA actor weights, with the lowest
+held-out actor loss retained as `best_validation.pt`.
 
 Build or revalidate the rollout and mixed datasets through the chunk launcher:
 
@@ -274,10 +285,15 @@ Build or revalidate the rollout and mixed datasets through the chunk launcher:
 bash run_rgb_dp_chunk_idql.sh stack_cup build_dataset
 ```
 
+The converter writes separate request-v3 rollout and human HDF5 sources, so it
+does not overwrite the older converted data. Later runs validate the existing
+sources and mixed files fail-closed. Use both overwrite flags only to rebuild
+those request-v3 outputs from the immutable source package.
+
 If the raw rollout handoff is not mounted, an existing converted rollout file
 is accepted only after an output-only audit of its embedded immutable manifest,
 checkpoint identity, exact episode/mask counts, normalized actions,
-reward/terminal semantics, observation shapes, and per-row timing provenance.
+reward/terminal semantics, request observations, and timing provenance.
 Raw source hashes are additionally rechecked whenever the rollout directory is
 available. Set `REAL_ROBOT_ROLLOUT_OUTPUT_ONLY_VALIDATION=1` to request this
 mode explicitly; an explicit `REAL_ROBOT_ROLLOUT_SOURCE_ROOT` override remains
@@ -286,12 +302,24 @@ fail-closed and is never silently downgraded to output-only validation.
 Start the default chunked run (joint actor and critic, not separate training):
 
 ```bash
-bash run_rgb_dp_chunk_idql.sh stack_cup train_chunk_idql
+bash run_rgb_dp_chunk_idql.sh stack_cup train_chunk_idql_resilient
 ```
 
+The default model and evaluation directory names contain `human_stride1`, so a
+completed checkpoint from the earlier 4,117-sample recipe cannot be mistaken
+for this dataset revision.
+
 It initializes the actor from
-`trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260902111545/models/model_epoch_50.pth`,
+`trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260902111545/models/model_epoch_200.pth`,
 uses `rise_temporal_v2`, and uses `robot0_gripper_state` for critic late fusion.
+The StackCup default enables dense dynamics with weight `0.05` at offsets 4
+and 8. Policy rollouts have an exact new camera request only at offset 8, so
+their offset-4 target is explicitly masked; human demonstrations provide valid
+targets at both offsets. This avoids training the dynamics head against a
+fabricated zero-change rollout image at offset 4.
+Actor and critic train jointly; actor U-Net and observation-encoder learning
+rates are `1e-5`, and actor, Q, and V observation encoders freeze for the first
+1,000 reference-batch updates.
 Generic simulation eval and collection stages are rejected for this
 real-robot task.
 

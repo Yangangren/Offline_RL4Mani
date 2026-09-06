@@ -747,6 +747,7 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
         observation_horizon,
         next_observation_horizon=1,
         dynamics_prediction_offsets=(),
+        validity_key="chunk_critic_valid",
     ):
         super().__init__()
         if dataset.__class__.__name__ != "SequenceDataset":
@@ -758,6 +759,13 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
         self.dynamics_prediction_offsets = tuple(
             int(value) for value in dynamics_prediction_offsets
         )
+        self.requested_validity_key = (
+            None if validity_key is None else str(validity_key)
+        )
+        self._demo_request_aligned = {}
+        self._demo_one_step_aligned = {}
+        self._demo_policy_chunk_indices = {}
+        self._demo_request_bootstrap_valid = {}
         if (
             self.chunk_horizon < 1
             or self.observation_horizon < 1
@@ -795,9 +803,215 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                 "SequenceDataset is too short for sparse chunk loading: "
                 f"available={available}, required={required}"
             )
+        self.unfiltered_size = len(dataset)
+        self.valid_indices = self._load_valid_indices()
+        self.validity_key = (
+            self.requested_validity_key
+            if self.valid_indices is not None
+            else None
+        )
+        if self.valid_indices is not None and not self.valid_indices:
+            raise ValueError(
+                f"dataset has no samples enabled by {self.validity_key}"
+            )
+
+    def _load_valid_indices(self):
+        """Return base SequenceDataset indices admitted by an HDF5 row mask.
+
+        Old simulation datasets do not carry real-robot timing metadata and
+        retain their historical all-window behavior. A partially populated
+        mixed dataset is rejected because silently treating missing rollout
+        masks as valid would reintroduce inference-gap transitions.
+        """
+
+        key = self.requested_validity_key
+        if key is None:
+            return None
+        base = self.dataset
+        with base.hdf5_file_opened():
+            presence = {
+                demo_id: key in base.hdf5_file[f"data/{demo_id}"]
+                for demo_id in base.demos
+            }
+            if not any(presence.values()):
+                return None
+            missing = [demo_id for demo_id, found in presence.items() if not found]
+            if missing:
+                raise ValueError(
+                    f"dataset only partially defines {key}; missing demos "
+                    f"{missing[:8]}"
+                )
+            masks = {}
+            for demo_id in base.demos:
+                episode = base.hdf5_file[f"data/{demo_id}"]
+                source = episode.attrs.get("rise_source")
+                if isinstance(source, bytes):
+                    source = source.decode("utf-8")
+                if source not in {
+                    "expert",
+                    "non_expert_success",
+                    "non_expert_failure",
+                }:
+                    raise ValueError(
+                        f"data/{demo_id} defines {key} but has no valid "
+                        "rise_source attribute"
+                    )
+                values = np.asarray(
+                    episode[key][:],
+                    dtype=np.uint8,
+                ).reshape(-1)
+                expected = int(base._demo_id_to_demo_length[demo_id])
+                if values.shape != (expected,) or np.any(~np.isin(values, (0, 1))):
+                    raise ValueError(
+                        f"data/{demo_id}/{key} must be a binary vector of "
+                        f"length {expected}, got shape={values.shape}"
+                    )
+                masks[demo_id] = values
+                request_aligned = bool(episode.attrs.get("request_aligned", 0))
+                one_step_aligned = bool(episode.attrs.get("one_step_aligned", 0))
+                if request_aligned and one_step_aligned:
+                    raise ValueError(
+                        f"data/{demo_id} cannot be both request_aligned and "
+                        "one_step_aligned"
+                    )
+                self._demo_request_aligned[demo_id] = request_aligned
+                self._demo_one_step_aligned[demo_id] = one_step_aligned
+                if one_step_aligned:
+                    if key != "one_step_critic_valid":
+                        raise ValueError(
+                            f"data/{demo_id} one_step_aligned observations can "
+                            "only be used with one_step_critic_valid"
+                        )
+                    aligned_group = episode.get("one_step_obs")
+                    if not isinstance(aligned_group, h5py.Group):
+                        raise ValueError(
+                            f"data/{demo_id} is one_step_aligned but has no "
+                            "one_step_obs group"
+                        )
+                    for obs_key in base.obs_keys:
+                        if obs_key not in aligned_group:
+                            raise ValueError(
+                                f"data/{demo_id}/one_step_obs is missing {obs_key}"
+                            )
+                        aligned_dataset = aligned_group[obs_key]
+                        if (
+                            aligned_dataset.ndim < 2
+                            or aligned_dataset.shape[0] != expected
+                            or aligned_dataset.shape[1] != self.observation_horizon
+                        ):
+                            raise ValueError(
+                                f"{aligned_dataset.name} must have leading shape "
+                                f"({expected}, {self.observation_horizon})"
+                            )
+                if source != "expert":
+                    offset_path = "provenance/policy_chunk_offset"
+                    if offset_path not in episode:
+                        raise ValueError(
+                            f"data/{demo_id} is a rollout but is missing "
+                            f"{offset_path}"
+                        )
+                    offsets = np.asarray(
+                        episode[offset_path][:], dtype=np.uint8
+                    ).reshape(-1)
+                    chunk_valid = np.asarray(
+                        episode["chunk_critic_valid"][:], dtype=np.uint8
+                    ).reshape(-1)
+                    if offsets.shape != (expected,) or chunk_valid.shape != (
+                        expected,
+                    ):
+                        raise ValueError(
+                            f"data/{demo_id} proposal metadata has invalid shape"
+                        )
+                    if request_aligned:
+                        request_group = episode.get("request_obs")
+                        chunk_index_path = "provenance/policy_chunk_index"
+                        bootstrap_path = "provenance/request_bootstrap_valid"
+                        if not isinstance(request_group, h5py.Group):
+                            raise ValueError(
+                                f"data/{demo_id} is request-aligned but has no "
+                                "request_obs group"
+                            )
+                        if chunk_index_path not in episode or bootstrap_path not in episode:
+                            raise ValueError(
+                                f"data/{demo_id} is missing request index or "
+                                "bootstrap metadata"
+                            )
+                        chunk_indices = np.asarray(
+                            episode[chunk_index_path][:], dtype=np.int64
+                        ).reshape(-1)
+                        bootstrap_valid = np.asarray(
+                            episode[bootstrap_path][:], dtype=np.uint8
+                        ).reshape(-1)
+                        if chunk_indices.shape != (expected,):
+                            raise ValueError(
+                                f"data/{demo_id}/{chunk_index_path} must have "
+                                f"length {expected}"
+                            )
+                        request_count = int(bootstrap_valid.size)
+                        if request_count < 1 or np.any(
+                            ~np.isin(bootstrap_valid, (0, 1))
+                        ):
+                            raise ValueError(
+                                f"data/{demo_id}/{bootstrap_path} is invalid"
+                            )
+                        if (
+                            np.any(chunk_indices < 0)
+                            or np.any(chunk_indices >= request_count)
+                            or np.any((chunk_valid == 1) & (offsets != 0))
+                        ):
+                            raise ValueError(
+                                f"data/{demo_id} has inconsistent request indices"
+                            )
+                        for obs_key in base.obs_keys:
+                            if obs_key not in request_group:
+                                raise ValueError(
+                                    f"data/{demo_id}/request_obs is missing {obs_key}"
+                                )
+                            request_dataset = request_group[obs_key]
+                            if (
+                                request_dataset.ndim < 2
+                                or request_dataset.shape[0] != request_count
+                                or request_dataset.shape[1] != self.observation_horizon
+                            ):
+                                raise ValueError(
+                                    f"{request_dataset.name} must have leading shape "
+                                    f"({request_count}, {self.observation_horizon})"
+                                )
+                        self._demo_policy_chunk_indices[demo_id] = chunk_indices
+                        self._demo_request_bootstrap_valid[demo_id] = bootstrap_valid
+
+            request_aligned_rollouts = [
+                demo_id
+                for demo_id, enabled in self._demo_request_aligned.items()
+                if enabled
+            ]
+            if key == "one_step_critic_valid" and request_aligned_rollouts:
+                raise ValueError(
+                    "request-aligned H8 rollout episodes cannot supply one-step "
+                    "IDQL transitions; use chunk IDQL or recollect per-action "
+                    "request observations"
+                )
+        admitted = []
+        for base_index in range(len(base)):
+            demo_id = base._index_to_demo_id[base_index]
+            demo_start = base._demo_id_to_start_indices[demo_id]
+            demo_offset = 0 if base.pad_frame_stack else base.n_frame_stack - 1
+            row = (
+                base_index
+                - demo_start
+                + demo_offset
+                + (base.sample_start_offset if base.demo_start_only else 0)
+            )
+            if int(masks[demo_id][row]) == 1:
+                admitted.append(base_index)
+        return admitted
 
     def __len__(self):
-        return len(self.dataset)
+        return (
+            self.unfiltered_size
+            if self.valid_indices is None
+            else len(self.valid_indices)
+        )
 
     def __getattr__(self, name):
         if name == "dataset":
@@ -845,8 +1059,32 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                 )
         return next_obs
 
+    def _get_request_observations(self, demo_id, request_index):
+        """Read one exact model request without routing through action rows."""
+
+        request_group = self.dataset.hdf5_file[
+            f"data/{demo_id}/request_obs"
+        ]
+        return {
+            key: np.asarray(request_group[key][request_index])
+            for key in self.dataset.obs_keys
+        }
+
+    def _get_one_step_observations(self, demo_id, action_index):
+        """Read one explicitly materialized two-frame action-state input."""
+
+        aligned_group = self.dataset.hdf5_file[
+            f"data/{demo_id}/one_step_obs"
+        ]
+        return {
+            key: np.asarray(aligned_group[key][action_index])
+            for key in self.dataset.obs_keys
+        }
+
     def __getitem__(self, index):
         base = self.dataset
+        if self.valid_indices is not None:
+            index = self.valid_indices[index]
         demo_id = base._index_to_demo_id[index]
         demo_start_index = base._demo_id_to_start_indices[demo_id]
         demo_length = base._demo_id_to_demo_length[demo_id]
@@ -865,14 +1103,30 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
             num_frames_to_stack=base.n_frame_stack - 1,
             seq_length=base.seq_length,
         )
-        meta["obs"] = base.get_obs_sequence_from_demo(
-            demo_id,
-            index_in_demo=index_in_demo,
-            keys=base.obs_keys,
-            num_frames_to_stack=base.n_frame_stack - 1,
-            seq_length=1,
-            prefix="obs",
-        )
+        request_aligned = self._demo_request_aligned.get(demo_id, False)
+        one_step_aligned = self._demo_one_step_aligned.get(demo_id, False)
+        if one_step_aligned:
+            current_aligned = self._get_one_step_observations(
+                demo_id, index_in_demo
+            )
+            meta["obs"] = dict(current_aligned)
+        elif request_aligned:
+            request_index = int(
+                self._demo_policy_chunk_indices[demo_id][index_in_demo]
+            )
+            current_request = self._get_request_observations(
+                demo_id, request_index
+            )
+            meta["obs"] = dict(current_request)
+        else:
+            meta["obs"] = base.get_obs_sequence_from_demo(
+                demo_id,
+                index_in_demo=index_in_demo,
+                keys=base.obs_keys,
+                num_frames_to_stack=base.n_frame_stack - 1,
+                seq_length=1,
+                prefix="obs",
+            )
 
         current_index = self.observation_horizon - 1
         chunk_dones = np.asarray(
@@ -886,7 +1140,48 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
             )
         )
         valid_length = int(action_mask.sum())
-        if self.dynamics_prediction_offsets:
+        if one_step_aligned:
+            next_index = min(index_in_demo + 1, demo_length - 1)
+            meta["next_obs"] = self._get_one_step_observations(
+                demo_id, next_index
+            )
+        elif request_aligned:
+            bootstrap_valid = bool(
+                self._demo_request_bootstrap_valid[demo_id][request_index]
+            )
+            if bootstrap_valid:
+                next_request = self._get_request_observations(
+                    demo_id, request_index + 1
+                )
+            else:
+                next_request = current_request
+            meta["next_obs"] = dict(next_request)
+            if self.dynamics_prediction_offsets:
+                # Request-aligned policy rollouts only recorded a new camera
+                # observation at the next H8 request. Intermediate dynamics
+                # offsets therefore receive a shape-compatible placeholder
+                # and availability=0; human action-time episodes still provide
+                # real targets for those offsets through the regular path.
+                dynamics_values = {key: [] for key in base.obs_keys}
+                target_available = []
+                for offset in self.dynamics_prediction_offsets:
+                    use_next_request = int(offset) == self.chunk_horizon
+                    source_obs = (
+                        next_request if use_next_request else current_request
+                    )
+                    for key in base.obs_keys:
+                        dynamics_values[key].append(source_obs[key][-1])
+                    target_available.append(
+                        float(use_next_request and bootstrap_valid)
+                    )
+                meta["chunk_dynamics_next_obs"] = {
+                    key: np.stack(values, axis=0)
+                    for key, values in dynamics_values.items()
+                }
+                meta["chunk_dynamics_target_available"] = np.asarray(
+                    target_available, dtype=np.float32
+                )
+        elif self.dynamics_prediction_offsets:
             # All bootstrap-history and dense-dynamics frames lie in one short
             # successor window. Read that window once per observation key.
             # This is materially faster for the compressed RGB datasets used
@@ -995,6 +1290,7 @@ class SparseOneStepSequenceDataset(SparseChunkSequenceDataset):
             chunk_horizon=1,
             observation_horizon=observation_horizon,
             next_observation_horizon=critic_observation_horizon,
+            validity_key="one_step_critic_valid",
         )
 
     def __getitem__(self, index):
@@ -1011,6 +1307,7 @@ class SparseDQLSequenceDataset(SparseChunkSequenceDataset):
             dataset,
             chunk_horizon=1,
             observation_horizon=observation_horizon,
+            validity_key="one_step_critic_valid",
         )
 
     def _get_next_obs_sequence(

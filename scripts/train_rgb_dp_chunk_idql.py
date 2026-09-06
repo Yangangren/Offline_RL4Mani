@@ -5288,6 +5288,28 @@ def validate_source(source: dict, args: argparse.Namespace) -> None:
         raise ValueError(
             f"source task={source.get('task')} does not match task={args.task}"
         )
+    source_reward_mode = str(source.get("reward_mode", "rise"))
+    if source_reward_mode != str(args.reward_mode):
+        raise ValueError(
+            f"source reward_mode={source_reward_mode!r} does not match "
+            f"requested reward_mode={args.reward_mode!r}"
+        )
+    expected_reward_definition = REWARD_DEFINITIONS[str(args.reward_mode)]
+    source_reward_definition = source.get("reward_definition")
+    if source_reward_definition is None and source_reward_mode == "rise":
+        raise ValueError(
+            "rise source checkpoint is missing reward_definition; old binary "
+            "imitation-reward critics cannot warm-start signed-terminal training"
+        )
+    if (
+        source_reward_definition is not None
+        and str(source_reward_definition) != expected_reward_definition
+    ):
+        raise ValueError(
+            "source reward_definition does not match the requested reward "
+            f"semantics: source={source_reward_definition!r}, "
+            f"current={expected_reward_definition!r}"
+        )
     if str(args.critic_architecture) == WCM_CRITIC_ARCHITECTURE:
         # A one-step IDQL source contributes only its actor lineage to a fresh
         # WCM system. Its Q/V widths and encoder-head layout are deliberately
@@ -5385,6 +5407,22 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
         raise ValueError(
             f"source reward_mode={source_reward_mode!r} does not match "
             f"requested reward_mode={args.reward_mode!r}"
+        )
+    expected_reward_definition = REWARD_DEFINITIONS[str(args.reward_mode)]
+    source_reward_definition = source.get("reward_definition")
+    if source_reward_definition is None and source_reward_mode == "rise":
+        raise ValueError(
+            "rise source checkpoint is missing reward_definition; old binary "
+            "imitation-reward critics cannot warm-start signed-terminal training"
+        )
+    if (
+        source_reward_definition is not None
+        and str(source_reward_definition) != expected_reward_definition
+    ):
+        raise ValueError(
+            "source reward_definition does not match the requested reward "
+            f"semantics: source={source_reward_definition!r}, "
+            f"current={expected_reward_definition!r}"
         )
     source_conditioned = bool(source.get("conditioned_actor", False))
     validating_completed_resume = bool(
@@ -5833,9 +5871,19 @@ def checkpoint_payload(
         ),
         "single_dataloader": distributed_world_size == 1,
         "sampling": (
-            "distributed_shuffled_SequenceDataset_indices"
+            "distributed_shuffled_"
+            + (
+                f"{args.dataset_validity_key}_admitted_indices"
+                if getattr(args, "dataset_validity_key", None) is not None
+                else "SequenceDataset_indices"
+            )
             if distributed_world_size > 1
-            else "uniform_shuffled_SequenceDataset_indices"
+            else "uniform_shuffled_"
+            + (
+                f"{args.dataset_validity_key}_admitted_indices"
+                if getattr(args, "dataset_validity_key", None) is not None
+                else "SequenceDataset_indices"
+            )
         ),
         "reward_mode": str(args.reward_mode),
         "reward_definition": REWARD_DEFINITIONS[args.reward_mode],
@@ -5847,12 +5895,17 @@ def checkpoint_payload(
             if args.reward_mode == "task"
             else "rewards=canonical_first_success_terminal_reward"
             if args.reward_mode == "terminal_success"
-            else "rewards=expert_1_non_expert_0"
+            else "rewards=canonical_signed_terminal_outcome"
         ),
         "actor_training_objective": (
             (
-                "conditional_diffusion_BC_all_mixed_rows_"
-                f"{args.actor_condition_mode}_"
+                "conditional_diffusion_BC_"
+                + (
+                    f"{args.dataset_validity_key}_admitted_rows_"
+                    if getattr(args, "dataset_validity_key", None) is not None
+                    else "all_mixed_rows_"
+                )
+                + f"{args.actor_condition_mode}_"
                 + (
                     "from_source_chunk_IDQL_actor"
                     if args.initialization == "source_chunk_idql_joint"
@@ -5868,7 +5921,11 @@ def checkpoint_payload(
             )
             if trains_joint_actor(args) and args.conditioned_actor
             else (
-                "full_diffusion_BC_all_mixed_rows"
+                (
+                    f"full_diffusion_BC_{args.dataset_validity_key}_admitted_rows"
+                    if getattr(args, "dataset_validity_key", None) is not None
+                    else "full_diffusion_BC_all_mixed_rows"
+                )
                 if trains_joint_actor(args)
                 else (
                     "frozen_deployed_dp_actor_from_pretrained_checkpoint"
@@ -5931,19 +5988,19 @@ def checkpoint_payload(
             if is_wcm and args.reward_mode == "task"
             else "terminal_success_semi_mdp_chunk_iql_with_shared_wcm_dynamics"
             if is_wcm and args.reward_mode == "terminal_success"
-            else "rise_semi_mdp_chunk_iql_with_shared_wcm_dynamics"
+            else "signed_terminal_outcome_semi_mdp_chunk_iql_with_shared_wcm_dynamics"
             if is_wcm
             else "task_reward_semi_mdp_chunk_iql_rise_v2_temporal_fusion"
             if is_rise_v2 and args.reward_mode == "task"
             else "terminal_success_semi_mdp_chunk_iql_rise_v2_temporal_fusion"
             if is_rise_v2 and args.reward_mode == "terminal_success"
-            else "rise_semi_mdp_chunk_iql_rise_v2_temporal_fusion"
+            else "signed_terminal_outcome_semi_mdp_chunk_iql_rise_v2_temporal_fusion"
             if is_rise_v2
             else "task_reward_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
             if args.reward_mode == "task"
             else "terminal_success_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
             if args.reward_mode == "terminal_success"
-            else "rise_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
+            else "signed_terminal_outcome_semi_mdp_chunk_iql_with_actor_encoder_dynamics"
         ),
         "critic_input_mode": (
             "shared_raw_observation_causal_temporal_state"
@@ -6185,6 +6242,23 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(
                 f"resume reward_mode={saved_reward_mode} does not match "
                 f"requested reward_mode={args.reward_mode}"
+            )
+        expected_reward_definition = REWARD_DEFINITIONS[str(args.reward_mode)]
+        saved_reward_definition = resume_state.get("reward_definition")
+        if saved_reward_definition is None and saved_reward_mode == "rise":
+            raise ValueError(
+                "rise resume checkpoint is missing reward_definition; old "
+                "binary imitation-reward checkpoints cannot resume "
+                "signed-terminal training"
+            )
+        if (
+            saved_reward_definition is not None
+            and str(saved_reward_definition) != expected_reward_definition
+        ):
+            raise ValueError(
+                "resume reward_definition does not match the requested reward "
+                f"semantics: checkpoint={saved_reward_definition!r}, "
+                f"current={expected_reward_definition!r}"
             )
         saved_args = resume_state.get("args", {})
         resume_float_fields = {
@@ -6644,6 +6718,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             len(validation_dataset),
             expected_task=args.task,
             expected_reward_mode=args.reward_mode,
+            validity_key=getattr(validation_dataset, "validity_key", None),
         )
         validation_split_audit = audit_validation_dataset_split(
             args.dataset,
@@ -6782,7 +6857,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         len(dataset),
         expected_task=args.task,
         expected_reward_mode=args.reward_mode,
+        validity_key=getattr(dataset, "validity_key", None),
     )
+    args.dataset_validity_key = audit["validity_key"]
     action_stats = copy.deepcopy(dp_checkpoint["action_normalization_stats"])
     obs_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
     del dp_checkpoint
@@ -7613,7 +7690,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "split_audit": validation_split_audit,
                 "actor_conditioning": validation_condition_audit,
                 "frequency_epochs": 1,
-                "coverage": "all_held_out_windows",
+                "coverage": (
+                    f"all_{validation_audit['validity_key']}_admitted_held_out_windows"
+                    if validation_audit is not None
+                    and validation_audit["validity_key"] is not None
+                    else "all_held_out_windows"
+                ),
                 "execution": "rank_zero_only_no_parameter_updates",
                 "actor_weights": "exponential_moving_average",
                 "seed": int(args.validation_seed),
@@ -7646,6 +7728,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "steps_per_epoch_source": args.steps_per_epoch_source,
             "sequence_length": int(sequence_length),
             "sparse_chunk_loader": bool(args.sparse_chunk_loader),
+            "validity_key": audit["validity_key"],
+            "unfiltered_sequence_dataset_size": int(
+                audit["hdf5_total_transitions"]
+            ),
+            "admitted_sequence_dataset_size": int(
+                audit["sequence_dataset_size"]
+            ),
             "num_workers_per_rank": int(args.num_workers),
             "total_worker_processes": int(
                 args.num_workers * distributed.world_size
@@ -7677,6 +7766,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "critic_rows": (
                 "none_critic_disabled"
                 if actor_only
+                else f"{audit['validity_key']}_admitted_shared_rows"
+                if audit["validity_key"] is not None
                 else "all_human_success_failure"
             ),
             "critic_reward_source": (
@@ -7687,12 +7778,25 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 if args.reward_mode == "task"
                 else "rewards=canonical_first_success_terminal_reward"
                 if args.reward_mode == "terminal_success"
-                else "rewards=expert_1_non_expert_0"
+                else "rewards=canonical_signed_terminal_outcome"
             ),
             "actor_rows": (
-                "all_human_success_failure"
+                (
+                    f"{audit['validity_key']}_admitted_shared_rows"
+                    if audit["validity_key"] is not None
+                    else "all_human_success_failure"
+                )
                 if trains_joint_actor(args)
                 else "none_actor_frozen"
+            ),
+            "filtered_rows": int(
+                audit["hdf5_total_transitions"]
+                - audit["sequence_dataset_size"]
+            ),
+            "actor_rollout_targets": (
+                "full_prediction_horizon_at_recorded_proposal_starts"
+                if audit["validity_key"] is not None
+                else "full_prediction_horizon"
             ),
             "actor_condition_labels": (
                 actor_condition_labels(args.actor_condition_mode)

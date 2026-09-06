@@ -83,7 +83,11 @@ REWARD_DEFINITIONS = {
         "reward=1_and_done=1_there; failed_episode: reward=0, "
         "done=1_at_source_end"
     ),
-    "rise": "expert_transition=1; non_expert_transition=0",
+    "rise": (
+        "successful_episode: truncate_at_first_source_task_reward>0.5, "
+        "reward=1_and_done=1_there; failed_episode: reward=-1_and_done=1_"
+        "at_source_end; all_nonterminal_rewards=0"
+    ),
 }
 TEMPORAL_CRITIC_ARCHITECTURE = "rise_temporal_v2"
 TEMPORAL_ONE_STEP_MARKER = "temporal_one_step_idql"
@@ -1344,7 +1348,7 @@ def rise_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
     elif args.reward_mode == "terminal_success":
         reward_alignment = "canonical_first_success_terminal_reward_with_truncation"
     else:
-        reward_alignment = "expert_transition_reward_1_non_expert_transition_reward_0"
+        reward_alignment = "canonical_signed_terminal_outcome_reward_with_truncation"
     return {
         "matched": [
             "one uniformly shuffled mixed SequenceDataset",
@@ -1804,6 +1808,7 @@ def dataset_audit(
     dataset_size: int,
     expected_task: str | None = None,
     expected_reward_mode: str | None = None,
+    validity_key: str | None = None,
 ) -> dict[str, Any]:
     with h5py.File(dataset_path, "r") as handle:
         reward_definition = str(handle.attrs.get("reward_definition", ""))
@@ -1830,7 +1835,7 @@ def dataset_audit(
                 f"train with --reward-mode {reward_mode}"
             )
         task_reward_audit = None
-        if reward_mode in ("task", "terminal_success"):
+        if reward_mode in ("task", "terminal_success", "rise"):
             missing_source_labels = [
                 key
                 for key, episode in handle["data"].items()
@@ -1869,26 +1874,31 @@ def dataset_audit(
                         f"task-reward dataset data/{episode_key} contains "
                         "non-finite rewards"
                     )
-                if reward_mode == "terminal_success":
+                if reward_mode in ("terminal_success", "rise"):
                     if source not in {"expert", "non_expert_success", "non_expert_failure"}:
-                        raise ValueError(f"unsupported terminal-success source={source!r}")
+                        raise ValueError(
+                            f"unsupported {reward_mode} source={source!r}"
+                        )
                     expected_rewards = np.zeros_like(rewards)
                     if source in {"expert", "non_expert_success"}:
                         expected_rewards[-1] = 1.0
                         task_positive = np.flatnonzero(task_rewards > 0.5)
                         if not (task_positive.size == 1 and task_positive[0] == rewards.size - 1):
                             raise ValueError(
-                                f"terminal-success data/{episode_key} must end "
+                                f"{reward_mode} data/{episode_key} must end "
                                 "at its first positive source task reward"
                             )
-                    elif np.any(task_rewards > 0.5):
-                        raise ValueError(
-                            f"terminal-success failure data/{episode_key} has a "
-                            "positive source task reward"
-                        )
+                    else:
+                        if np.any(task_rewards > 0.5):
+                            raise ValueError(
+                                f"{reward_mode} failure data/{episode_key} has "
+                                "a positive source task reward"
+                            )
+                        if reward_mode == "rise":
+                            expected_rewards[-1] = -1.0
                     if not np.array_equal(rewards, expected_rewards):
                         raise ValueError(
-                            f"terminal-success data/{episode_key} has incorrect "
+                            f"{reward_mode} data/{episode_key} has incorrect "
                             "canonical critic rewards"
                         )
                     if "dones" not in episode:
@@ -1917,6 +1927,8 @@ def dataset_audit(
                         "transitions": 0,
                         "positive_reward_episodes": 0,
                         "positive_reward_transitions": 0,
+                        "negative_reward_episodes": 0,
+                        "negative_reward_transitions": 0,
                         "reward_sum": 0.0,
                         "source_positive_reward_transitions": 0,
                         "source_reward_sum": 0.0,
@@ -1930,6 +1942,12 @@ def dataset_audit(
                 source_stats["positive_reward_transitions"] += int(
                     np.count_nonzero(rewards > 0.5)
                 )
+                source_stats["negative_reward_episodes"] += int(
+                    np.any(rewards < -0.5)
+                )
+                source_stats["negative_reward_transitions"] += int(
+                    np.count_nonzero(rewards < -0.5)
+                )
                 source_stats["reward_sum"] += float(rewards.sum())
                 source_stats["source_positive_reward_transitions"] += int(
                     np.count_nonzero(task_rewards > 0.5)
@@ -1940,6 +1958,23 @@ def dataset_audit(
             for key, value in handle.get("mask", {}).items()
         }
         hdf5_total = int(handle["data"].attrs.get("total", -1))
+        validity_total = None
+        if validity_key is not None:
+            missing_validity = [
+                key for key, episode in handle["data"].items()
+                if validity_key not in episode
+            ]
+            if missing_validity:
+                raise ValueError(
+                    f"dataset is missing {validity_key} for episodes "
+                    f"{missing_validity[:8]}"
+                )
+            validity_total = int(
+                sum(
+                    np.asarray(episode[validity_key][:], dtype=np.uint8).sum()
+                    for episode in handle["data"].values()
+                )
+            )
         dataset_task = str(handle.attrs.get("task", "")) or None
     if expected_task is not None and dataset_task is not None and dataset_task != expected_task:
         raise ValueError(
@@ -1949,15 +1984,21 @@ def dataset_audit(
     builder_summary = (
         json.loads(summary_path.read_text()) if summary_path.is_file() else None
     )
-    if hdf5_total >= 0 and int(dataset_size) != hdf5_total:
+    expected_dataset_size = (
+        int(validity_total) if validity_total is not None else hdf5_total
+    )
+    if expected_dataset_size >= 0 and int(dataset_size) != expected_dataset_size:
         raise ValueError(
-            f"SequenceDataset has {dataset_size} indices but HDF5 reports {hdf5_total} transitions"
+            f"SequenceDataset has {dataset_size} indices but HDF5 reports "
+            f"{expected_dataset_size} valid samples"
         )
     return {
         "path": str(dataset_path),
         "task": dataset_task,
         "sequence_dataset_size": int(dataset_size),
         "hdf5_total_transitions": hdf5_total,
+        "validity_key": validity_key,
+        "validity_samples": validity_total,
         "masks": masks,
         "reward_mode": reward_mode,
         "reward_definition": reward_definition,
@@ -2306,9 +2347,19 @@ def checkpoint_payload(
         "validation_seed": int(args.validation_seed),
         "single_dataloader": distributed_world_size == 1,
         "sampling": (
-            "distributed_shuffled_SequenceDataset_indices"
+            "distributed_shuffled_"
+            + (
+                f"{args.dataset_validity_key}_admitted_indices"
+                if getattr(args, "dataset_validity_key", None) is not None
+                else "SequenceDataset_indices"
+            )
             if distributed_world_size > 1
-            else "uniform_shuffled_SequenceDataset_indices"
+            else "uniform_shuffled_"
+            + (
+                f"{args.dataset_validity_key}_admitted_indices"
+                if getattr(args, "dataset_validity_key", None) is not None
+                else "SequenceDataset_indices"
+            )
         ),
         "reward_mode": str(args.reward_mode),
         "reward_definition": REWARD_DEFINITIONS[args.reward_mode],
@@ -2322,21 +2373,29 @@ def checkpoint_payload(
         "resolved_actor_obs_encoder_freeze_steps": int(
             args.resolved_actor_obs_encoder_freeze_steps
         ),
-        "actor_source_mask": "none_all_shared_batch_rows",
-        "actor_data_mode": "all_human_success_failure_rows",
+        "actor_source_mask": (
+            f"shared_{args.dataset_validity_key}"
+            if getattr(args, "dataset_validity_key", None) is not None
+            else "none_all_shared_batch_rows"
+        ),
+        "actor_data_mode": (
+            f"{args.dataset_validity_key}_admitted_human_success_failure_rows"
+            if getattr(args, "dataset_validity_key", None) is not None
+            else "all_human_success_failure_rows"
+        ),
         "critic_training_objective": (
             "task_reward_one_step_iql"
             if args.reward_mode == "task"
             else "terminal_success_reward_one_step_iql"
             if args.reward_mode == "terminal_success"
-            else "rise_one_step_iql"
+            else "signed_terminal_outcome_one_step_iql"
         ),
         "critic_reward_source": (
             "rewards=source_environment_task_reward"
             if args.reward_mode == "task"
             else "rewards=canonical_first_success_terminal_reward"
             if args.reward_mode == "terminal_success"
-            else "rewards=expert_1_non_expert_0"
+            else "rewards=canonical_signed_terminal_outcome"
         ),
         "critic_input_mode": "independent_causal_two_frame_temporal_encoders",
         "critic_action_space": "pretrained_dp_normalized_action_space",
@@ -2441,6 +2500,22 @@ def replace_with_hardlink(source: Path, target: Path) -> None:
 
 
 def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
+    expected_reward_definition = REWARD_DEFINITIONS[str(args.reward_mode)]
+    saved_reward_definition = checkpoint.get("reward_definition")
+    if saved_reward_definition is None and str(args.reward_mode) == "rise":
+        raise ValueError(
+            "rise resume checkpoint is missing reward_definition; old binary "
+            "imitation-reward checkpoints cannot resume signed-terminal training"
+        )
+    if (
+        saved_reward_definition is not None
+        and str(saved_reward_definition) != expected_reward_definition
+    ):
+        raise ValueError(
+            "resume reward_definition does not match the requested reward "
+            f"semantics: checkpoint={saved_reward_definition!r}, "
+            f"current={expected_reward_definition!r}"
+        )
     previous = checkpoint.get("args", {})
     exact_keys = (
         "dataset",
@@ -2600,7 +2675,9 @@ def train(args: argparse.Namespace) -> dict:
         len(dataset),
         expected_task=args.task,
         expected_reward_mode=args.reward_mode,
+        validity_key=getattr(dataset, "validity_key", None),
     )
+    args.dataset_validity_key = audit["validity_key"]
     validation_dataset = None
     validation_loader = None
     validation_audit = None
@@ -2623,6 +2700,7 @@ def train(args: argparse.Namespace) -> dict:
             len(validation_dataset),
             expected_task=args.task,
             expected_reward_mode=args.reward_mode,
+            validity_key=getattr(validation_dataset, "validity_key", None),
         )
         validation_split_audit = audit_validation_dataset_split(
             args.dataset,
@@ -2966,13 +3044,32 @@ def train(args: argparse.Namespace) -> dict:
         },
         "data_routing": {
             "shared_loader": True,
-            "actor_rows": "all_human_success_failure_no_mask",
-            "critic_rows": "all_human_success_failure",
-            "actor_filtered_rows": 0,
+            "actor_rows": (
+                f"{audit['validity_key']}_admitted_shared_rows"
+                if audit["validity_key"] is not None
+                else "all_human_success_failure_no_mask"
+            ),
+            "critic_rows": (
+                f"{audit['validity_key']}_admitted_shared_rows"
+                if audit["validity_key"] is not None
+                else "all_human_success_failure"
+            ),
+            "filtered_rows": int(
+                audit["hdf5_total_transitions"]
+                - audit["sequence_dataset_size"]
+            ),
+            "actor_rollout_targets": "full_prediction_horizon_at_admitted_rows",
         },
         "loader": {
             "class": dataset.__class__.__name__,
             "sparse_one_step_loader": bool(args.sparse_one_step_loader),
+            "validity_key": audit["validity_key"],
+            "unfiltered_sequence_dataset_size": int(
+                audit["hdf5_total_transitions"]
+            ),
+            "admitted_sequence_dataset_size": int(
+                audit["sequence_dataset_size"]
+            ),
             "observation_loading": (
                 "actor_observation_history_plus_two_frame_successor_critic_history"
                 if args.sparse_one_step_loader
