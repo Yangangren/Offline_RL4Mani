@@ -2,14 +2,14 @@
 """Build one RGB IDQL dataset from expert and deployment trajectories.
 
 The default ``task`` reward mode keeps each source trajectory's environment
-reward. ``terminal_success`` canonicalizes sparse task rewards across sources:
-successful episodes end at their first positive task reward and receive exactly
-one terminal reward, while failed episodes receive zero reward and terminate at
-their original end. The optional ``rise`` mode reproduces the prior binary
-imitation reward (human transition 1, rollout transition 0). Source identity and
-the actor's condition are stored separately from critic rewards. Large arrays
-stay in their source HDF5 files through external links or prefix virtual
-datasets; shifted ``next_obs`` arrays are HDF5 virtual datasets.
+reward. ``terminal_success`` and ``rise`` canonicalize sparse task rewards
+across sources: successful episodes end at their first positive task reward and
+receive exactly one positive terminal reward. ``terminal_success`` leaves failed
+episodes at zero reward, while ``rise`` assigns exactly one negative reward at
+the end of each failed episode. Source identity and the actor's condition are
+stored separately from critic rewards. Large arrays stay in their source HDF5
+files through external links or prefix virtual datasets; shifted ``next_obs``
+arrays are HDF5 virtual datasets.
 """
 
 from __future__ import annotations
@@ -25,6 +25,11 @@ from typing import Any, Sequence
 import h5py
 import numpy as np
 
+from rgb_dp_idql_rewards import (
+    CANONICAL_TERMINAL_REWARD_MODES,
+    REWARD_DEFINITIONS,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EXPERT = ROOT / "datasets/square/ph/image_v15.hdf5"
@@ -36,15 +41,6 @@ DEFAULT_OUTPUT = (
     ROOT
     / "datasets/square/idql/square_rgb_dp_idql_200demo_100success_94failure_task_reward.hdf5"
 )
-REWARD_DEFINITIONS = {
-    "task": "source_task_reward",
-    "terminal_success": (
-        "successful_episode: truncate_at_first_source_task_reward>0.5, "
-        "reward=1_and_done=1_there; failed_episode: reward=0, "
-        "done=1_at_source_end"
-    ),
-    "rise": "expert_transition=1; non_expert_transition=0",
-}
 ACTOR_CONDITION_DEFINITIONS = {
     "human_only": "human_demo=1; success_rollout=0; failure_rollout=0",
     "human_success": "human_demo=1; success_rollout=1; failure_rollout=0",
@@ -63,7 +59,7 @@ def terminal_success_layout(
     source_rewards: h5py.Dataset | np.ndarray,
     source_label: str,
 ) -> tuple[int, int | None, int]:
-    """Return retained count, terminal-success index, and positive count.
+    """Return retained count, first-success index, and source positive count.
 
     Source labels define whether an episode is intended to be successful. A
     positive source task reward is still required for every labeled success,
@@ -72,7 +68,7 @@ def terminal_success_layout(
     """
     rewards = np.asarray(source_rewards[:], dtype=np.float32).reshape(-1)
     if rewards.size < 1:
-        raise ValueError("terminal-success canonicalization received no rewards")
+        raise ValueError("terminal-outcome canonicalization received no rewards")
     if not np.isfinite(rewards).all():
         raise ValueError("source task rewards contain non-finite values")
     positive_indices = np.flatnonzero(rewards > 0.5)
@@ -92,6 +88,27 @@ def terminal_success_layout(
             )
         return int(rewards.size), None, 0
     raise ValueError(f"unsupported source label: {source_label!r}")
+
+
+def canonical_terminal_rewards(
+    count: int,
+    source_label: str,
+    reward_mode: str,
+) -> np.ndarray:
+    """Return one signed terminal outcome and zero nonterminal rewards."""
+    if reward_mode not in CANONICAL_TERMINAL_REWARD_MODES:
+        raise ValueError(f"unsupported canonical reward mode: {reward_mode!r}")
+    if int(count) < 1:
+        raise ValueError("canonical terminal rewards require a nonempty episode")
+    rewards = np.zeros(int(count), dtype=np.float32)
+    if source_label in SUCCESS_SOURCES:
+        rewards[-1] = 1.0
+    elif source_label in FAILURE_SOURCES:
+        if reward_mode == "rise":
+            rewards[-1] = -1.0
+    else:
+        raise ValueError(f"unsupported source label: {source_label!r}")
+    return rewards
 
 
 def actor_condition_value(source_label: str, mode: str) -> bool:
@@ -378,7 +395,7 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
         source_object: str,
         location: str,
     ) -> None:
-        if args.reward_mode == "terminal_success" and key in {
+        if args.reward_mode in CANONICAL_TERMINAL_REWARD_MODES and key in {
             "actions", "obs", "task_rewards"
         }:
             try:
@@ -604,7 +621,10 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
             )
             source_count = expected_count
             terminal_success_index = None
-            if args.reward_mode == "terminal_success" and source_rewards is not None:
+            if (
+                args.reward_mode in CANONICAL_TERMINAL_REWARD_MODES
+                and source_rewards is not None
+            ):
                 try:
                     (
                         expected_count,
@@ -652,7 +672,7 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
                     f"{location} num_samples={actual_count}, expected "
                     f"{expected_count} from data/{source_key}"
                 )
-            if args.reward_mode == "terminal_success":
+            if args.reward_mode in CANONICAL_TERMINAL_REWARD_MODES:
                 expected_attrs = {
                     "source_num_samples": source_count,
                     "truncated_transition_count": source_count - expected_count,
@@ -769,15 +789,15 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
                     expected_rewards = np.asarray(
                         source_rewards[:expected_count], dtype=np.float32
                     )
-                elif args.reward_mode == "terminal_success":
-                    expected_rewards = np.zeros(expected_count, dtype=np.float32)
-                    if source in SUCCESS_SOURCES:
-                        expected_rewards[-1] = 1.0
-                else:
-                    expected_rewards = np.full(
+                elif args.reward_mode in CANONICAL_TERMINAL_REWARD_MODES:
+                    expected_rewards = canonical_terminal_rewards(
                         expected_count,
-                        1.0 if source == "expert" else 0.0,
-                        dtype=np.float32,
+                        source,
+                        args.reward_mode,
+                    )
+                else:
+                    raise AssertionError(
+                        f"unhandled reward mode {args.reward_mode!r}"
                     )
                 if not np.array_equal(actual_rewards, expected_rewards):
                     errors.append(f"{location}/rewards has incorrect {args.reward_mode} values")
@@ -966,7 +986,7 @@ def add_episode(
         source_positive_count = int(np.count_nonzero(source_rewards > 0.5))
         terminal_success_index = None
         count = source_count
-        if reward_mode == "terminal_success":
+        if reward_mode in CANONICAL_TERMINAL_REWARD_MODES:
             (
                 count,
                 terminal_success_index,
@@ -989,7 +1009,7 @@ def add_episode(
             if key in {"obs", "next_obs", "rewards", "dones"}:
                 continue
             child = source_group[key]
-            if reward_mode == "terminal_success":
+            if reward_mode in CANONICAL_TERMINAL_REWARD_MODES:
                 if not isinstance(child, h5py.Dataset):
                     raise TypeError(f"unsupported nested source group {child.name}")
                 create_virtual_prefix_dataset(
@@ -1004,7 +1024,7 @@ def add_episode(
                     str(source_path),
                     f"/data/{source_key}/{key}",
                 )
-        if reward_mode == "terminal_success":
+        if reward_mode in CANONICAL_TERMINAL_REWARD_MODES:
             observations = target.create_group("obs")
             copy_attrs(source_group["obs"].attrs, observations.attrs)
             for obs_key, dataset in source_group["obs"].items():
@@ -1038,19 +1058,15 @@ def add_episode(
                 str(source_path),
                 f"/data/{source_key}/rewards",
             )
-        elif reward_mode == "terminal_success":
-            rewards = np.zeros(count, dtype=np.float32)
-            if source_label in SUCCESS_SOURCES:
-                rewards[-1] = 1.0
+        elif reward_mode in CANONICAL_TERMINAL_REWARD_MODES:
+            rewards = canonical_terminal_rewards(
+                count,
+                source_label,
+                reward_mode,
+            )
             target.create_dataset(
                 "rewards",
                 data=rewards,
-            )
-        elif reward_mode == "rise":
-            reward = 1.0 if source_label == "expert" else 0.0
-            target.create_dataset(
-                "rewards",
-                data=np.full(count, reward, dtype=np.float32),
             )
         else:
             raise ValueError(f"unsupported reward mode: {reward_mode}")
@@ -1074,12 +1090,20 @@ def add_episode(
     if reward_mode == "task":
         critic_positive_count = source_positive_count
         critic_reward_sum = float(source_rewards.sum())
-    elif reward_mode == "terminal_success":
+    elif reward_mode in CANONICAL_TERMINAL_REWARD_MODES:
         critic_positive_count = int(source_label in SUCCESS_SOURCES)
-        critic_reward_sum = float(critic_positive_count)
+        critic_negative_count = int(
+            reward_mode == "rise" and source_label in FAILURE_SOURCES
+        )
+        critic_reward_sum = float(critic_positive_count - critic_negative_count)
     else:
-        critic_positive_count = count if source_label == "expert" else 0
-        critic_reward_sum = float(critic_positive_count)
+        raise ValueError(f"unsupported reward mode: {reward_mode}")
+    if reward_mode == "task":
+        retained_critic_rewards = source_rewards[:count]
+        critic_negative_count = int(
+            np.count_nonzero(retained_critic_rewards < -0.5)
+        )
+    critic_zero_count = int(count - critic_positive_count - critic_negative_count)
     retained_source_positive_count = int(
         np.count_nonzero(source_rewards[:count] > 0.5)
     )
@@ -1090,6 +1114,8 @@ def add_episode(
         "source_positive_count": int(source_positive_count),
         "retained_source_positive_count": retained_source_positive_count,
         "critic_positive_count": int(critic_positive_count),
+        "critic_negative_count": int(critic_negative_count),
+        "critic_zero_count": int(critic_zero_count),
         "source_reward_sum": float(source_rewards.sum()),
         "critic_reward_sum": float(critic_reward_sum),
     }
@@ -1166,6 +1192,8 @@ def build(args: argparse.Namespace) -> dict:
             "source_positive_transitions": 0,
             "retained_source_positive_transitions": 0,
             "critic_positive_transitions": 0,
+            "critic_negative_transitions": 0,
+            "critic_zero_transitions": 0,
             "source_reward_sum": 0.0,
             "critic_reward_sum": 0.0,
         }
@@ -1204,6 +1232,8 @@ def build(args: argparse.Namespace) -> dict:
                     "retained_source_positive_count",
                 ),
                 ("critic_positive_transitions", "critic_positive_count"),
+                ("critic_negative_transitions", "critic_negative_count"),
+                ("critic_zero_transitions", "critic_zero_count"),
                 ("source_reward_sum", "source_reward_sum"),
                 ("critic_reward_sum", "critic_reward_sum"),
             ):
@@ -1231,7 +1261,8 @@ def build(args: argparse.Namespace) -> dict:
         output.attrs["preserved_source_task_reward_key"] = "task_rewards"
         output.attrs["terminal_policy"] = (
             "first_positive_truncation"
-            if args.reward_mode == "terminal_success" else "source_episode_end"
+            if args.reward_mode in CANONICAL_TERMINAL_REWARD_MODES
+            else "source_episode_end"
         )
         output.attrs["source_label_definition"] = (
             "source_is_expert=1 for human demo; 0 for deployment rollout"
@@ -1271,7 +1302,8 @@ def build(args: argparse.Namespace) -> dict:
         "preserved_source_task_reward_key": "task_rewards",
         "terminal_policy": (
             "first_positive_truncation"
-            if args.reward_mode == "terminal_success" else "source_episode_end"
+            if args.reward_mode in CANONICAL_TERMINAL_REWARD_MODES
+            else "source_episode_end"
         ),
         "reward_statistics": reward_statistics,
         "source_label_definition": (
@@ -1307,7 +1339,7 @@ def build(args: argparse.Namespace) -> dict:
         "source_identities": source_identities,
         "storage": (
             "HDF5 virtual retained-prefix and shifted-next_obs datasets"
-            if args.reward_mode == "terminal_success"
+            if args.reward_mode in CANONICAL_TERMINAL_REWARD_MODES
             else "HDF5 external links plus virtual next_obs datasets"
         ),
     }
@@ -1340,8 +1372,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "task keeps source environment rewards (default); "
             "terminal_success truncates each success at its first positive "
-            "task reward and emits one terminal reward; rise assigns human "
-            "transition=1 and rollout transition=0"
+            "task reward and emits one +1 terminal reward; rise uses the same "
+            "unique success terminal and emits -1 at failed episode ends, with "
+            "zero reward on all nonterminal transitions"
         ),
     )
     parser.add_argument(

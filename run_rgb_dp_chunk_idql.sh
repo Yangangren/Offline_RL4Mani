@@ -1107,19 +1107,19 @@ ensure_dataset() {
       run_real_robot_mixed_builder 1
     else
       "$PYTHON" -B scripts/build_rgb_dp_idql_dataset.py \
-        --task "$TASK" \
-        --expert-dataset "$EXPERT_DATASET" \
-        --rollout-dataset "$ROLLOUT_DATASET" \
-        --output "$IDQL_DATASET" \
-        --expert-mask "$EXPERT_MASK" \
-        --expert-count "$EXPERT_COUNT" \
-        --success-mask "$SUCCESS_MASK" \
-        --success-count "$SUCCESS_COUNT" \
-        --failure-mask "$FAILURE_MASK" \
-        --failure-count "$FAILURE_COUNT" \
-        --reward-mode "$IDQL_REWARD_MODE" \
-        --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
-        --seed "${DATASET_SEED:-0}" \
+          --task "$TASK" \
+          --expert-dataset "$EXPERT_DATASET" \
+          --rollout-dataset "$ROLLOUT_DATASET" \
+          --output "$IDQL_DATASET" \
+          --expert-mask "$EXPERT_MASK" \
+          --expert-count "$EXPERT_COUNT" \
+          --success-mask "$SUCCESS_MASK" \
+          --success-count "$SUCCESS_COUNT" \
+          --failure-mask "$FAILURE_MASK" \
+          --failure-count "$FAILURE_COUNT" \
+          --reward-mode "$IDQL_REWARD_MODE" \
+          --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+          --seed "${DATASET_SEED:-0}" \
         --validate-only
     fi
   fi

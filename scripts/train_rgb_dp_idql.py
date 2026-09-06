@@ -61,6 +61,10 @@ from rgb_dp_distributed import (
     restore_process_rng_state,
     seed_process,
 )
+from rgb_dp_idql_rewards import (
+    LEGACY_RISE_REWARD_DEFINITION,
+    REWARD_DEFINITIONS,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,19 +80,6 @@ DEFAULT_OUTPUT = (
     ROOT
     / "trained_models/square_rgb_dp_idql_rise/200demo_100success_94failure_task_reward"
 )
-REWARD_DEFINITIONS = {
-    "task": "source_task_reward",
-    "terminal_success": (
-        "successful_episode: truncate_at_first_source_task_reward>0.5, "
-        "reward=1_and_done=1_there; failed_episode: reward=0, "
-        "done=1_at_source_end"
-    ),
-    "rise": (
-        "successful_episode: truncate_at_first_source_task_reward>0.5, "
-        "reward=1_and_done=1_there; failed_episode: reward=-1_and_done=1_"
-        "at_source_end; all_nonterminal_rewards=0"
-    ),
-}
 TEMPORAL_CRITIC_ARCHITECTURE = "rise_temporal_v2"
 TEMPORAL_ONE_STEP_MARKER = "temporal_one_step_idql"
 
@@ -1819,6 +1810,15 @@ def dataset_audit(
             raise ValueError(
                 "dataset has an unsupported or missing reward mode: "
                 f"reward_mode={reward_mode!r}, definition={reward_definition!r}"
+            )
+        if (
+            reward_mode == "rise"
+            and reward_definition == LEGACY_RISE_REWARD_DEFINITION
+        ):
+            raise ValueError(
+                f"{dataset_path} contains legacy rise rewards "
+                f"({LEGACY_RISE_REWARD_DEFINITION}); the signed-terminal "
+                "trainer must not consume expert=1/non_expert=0 rewards"
             )
         expected_definition = REWARD_DEFINITIONS[reward_mode]
         if reward_definition != expected_definition:
