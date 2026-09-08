@@ -202,6 +202,8 @@ export OPENBLAS_NUM_THREADS=1
 export PYTHONFAULTHANDLER=1
 
 PYTHON=${ROBOMIMIC_PYTHON:-/home/ryan/miniconda3/envs/robomimic_stable/bin/python}
+IDQL_TRAIN_SCRIPT=${IDQL_TRAIN_SCRIPT:-scripts/train_rgb_dp_idql.py}
+IDQL_EVAL_SCRIPT=${IDQL_EVAL_SCRIPT:-scripts/eval_rgb_dp_idql.py}
 export ROBOMIMIC_PYTHON="$PYTHON"
 IDQL_NUM_GPUS=${IDQL_NUM_GPUS:-1}
 if (( IDQL_NUM_GPUS > 1 )) && [[ "${DEVICE:-cuda}" != "cuda" ]]; then
@@ -242,6 +244,12 @@ case "$IDQL_REWARD_MODE" in
     DEFAULT_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_terminal_success_reward
     DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_pretrained_dp_actor_terminal_success_reward
     ;;
+  rise_source_binary)
+    DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_rise_source_binary_reward.hdf5
+    DEFAULT_IDQL_OUTPUT_DIR=${TASK_IDQL_OUTPUT_DIR}_rise_source_binary_reward
+    DEFAULT_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_rise_source_binary_reward
+    DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_pretrained_dp_actor_rise_source_binary_reward
+    ;;
   rise)
     DEFAULT_IDQL_DISCOUNT=1.0
     DEFAULT_IDQL_DATASET=${TASK_IDQL_DATASET%.hdf5}_signed_terminal_reward.hdf5
@@ -250,7 +258,7 @@ case "$IDQL_REWARD_MODE" in
     DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${TASK_EVAL_OUTPUT}_pretrained_dp_actor_signed_terminal_reward
     ;;
   *)
-    echo "Unsupported IDQL_REWARD_MODE=$IDQL_REWARD_MODE. Use task, terminal_success, or rise." >&2
+    echo "Unsupported IDQL_REWARD_MODE=$IDQL_REWARD_MODE. Use task, rise_source_binary, terminal_success, or rise." >&2
     exit 2
     ;;
 esac
@@ -556,6 +564,10 @@ run_train() {
   local distributed_args=()
   local heldout_args=()
   local train_launcher=("$PYTHON" -B)
+  local -a train_extra_args=()
+  if [[ -n "${IDQL_TRAIN_EXTRA_ARGS:-}" ]]; then
+    read -r -a train_extra_args <<< "$IDQL_TRAIN_EXTRA_ARGS"
+  fi
   if [[ -n "$resume_path" ]]; then
     resume_args=(--resume-checkpoint "$resume_path")
   fi
@@ -581,9 +593,10 @@ run_train() {
       --gradient-bucket-cap-mb "${IDQL_GRADIENT_BUCKET_CAP_MB:-100}"
     )
     export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
-    echo "[rgb_dp_idql] distributed training: GPUs=$IDQL_NUM_GPUS per-rank-batch=${BATCH_SIZE:-64}" >&2
+    echo "[rgb_dp_idql] distributed training: GPUs=$IDQL_NUM_GPUS per-rank-batch=${BATCH_SIZE:-100}" >&2
   fi
-  "${train_launcher[@]}" scripts/train_rgb_dp_idql.py \
+  "${train_launcher[@]}" "$IDQL_TRAIN_SCRIPT" \
+    "${train_extra_args[@]}" \
     --task "$TASK" \
     "${distributed_args[@]}" \
     --dataset "$IDQL_DATASET" \
@@ -686,7 +699,7 @@ case "$STAGE" in
 
   eval)
     require_simulation_stage_task "$STAGE"
-    "$PYTHON" -B scripts/eval_rgb_dp_idql.py \
+    "$PYTHON" -B "$IDQL_EVAL_SCRIPT" \
       --idql-checkpoint "$IDQL_CHECKPOINT" \
       --dp-checkpoint "$DP_CHECKPOINT" \
       --expected-task "$TASK" \
@@ -709,6 +722,7 @@ case "$STAGE" in
     read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-1 4 8 16 32 64}"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
     "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
+      --eval-script "$IDQL_EVAL_SCRIPT" \
       --idql-checkpoint "$IDQL_CHECKPOINT" \
       --dp-checkpoint "$DP_CHECKPOINT" \
       --expected-task "$TASK" \
@@ -735,6 +749,7 @@ case "$STAGE" in
     read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-4 8 12 16}"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
     "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
+      --eval-script "$IDQL_EVAL_SCRIPT" \
       --idql-checkpoint "$IDQL_CHECKPOINT" \
       --dp-checkpoint "$COMPOSED_DP_CHECKPOINT" \
       --expected-task "$TASK" \

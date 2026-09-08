@@ -1141,10 +1141,38 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
         )
         valid_length = int(action_mask.sum())
         if one_step_aligned:
-            next_index = min(index_in_demo + 1, demo_length - 1)
+            # ``one_step_obs[t]`` is the observation before action ``t``.
+            # A chunk transition therefore bootstraps from ``t + L`` after
+            # its L executable actions, rather than from the one-step
+            # successor used when ``chunk_horizon == 1``.
+            next_index = min(
+                index_in_demo + valid_length,
+                demo_length - 1,
+            )
             meta["next_obs"] = self._get_one_step_observations(
                 demo_id, next_index
             )
+            if self.dynamics_prediction_offsets:
+                dynamics_values = {key: [] for key in base.obs_keys}
+                target_available = []
+                for offset in self.dynamics_prediction_offsets:
+                    requested_index = index_in_demo + int(offset)
+                    target_index = min(requested_index, demo_length - 1)
+                    target_obs = self._get_one_step_observations(
+                        demo_id, target_index
+                    )
+                    for key in base.obs_keys:
+                        dynamics_values[key].append(target_obs[key][-1])
+                    target_available.append(
+                        float(requested_index < demo_length)
+                    )
+                meta["chunk_dynamics_next_obs"] = {
+                    key: np.stack(values, axis=0)
+                    for key, values in dynamics_values.items()
+                }
+                meta["chunk_dynamics_target_available"] = np.asarray(
+                    target_available, dtype=np.float32
+                )
         elif request_aligned:
             bootstrap_valid = bool(
                 self._demo_request_bootstrap_valid[demo_id][request_index]

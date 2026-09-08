@@ -70,8 +70,8 @@ case "$TASK" in
     DEFAULT_FAILURE_FILTER_SIZE=33
     DEFAULT_FAILURE_FILTER_KEY=failure
     DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/self_imitation/200demo_all_success
-    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/mixed_imitation/200demo_100success_33failure
-    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/mixed_imitation/200demo_100success_33failure_conditioned
+    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/mixed_imitation/200demo_467success_33failure
+    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/can_rgb_dp/mixed_imitation/200demo_467success_33failure_conditioned
     DEFAULT_EVAL_OUTPUT=rollouts/can_rgb_dp/imitation_eval
     DEFAULT_HORIZON=400
     ;;

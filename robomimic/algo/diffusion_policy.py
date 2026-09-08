@@ -60,6 +60,37 @@ def binary_condition_loss_stats(
     return stats
 
 
+class RiseSpectralConditionAdapter(nn.Module):
+    """RISE feature MLP whose final matrix supplies the spectral penalty."""
+
+    def __init__(self, feature_dim, hidden_dims=(512, 512)):
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.hidden_dims = tuple(int(value) for value in hidden_dims)
+        if self.feature_dim < 1 or not self.hidden_dims:
+            raise ValueError("RISE spectral adapter dimensions must be positive")
+        if any(value < 1 for value in self.hidden_dims):
+            raise ValueError("RISE spectral hidden dimensions must be positive")
+        layers = []
+        input_dim = self.feature_dim
+        for hidden_dim in self.hidden_dims:
+            layers.extend((nn.Linear(input_dim, hidden_dim), nn.ReLU()))
+            input_dim = hidden_dim
+        layers.append(nn.Linear(input_dim, self.feature_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, features):
+        if int(features.shape[-1]) != self.feature_dim:
+            raise ValueError(
+                f"RISE spectral adapter expected feature_dim={self.feature_dim}, "
+                f"got {features.shape[-1]}"
+            )
+        return self.net(features)
+
+    def spectral_norm(self):
+        return torch.linalg.matrix_norm(self.net[-1].weight, ord=2)
+
+
 class SuccessConditionResidual(nn.Module):
     """Zero-initialized residual adapter for success-conditioned DP."""
 
@@ -234,6 +265,10 @@ class DiffusionPolicyUNet(PolicyAlgo):
         self.recap_conditional_loss_weight = 0.7
         self.recap_conditional_action_start = None
         self.recap_conditional_action_horizon = None
+        # The released RISE actor adds this penalty to diffusion BC. The
+        # adapter itself is installed explicitly by the post-training entry
+        # point, so ordinary Diffusion Policy checkpoints remain unchanged.
+        self.rise_spectral_penalty_weight = 0.0
 
         if self.reference_margin_enabled and self.hazard_constraint_enabled:
             raise ValueError(
@@ -325,6 +360,9 @@ class DiffusionPolicyUNet(PolicyAlgo):
             inputs_as_kwargs=True,
         )
         assert features.ndim == 3
+        policy = nets["policy"]
+        if "rise_spectral_adapter" in policy:
+            features = policy["rise_spectral_adapter"](features)
         return features.flatten(start_dim=1)
 
     def _encode_current_and_reference(self, inputs):
@@ -380,9 +418,87 @@ class DiffusionPolicyUNet(PolicyAlgo):
         lr = optimizer.param_groups[0].get("lr", 1e-4) if optimizer.param_groups else 1e-4
         optimizer.add_param_group({"params": missing, "lr": lr})
 
+    def install_rise_spectral_adapter(self, hidden_dims=(512, 512)) -> None:
+        """Install the released RISE post-encoder MLP in online and EMA actors."""
+        policy = self.nets["policy"]
+        if "condition_adapter" in policy:
+            raise RuntimeError(
+                "RISE spectral and chunk-IDQL success-condition adapters are "
+                "mutually exclusive"
+            )
+        if (
+            self.ema is not None
+            and "condition_adapter" in self.ema.averaged_model["policy"]
+        ):
+            raise RuntimeError(
+                "RISE spectral and chunk-IDQL success-condition adapters are "
+                "mutually exclusive"
+            )
+        feature_dim = int(policy["obs_encoder"].output_shape()[0])
+        hidden_dims = tuple(int(value) for value in hidden_dims)
+        if "rise_spectral_adapter" in policy:
+            adapter = policy["rise_spectral_adapter"]
+            if not isinstance(adapter, RiseSpectralConditionAdapter):
+                raise RuntimeError("actor has an incompatible RISE spectral adapter")
+            if adapter.feature_dim != feature_dim:
+                raise ValueError(
+                    f"RISE adapter feature_dim={adapter.feature_dim}, expected {feature_dim}"
+                )
+            if adapter.hidden_dims != hidden_dims:
+                raise ValueError(
+                    f"RISE adapter hidden_dims={adapter.hidden_dims}, expected {hidden_dims}"
+                )
+        else:
+            policy["rise_spectral_adapter"] = RiseSpectralConditionAdapter(
+                feature_dim,
+                hidden_dims,
+            ).to(self.device)
+
+        if self.ema is not None:
+            ema_policy = self.ema.averaged_model["policy"]
+            if "rise_spectral_adapter" not in ema_policy:
+                ema_policy["rise_spectral_adapter"] = deepcopy(
+                    policy["rise_spectral_adapter"]
+                ).to(self.device)
+        self._refresh_ema_parameter_views()
+        self._ensure_policy_optimizer_has_trainable_params()
+
+    def _install_rise_spectral_adapter_from_state(self, state_dict) -> None:
+        prefix = "policy.rise_spectral_adapter.net."
+        weights = []
+        for key, value in state_dict.items():
+            if not key.startswith(prefix) or not key.endswith(".weight"):
+                continue
+            layer_index = key[len(prefix) : -len(".weight")]
+            if layer_index.isdigit():
+                weights.append((int(layer_index), value))
+        if not weights:
+            return
+        weights.sort(key=lambda item: item[0])
+        feature_dim = int(self.nets["policy"]["obs_encoder"].output_shape()[0])
+        if int(weights[0][1].shape[1]) != feature_dim:
+            raise ValueError("checkpoint RISE adapter input dimension is incompatible")
+        if int(weights[-1][1].shape[0]) != feature_dim:
+            raise ValueError("checkpoint RISE adapter output dimension is incompatible")
+        hidden_dims = tuple(int(weight.shape[0]) for _, weight in weights[:-1])
+        self.install_rise_spectral_adapter(hidden_dims=hidden_dims)
+
     def install_success_condition_adapter(self, hidden_dim: int = 256) -> None:
         """Install per-block condition FiLM without changing the DP function."""
         policy = self.nets["policy"]
+        if "rise_spectral_adapter" in policy:
+            raise RuntimeError(
+                "chunk-IDQL success-condition and RISE spectral adapters are "
+                "mutually exclusive"
+            )
+        if (
+            self.ema is not None
+            and "rise_spectral_adapter" in self.ema.averaged_model["policy"]
+        ):
+            raise RuntimeError(
+                "chunk-IDQL success-condition and RISE spectral adapters are "
+                "mutually exclusive"
+            )
         global_cond_dim = self._global_condition_dim()
         if "condition_adapter" in policy:
             adapter = policy["condition_adapter"]
@@ -418,6 +534,19 @@ class DiffusionPolicyUNet(PolicyAlgo):
     def _install_legacy_success_condition_adapter(self, hidden_dim: int) -> None:
         """Install the former observation-residual adapter for old checkpoints."""
         policy = self.nets["policy"]
+        if "rise_spectral_adapter" in policy:
+            raise RuntimeError(
+                "legacy chunk-IDQL condition and RISE spectral adapters are "
+                "mutually exclusive"
+            )
+        if (
+            self.ema is not None
+            and "rise_spectral_adapter" in self.ema.averaged_model["policy"]
+        ):
+            raise RuntimeError(
+                "legacy chunk-IDQL condition and RISE spectral adapters are "
+                "mutually exclusive"
+            )
         global_cond_dim = self._global_condition_dim()
         if "condition_adapter" not in policy:
             policy["condition_adapter"] = SuccessConditionResidual(
@@ -1243,11 +1372,38 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 if reference_distillation_loss is not None:
                     loss = loss + weighted_reference_distillation_loss
 
+            spectral_norm = None
+            weighted_spectral_penalty = None
+            spectral_weight = float(
+                getattr(self, "rise_spectral_penalty_weight", 0.0) or 0.0
+            )
+            if spectral_weight > 0.0:
+                policy = self.nets["policy"]
+                if "rise_spectral_adapter" not in policy:
+                    raise RuntimeError(
+                        "RISE spectral penalty is enabled without its feature adapter"
+                    )
+                spectral_norm = policy["rise_spectral_adapter"].spectral_norm()
+                weighted_spectral_penalty = spectral_weight * spectral_norm
+                loss = loss + weighted_spectral_penalty
+
             # logging
             losses = {
                 "l2_loss": loss,
                 "total_loss": loss,
             }
+            if spectral_norm is not None:
+                losses.update(
+                    {
+                        "rise_diffusion_bc_loss": per_sample_energy.mean(),
+                        "spectral_norm": spectral_norm,
+                        "weighted_spectral_penalty": weighted_spectral_penalty,
+                        "spectral_penalty_weight": torch.as_tensor(
+                            spectral_weight,
+                            device=self.device,
+                        ),
+                    }
+                )
             if recap_paired_losses is not None:
                 losses.update(recap_paired_losses)
             if reference_distillation_loss is not None:
@@ -1374,6 +1530,14 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 "recap_conditional_action_horizon",
                 "RECAP/ConditionalActionHorizon",
             ),
+        ):
+            if key in info["losses"]:
+                log[name] = scalar(info["losses"][key])
+        for key, name in (
+            ("rise_diffusion_bc_loss", "RISE/DiffusionBCLoss"),
+            ("spectral_norm", "RISE/SpectralNorm"),
+            ("weighted_spectral_penalty", "RISE/WeightedSpectralPenalty"),
+            ("spectral_penalty_weight", "RISE/SpectralPenaltyWeight"),
         ):
             if key in info["losses"]:
                 log[name] = scalar(info["losses"][key])
@@ -1573,6 +1737,7 @@ class DiffusionPolicyUNet(PolicyAlgo):
             load_optimizers (bool): whether to load optimizers and lr_schedulers from the model_dict;
                 used when resuming training from a checkpoint
         """
+        self._install_rise_spectral_adapter_from_state(model_dict["nets"])
         self._install_success_condition_adapter_from_state(model_dict["nets"])
         self.nets.load_state_dict(model_dict["nets"])
 

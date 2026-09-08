@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Extract and plot Transport chunk-critic advantage distributions.
+"""Extract and plot chunk-critic advantage distributions.
 
-The default analysis evaluates every full horizon-8 deployment-rollout chunk
-from the success and failure masks of the dataset used by the selected critic.
+The defaults target the Transport experiment. Command-line overrides can apply
+the same analysis to another task while preserving strict checkpoint checks.
+The analysis evaluates every full horizon-8 deployment-rollout chunk from the
+success and failure masks of the selected dataset.
 Extraction is cached in resumable NPZ shards, so plot-only revisions do not
 repeat RGB critic inference.
 """
@@ -59,9 +61,13 @@ DEFAULT_DP_CHECKPOINT = (
 DEFAULT_DATASET = (
     ROOT
     / "datasets/transport/idql"
-    / "transport_rgb_dp_idql_200demo_422success_78failure_terminal_success.hdf5"
+    / "transport_rgb_dp_idql_200demo_100success_50failure.hdf5"
 )
-DEFAULT_OUTPUT_DIR = ROOT / "analysis/transport_chunk_advantage/epoch50"
+DEFAULT_OUTPUT_DIR = (
+    ROOT
+    / "analysis/transport_chunk_advantage"
+    / "epoch50_epoch200_100success_50failure"
+)
 DEFAULT_FIGURE_DIR = ROOT / "figures"
 
 CLASS_SPECS = (
@@ -231,9 +237,10 @@ def load_critic_system(
         map_location="cpu",
         weights_only=False,
     )
-    if checkpoint.get("task") != "transport":
+    if checkpoint.get("task") != args.task:
         raise ValueError(
-            f"checkpoint task must be 'transport', got {checkpoint.get('task')!r}"
+            f"checkpoint task must be {args.task!r}, "
+            f"got {checkpoint.get('task')!r}"
         )
     if checkpoint_critic_architecture(checkpoint) != RISE_V2_CRITIC_ARCHITECTURE:
         raise ValueError("this analysis requires a RISE-v2 chunk critic")
@@ -307,6 +314,12 @@ def load_critic_system(
         "action_dim": int(checkpoint["action_dim"]),
         "critic_action_space": checkpoint["critic_action_space"],
         "reward_mode": checkpoint["reward_mode"],
+        "checkpoint_training_dataset": str(checkpoint.get("dataset", "")),
+        "analysis_dataset": str(args.dataset.resolve()),
+        "analysis_dataset_basename_matches_checkpoint": (
+            Path(str(checkpoint.get("dataset", ""))).name
+            == args.dataset.name
+        ),
         "normalization_audit": normalization_audit,
         "value_normalization_audit": value_normalization_audit,
         "action_normalization_stats": action_stats,
@@ -724,6 +737,7 @@ def episode_bootstrap(
     *,
     samples: int,
     seed: int,
+    metric_name: str = "advantage",
 ) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
     differences = np.empty(samples, dtype=np.float64)
@@ -740,13 +754,45 @@ def episode_bootstrap(
         )
         differences[index] = float(success.mean() - failure.mean())
     return {
-        "estimand": "difference in mean per-episode median advantage",
+        "estimand": f"difference in mean per-episode median {metric_name}",
         "point_estimate": float(
             success_episode_medians.mean() - failure_episode_medians.mean()
         ),
         "samples": int(samples),
         "seed": int(seed),
         "ci95": np.quantile(differences, [0.025, 0.975]).tolist(),
+    }
+
+
+def compare_rollout_classes(
+    success: np.ndarray,
+    failure: np.ndarray,
+    success_episode: np.ndarray,
+    failure_episode: np.ndarray,
+    *,
+    metric_name: str,
+    bootstrap_samples: int,
+    bootstrap_seed: int,
+) -> dict[str, Any]:
+    success_episode_medians = episode_medians(success_episode, success)
+    failure_episode_medians = episode_medians(failure_episode, failure)
+    auc = probability_greater(success, failure)
+    return {
+        "mean_difference_success_minus_failure": float(
+            success.mean() - failure.mean()
+        ),
+        "median_difference_success_minus_failure": float(
+            np.median(success) - np.median(failure)
+        ),
+        "probability_success_greater_than_failure": auc,
+        "cliffs_delta": float(2.0 * auc - 1.0),
+        "episode_bootstrap": episode_bootstrap(
+            success_episode_medians,
+            failure_episode_medians,
+            samples=int(bootstrap_samples),
+            seed=int(bootstrap_seed),
+            metric_name=metric_name,
+        ),
     }
 
 
@@ -764,48 +810,45 @@ def summarize_results(
     if not success.size or not failure.size:
         raise RuntimeError("both success and failure chunks are required")
 
-    success_ep = episode_medians(arrays["episode"][success_mask], success)
-    failure_ep = episode_medians(arrays["episode"][failure_mask], failure)
-    auc = probability_greater(success, failure)
+    success_episode = arrays["episode"][success_mask]
+    failure_episode = arrays["episode"][failure_mask]
+    success_q_min = arrays["q_min"][success_mask].astype(np.float64)
+    failure_q_min = arrays["q_min"][failure_mask].astype(np.float64)
+    success_value = arrays["value"][success_mask].astype(np.float64)
+    failure_value = arrays["value"][failure_mask].astype(np.float64)
     summary = {
         "formula": "min(Q1(z,a), Q2(z,a)) - V(z)",
         "metadata": metadata,
         "success": {
             "episodes": int(len(np.unique(arrays["episode"][success_mask]))),
             "advantage": distribution_summary(success),
-            "q_min": distribution_summary(
-                arrays["q_min"][success_mask].astype(np.float64)
-            ),
-            "value": distribution_summary(
-                arrays["value"][success_mask].astype(np.float64)
-            ),
+            "q_min": distribution_summary(success_q_min),
+            "value": distribution_summary(success_value),
         },
         "failure": {
             "episodes": int(len(np.unique(arrays["episode"][failure_mask]))),
             "advantage": distribution_summary(failure),
-            "q_min": distribution_summary(
-                arrays["q_min"][failure_mask].astype(np.float64)
-            ),
-            "value": distribution_summary(
-                arrays["value"][failure_mask].astype(np.float64)
-            ),
+            "q_min": distribution_summary(failure_q_min),
+            "value": distribution_summary(failure_value),
         },
-        "comparison": {
-            "mean_difference_success_minus_failure": float(
-                success.mean() - failure.mean()
-            ),
-            "median_difference_success_minus_failure": float(
-                np.median(success) - np.median(failure)
-            ),
-            "probability_success_greater_than_failure": auc,
-            "cliffs_delta": float(2.0 * auc - 1.0),
-            "episode_bootstrap": episode_bootstrap(
-                success_ep,
-                failure_ep,
-                samples=int(bootstrap_samples),
-                seed=int(bootstrap_seed),
-            ),
-        },
+        "comparison": compare_rollout_classes(
+            success,
+            failure,
+            success_episode,
+            failure_episode,
+            metric_name="advantage",
+            bootstrap_samples=bootstrap_samples,
+            bootstrap_seed=bootstrap_seed,
+        ),
+        "q_min_comparison": compare_rollout_classes(
+            success_q_min,
+            failure_q_min,
+            success_episode,
+            failure_episode,
+            metric_name="conservative Q score",
+            bootstrap_samples=bootstrap_samples,
+            bootstrap_seed=bootstrap_seed,
+        ),
     }
     return summary
 
@@ -828,11 +871,11 @@ def configure_plot_style() -> None:
         {
             "font.family": "sans-serif",
             "font.sans-serif": ["Arial", "Liberation Sans", "DejaVu Sans"],
-            "font.size": 10.5,
-            "axes.labelsize": 12,
-            "xtick.labelsize": 10.5,
-            "ytick.labelsize": 10.5,
-            "legend.fontsize": 9.5,
+            "font.size": 12,
+            "axes.labelsize": 14,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+            "legend.fontsize": 10.5,
             "axes.linewidth": 1.0,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
@@ -893,6 +936,11 @@ def plot_violin(
     stem: str,
     *,
     tail_quantile: float,
+    ylabel: str = r"Critic advantage  $\min(Q_1,Q_2)-V$",
+    reference_value: float | None = 0.0,
+    quantile_lines: tuple[tuple[float, str], ...] | None = None,
+    show_sample_counts: bool = True,
+    show_quantile_legend: bool = True,
 ) -> tuple[list[Path], tuple[float, float]]:
     configure_plot_style()
     fig, ax = plt.subplots(figsize=(4.8, 3.65), constrained_layout=True)
@@ -932,15 +980,52 @@ def plot_violin(
         whiskerprops={"color": "#202020", "linewidth": 0.9},
         capprops={"color": "#202020", "linewidth": 0.9},
     )
-    ax.axhline(0.0, color="#555555", linestyle="--", linewidth=0.9, zorder=0)
-    ax.set_ylabel(r"Critic advantage  $\min(Q_1,Q_2)-V$")
-    ax.set_xticks(
-        positions,
-        (
+    if reference_value is not None:
+        ax.axhline(
+            reference_value,
+            color="#555555",
+            linestyle="--",
+            linewidth=0.9,
+            zorder=0,
+        )
+    if quantile_lines:
+        line_colors = ("#009E73", "#CC79A7")
+        for (value, label), color in zip(quantile_lines, line_colors):
+            ax.axhline(
+                value,
+                color=color,
+                linestyle="--",
+                linewidth=1.2,
+                zorder=3,
+                label=label,
+            )
+            ax.text(
+                0.985,
+                value,
+                f"{value:.3f}",
+                transform=ax.get_yaxis_transform(),
+                ha="right",
+                va="bottom",
+                fontsize=13,
+                color=color,
+                zorder=5,
+            )
+        if show_quantile_legend:
+            ax.legend(
+                frameon=False,
+                loc="upper right",
+                fontsize=10.5,
+                handlelength=2.6,
+            )
+    ax.set_ylabel(ylabel)
+    if show_sample_counts:
+        tick_labels = (
             f"Success\n($n$={len(success):,})",
             f"Failure\n($n$={len(failure):,})",
-        ),
-    )
+        )
+    else:
+        tick_labels = ("Success", "Failure")
+    ax.set_xticks(positions, tick_labels)
     ax.set_xlim(0.45, 2.55)
     if range_note is not None:
         span = display_range[1] - display_range[0]
@@ -951,8 +1036,8 @@ def plot_violin(
 
     figure_dir.mkdir(parents=True, exist_ok=True)
     paths = [figure_dir / f"{stem}.pdf", figure_dir / f"{stem}.png"]
-    fig.savefig(paths[0], bbox_inches="tight")
-    fig.savefig(paths[1], dpi=600, bbox_inches="tight")
+    fig.savefig(paths[0], bbox_inches="tight", pad_inches=0.01)
+    fig.savefig(paths[1], dpi=600, bbox_inches="tight", pad_inches=0.01)
     plt.close(fig)
     return paths, display_range
 
@@ -976,6 +1061,8 @@ def plot_histogram(
     stem: str,
     *,
     tail_quantile: float,
+    xlabel: str = r"Critic advantage  $\min(Q_1,Q_2)-V$",
+    reference_value: float | None = 0.0,
 ) -> tuple[list[Path], tuple[float, float]]:
     configure_plot_style()
     fig, ax = plt.subplots(figsize=(5.4, 3.65), constrained_layout=True)
@@ -1012,8 +1099,14 @@ def plot_histogram(
             linewidth=1.4,
             label=label,
         )
-    ax.axvline(0.0, color="#555555", linestyle="--", linewidth=0.9)
-    ax.set_xlabel(r"Critic advantage  $\min(Q_1,Q_2)-V$")
+    if reference_value is not None:
+        ax.axvline(
+            reference_value,
+            color="#555555",
+            linestyle="--",
+            linewidth=0.9,
+        )
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Density")
     ax.legend(frameon=False)
     ax.set_xlim(display_range)
@@ -1022,22 +1115,28 @@ def plot_histogram(
 
     figure_dir.mkdir(parents=True, exist_ok=True)
     paths = [figure_dir / f"{stem}.pdf", figure_dir / f"{stem}.png"]
-    fig.savefig(paths[0], bbox_inches="tight")
-    fig.savefig(paths[1], dpi=600, bbox_inches="tight")
+    fig.savefig(paths[0], bbox_inches="tight", pad_inches=0.01)
+    fig.savefig(paths[1], dpi=600, bbox_inches="tight", pad_inches=0.01)
     plt.close(fig)
     return paths, display_range
 
 
 def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
     arrays = load_cached_arrays(args.output_dir)
-    success = arrays["advantage"][arrays["label"] == 1].astype(np.float64)
-    failure = arrays["advantage"][arrays["label"] == 0].astype(np.float64)
+    success_mask = arrays["label"] == 1
+    failure_mask = arrays["label"] == 0
+    success = arrays["advantage"][success_mask].astype(np.float64)
+    failure = arrays["advantage"][failure_mask].astype(np.float64)
+    success_q_min = arrays["q_min"][success_mask].astype(np.float64)
+    failure_q_min = arrays["q_min"][failure_mask].astype(np.float64)
+    success_value = arrays["value"][success_mask].astype(np.float64)
+    failure_value = arrays["value"][failure_mask].astype(np.float64)
     paths = []
     violin_paths, central_range = plot_violin(
         success,
         failure,
         args.figure_dir,
-        "transport_chunk_advantage_violin",
+        f"{args.task}_chunk_advantage_violin",
         tail_quantile=float(args.plot_tail_quantile),
     )
     paths.extend(violin_paths)
@@ -1045,7 +1144,7 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
         success,
         failure,
         args.figure_dir,
-        "transport_chunk_advantage_histogram",
+        f"{args.task}_chunk_advantage_histogram",
         tail_quantile=float(args.plot_tail_quantile),
     )
     paths.extend(histogram_paths)
@@ -1055,7 +1154,7 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
             success,
             failure,
             args.figure_dir,
-            "transport_chunk_advantage_violin_full_range",
+            f"{args.task}_chunk_advantage_violin_full_range",
             tail_quantile=0.0,
         )
         paths.extend(full_violin_paths)
@@ -1063,12 +1162,66 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
             success,
             failure,
             args.figure_dir,
-            "transport_chunk_advantage_histogram_full_range",
+            f"{args.task}_chunk_advantage_histogram_full_range",
             tail_quantile=0.0,
         )
         paths.extend(full_histogram_paths)
     else:
         full_range = central_range
+
+    pooled_q_min_quantiles = np.quantile(
+        np.concatenate((success_q_min, failure_q_min)),
+        [0.4, 0.6],
+    )
+    q_quantile_lines = (
+        (float(pooled_q_min_quantiles[0]), "40th percentile"),
+        (float(pooled_q_min_quantiles[1]), "60th percentile"),
+    )
+    q_violin_paths, q_min_range = plot_violin(
+        success_q_min,
+        failure_q_min,
+        args.figure_dir,
+        f"{args.task}_chunk_qmin_violin",
+        tail_quantile=0.0,
+        ylabel="Q-function",
+        reference_value=None,
+        quantile_lines=q_quantile_lines,
+        show_sample_counts=False,
+        show_quantile_legend=args.task.lower() == "transport",
+    )
+    paths.extend(q_violin_paths)
+    q_histogram_paths, _ = plot_histogram(
+        success_q_min,
+        failure_q_min,
+        args.figure_dir,
+        f"{args.task}_chunk_qmin_histogram",
+        tail_quantile=0.0,
+        xlabel=r"Conservative critic score  $\min(Q_1,Q_2)$",
+        reference_value=None,
+    )
+    paths.extend(q_histogram_paths)
+
+    pooled_value_quantiles = np.quantile(
+        np.concatenate((success_value, failure_value)),
+        [0.4, 0.6],
+    )
+    value_quantile_lines = (
+        (float(pooled_value_quantiles[0]), "40th percentile"),
+        (float(pooled_value_quantiles[1]), "60th percentile"),
+    )
+    value_violin_paths, value_range = plot_violin(
+        success_value,
+        failure_value,
+        args.figure_dir,
+        f"{args.task}_chunk_value_violin",
+        tail_quantile=0.0,
+        ylabel="Value function",
+        reference_value=None,
+        quantile_lines=value_quantile_lines,
+        show_sample_counts=False,
+        show_quantile_legend=args.task.lower() == "transport",
+    )
+    paths.extend(value_violin_paths)
 
     metadata = None
     summary_path = args.output_dir / "summary.json"
@@ -1085,6 +1238,16 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
         "central_violin_range": list(central_range),
         "central_histogram_range": list(histogram_range),
         "full_data_range": list(full_range),
+        "q_min_full_data_range": list(q_min_range),
+        "q_min_pooled_quantiles": {
+            "q40": float(pooled_q_min_quantiles[0]),
+            "q60": float(pooled_q_min_quantiles[1]),
+        },
+        "value_full_data_range": list(value_range),
+        "value_pooled_quantiles": {
+            "q40": float(pooled_value_quantiles[0]),
+            "q60": float(pooled_value_quantiles[1]),
+        },
     }
     atomic_write_json(summary_path, summary)
     return summary, paths
@@ -1182,6 +1345,7 @@ def extract_results(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("extract", "plot", "all"), default="all")
+    parser.add_argument("--task", default="transport")
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--dp-checkpoint", type=Path, default=DEFAULT_DP_CHECKPOINT)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)

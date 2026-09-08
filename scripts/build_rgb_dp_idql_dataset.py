@@ -2,8 +2,10 @@
 """Build one RGB IDQL dataset from expert and deployment trajectories.
 
 The default ``task`` reward mode keeps each source trajectory's environment
-reward. ``terminal_success`` and ``rise`` canonicalize sparse task rewards
-across sources: successful episodes end at their first positive task reward and
+reward. ``rise_source_binary`` implements the released RISE reward design:
+every expert transition receives one and every rollout transition receives
+zero. ``terminal_success`` and ``rise`` canonicalize sparse task rewards across
+sources: successful episodes end at their first positive task reward and
 receive exactly one positive terminal reward. ``terminal_success`` leaves failed
 episodes at zero reward, while ``rise`` assigns exactly one negative reward at
 the end of each failed episode. Source identity and the actor's condition are
@@ -27,7 +29,7 @@ import numpy as np
 
 from rgb_dp_idql_rewards import (
     CANONICAL_TERMINAL_REWARD_MODES,
-    REWARD_DEFINITIONS,
+    ONE_STEP_REWARD_DEFINITIONS as REWARD_DEFINITIONS,
 )
 
 
@@ -109,6 +111,19 @@ def canonical_terminal_rewards(
     else:
         raise ValueError(f"unsupported source label: {source_label!r}")
     return rewards
+
+
+def rise_source_binary_rewards(count: int, source_label: str) -> np.ndarray:
+    """Return the released RISE expert-versus-play transition reward."""
+    if int(count) < 1:
+        raise ValueError("RISE source-binary rewards require a nonempty episode")
+    if source_label == "expert":
+        value = 1.0
+    elif source_label in {"non_expert_success", "non_expert_failure"}:
+        value = 0.0
+    else:
+        raise ValueError(f"unsupported source label: {source_label!r}")
+    return np.full(int(count), value, dtype=np.float32)
 
 
 def actor_condition_value(source_label: str, mode: str) -> bool:
@@ -795,6 +810,11 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
                         source,
                         args.reward_mode,
                     )
+                elif args.reward_mode == "rise_source_binary":
+                    expected_rewards = rise_source_binary_rewards(
+                        expected_count,
+                        source,
+                    )
                 else:
                     raise AssertionError(
                         f"unhandled reward mode {args.reward_mode!r}"
@@ -1058,6 +1078,11 @@ def add_episode(
                 str(source_path),
                 f"/data/{source_key}/rewards",
             )
+        elif reward_mode == "rise_source_binary":
+            target.create_dataset(
+                "rewards",
+                data=rise_source_binary_rewards(count, source_label),
+            )
         elif reward_mode in CANONICAL_TERMINAL_REWARD_MODES:
             rewards = canonical_terminal_rewards(
                 count,
@@ -1090,6 +1115,10 @@ def add_episode(
     if reward_mode == "task":
         critic_positive_count = source_positive_count
         critic_reward_sum = float(source_rewards.sum())
+    elif reward_mode == "rise_source_binary":
+        critic_positive_count = count if source_label == "expert" else 0
+        critic_negative_count = 0
+        critic_reward_sum = float(critic_positive_count)
     elif reward_mode in CANONICAL_TERMINAL_REWARD_MODES:
         critic_positive_count = int(source_label in SUCCESS_SOURCES)
         critic_negative_count = int(
@@ -1371,10 +1400,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="task",
         help=(
             "task keeps source environment rewards (default); "
-            "terminal_success truncates each success at its first positive "
-            "task reward and emits one +1 terminal reward; rise uses the same "
-            "unique success terminal and emits -1 at failed episode ends, with "
-            "zero reward on all nonterminal transitions"
+            "rise_source_binary gives every expert transition 1 and every "
+            "rollout transition 0; terminal_success truncates each success at "
+            "its first positive task reward and emits one +1 terminal reward; "
+            "rise uses the same unique success terminal and emits -1 at failed "
+            "episode ends, with zero reward on all nonterminal transitions"
         ),
     )
     parser.add_argument(

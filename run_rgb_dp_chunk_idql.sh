@@ -71,12 +71,12 @@ case "$TASK" in
     TASK_DP_CHECKPOINT=trained_models/can_rgb_dp/can_ph_rgb_dp_official_s1/models/model_epoch_50.pth
     TASK_EXPERT_DATASET=datasets/can/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/can_rgb_dp/epoch50_collection/can_rgb_dp_rollouts_rgb2.hdf5
-    TASK_IDQL_DATASET=datasets/can/idql/can_rgb_dp_idql_200demo_100success_33failure.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/can_rgb_dp/idql/200demo_100success_33failure
-    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/can_rgb_dp/chunk_idql/200demo_100success_33failure_h8_dynamics_human_condition
+    TASK_IDQL_DATASET=datasets/can/idql/can_rgb_dp_idql_200demo_467success_33failure.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/can_rgb_dp/idql/200demo_467success_33failure
+    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/can_rgb_dp/chunk_idql/200demo_467success_33failure_h8_dynamics_human_condition
     TASK_EXPERT_MASK=
     TASK_EXPERT_COUNT=200
-    TASK_SUCCESS_MASK=success_100
+    TASK_SUCCESS_MASK=success
     TASK_SUCCESS_COUNT=-1
     TASK_FAILURE_MASK=failure
     TASK_FAILURE_COUNT=-1
@@ -85,9 +85,9 @@ case "$TASK" in
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
-    TASK_CHUNK_EVAL_OUTPUT=rollouts/can_rgb_dp/chunk_idql/200demo_100success_33failure_h8_dynamics_human_condition
+    TASK_CHUNK_EVAL_OUTPUT=rollouts/can_rgb_dp/chunk_idql/200demo_467success_33failure_h8_dynamics_human_condition
     TASK_COMPOSED_DP_CHECKPOINT=trained_models/can_rgb_dp/can_ph_rgb_dp_official_s1/models/model_epoch_200.pth
-    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/can_rgb_dp/chunk_idql/200demo_100success_33failure_h8_dynamics_human_condition_epoch200_actor
+    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/can_rgb_dp/chunk_idql/200demo_467success_33failure_h8_dynamics_human_condition_epoch200_actor
     TASK_EVAL_HORIZON=400
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_qpos
     ;;
@@ -96,8 +96,8 @@ case "$TASK" in
     TASK_EXPERT_DATASET=datasets/transport/ph/image_v15.hdf5
     TASK_ROLLOUT_DATASET=rollouts/transport_rgb_dp/epoch200_collection/transport_rgb_dp_rollouts_rgb4.hdf5
     TASK_IDQL_DATASET=datasets/transport/idql/transport_rgb_dp_idql_200demo_422success_78failure.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/transport_rgb_dp/idql/200demo_100success_50failure
-    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/transport_rgb_dp/chunk_idql/200demo_100success_50failure_h8_dynamics_human_condition
+    TASK_IDQL_OUTPUT_DIR=trained_models/transport_rgb_dp/idql/200demo_422success_78failure
+    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/transport_rgb_dp/chunk_idql/200demo_422success_78failure_h8_dynamics_human_condition
     TASK_EXPERT_MASK=
     TASK_EXPERT_COUNT=200
     TASK_SUCCESS_MASK=success

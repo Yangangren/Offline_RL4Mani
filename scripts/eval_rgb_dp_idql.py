@@ -1513,6 +1513,20 @@ def load_policy(idql_checkpoint: Path, device: torch.device, args):
     # Keep optimizer states and unused network states off the GPU. Individual
     # actor / critic modules copy only the selected weights to @device below.
     checkpoint = torch.load(idql_checkpoint, map_location="cpu", weights_only=False)
+    if getattr(args, "require_rise_spectral_baseline", False):
+        if not bool(checkpoint.get("rise_spectral_baseline", False)):
+            raise ValueError(
+                f"{idql_checkpoint} is not a RISE spectral baseline checkpoint"
+            )
+        if checkpoint.get("reward_mode") != "rise_source_binary":
+            raise ValueError(
+                "RISE spectral evaluation requires reward_mode="
+                f"'rise_source_binary', got {checkpoint.get('reward_mode')!r}"
+            )
+        if bool(checkpoint.get("dinov2_augmentation", False)):
+            raise ValueError(
+                "this RISE evaluation entry point expects the no-DINO baseline"
+            )
     checkpoint_task = checkpoint.get("task")
     if args.expected_task is not None and checkpoint_task != args.expected_task:
         raise ValueError(
@@ -2202,6 +2216,16 @@ def build_summary(args, policy, stats: list[dict], complete: bool) -> dict:
         "visual_critic_idql": bool(policy.checkpoint.get("visual_critic_idql", False)),
         "hybrid_dp_chunk_actor_iql": bool(policy.checkpoint.get("hybrid_dp_chunk_actor_iql", False)),
         "rise_style_rgb_idql": rise_style_rgb_idql,
+        "rise_spectral_baseline": bool(
+            policy.checkpoint.get("rise_spectral_baseline", False)
+        ),
+        "reward_mode": policy.checkpoint.get("reward_mode"),
+        "spectral_penalty_weight": policy.checkpoint.get(
+            "spectral_penalty_weight"
+        ),
+        "dinov2_augmentation": bool(
+            policy.checkpoint.get("dinov2_augmentation", False)
+        ),
         "rise_style_rgb_chunk_idql": bool(
             policy.checkpoint.get("rise_style_rgb_chunk_idql", False)
         ),
@@ -2544,7 +2568,7 @@ def evaluate(args) -> dict:
                 print(f"WARNING: failed to close rollout environment: {exc}", flush=True)
 
 
-def main() -> None:
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--idql-checkpoint", type=Path, default=DEFAULT_IDQL)
     parser.add_argument("--dp-checkpoint", type=Path, default=None)
@@ -2647,7 +2671,7 @@ def main() -> None:
     parser.add_argument("--num-videos", type=int, default=0)
     parser.add_argument("--video-skip", type=int, default=5)
     parser.add_argument("--camera-names", type=str, nargs="+", default=("agentview", "robot0_eye_in_hand"))
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.dp_checkpoint_explicit = args.dp_checkpoint is not None
     if args.dp_checkpoint is None:
         args.dp_checkpoint = DEFAULT_DP
@@ -2678,6 +2702,11 @@ def main() -> None:
         value = getattr(args, key)
         if value is not None:
             setattr(args, key, value.resolve())
+    return args
+
+
+def main() -> None:
+    args = parse_args()
     evaluate(args)
 
 

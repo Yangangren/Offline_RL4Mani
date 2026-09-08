@@ -9180,6 +9180,16 @@ def make_parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--sparse-chunk-validity-key",
+        choices=("chunk_critic_valid", "one_step_critic_valid"),
+        default="chunk_critic_valid",
+        help=(
+            "HDF5 row mask used by the sparse chunk loader. "
+            "one_step_critic_valid is an ablation for training H-step chunk "
+            "IDQL on the denser action-state dataset used by one-step IDQL."
+        ),
+    )
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
         "--pin-memory", action=argparse.BooleanOptionalAction, default=True

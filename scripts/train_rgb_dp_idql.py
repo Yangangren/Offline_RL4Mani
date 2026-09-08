@@ -63,7 +63,7 @@ from rgb_dp_distributed import (
 )
 from rgb_dp_idql_rewards import (
     LEGACY_RISE_REWARD_DEFINITION,
-    REWARD_DEFINITIONS,
+    ONE_STEP_REWARD_DEFINITIONS as REWARD_DEFINITIONS,
 )
 
 
@@ -239,9 +239,14 @@ def configure_actor_optimizer(
     num_cycles: float = 0.5,
 ) -> None:
     policy = actor_algo.nets["policy"]
-    if set(policy.keys()) != {"noise_pred_net", "obs_encoder"}:
+    required_modules = {"noise_pred_net", "obs_encoder"}
+    optional_modules = {"rise_spectral_adapter"}
+    actual_modules = set(policy.keys())
+    if not required_modules.issubset(actual_modules) or (
+        actual_modules - required_modules - optional_modules
+    ):
         raise RuntimeError(
-            "one-step IDQL expected the original plain DP actor modules; got "
+            "one-step IDQL received unsupported DP actor modules: "
             f"{tuple(policy.keys())}"
         )
     if obs_encoder_learning_rate is None:
@@ -256,10 +261,15 @@ def configure_actor_optimizer(
         ]
     else:
         parameter_groups = []
-        for name, group_learning_rate in (
+        module_learning_rates = [
             ("noise_pred_net", float(learning_rate)),
             ("obs_encoder", float(obs_encoder_learning_rate)),
-        ):
+        ]
+        if "rise_spectral_adapter" in policy:
+            module_learning_rates.append(
+                ("rise_spectral_adapter", float(obs_encoder_learning_rate))
+            )
+        for name, group_learning_rate in module_learning_rates:
             parameters = list(policy[name].parameters())
             for parameter in parameters:
                 parameter.requires_grad_(True)
@@ -334,8 +344,22 @@ def assert_unconditioned_actor(actor_algo) -> dict[str, Any]:
             "one-step IDQL requires the original unconditioned pretrained DP; "
             "condition_adapter is present"
         )
+    spectral_adapter = (
+        train_policy["rise_spectral_adapter"]
+        if "rise_spectral_adapter" in train_policy
+        else None
+    )
+    spectral_present = spectral_adapter is not None
+    if ema_policy is not None and (
+        ("rise_spectral_adapter" in ema_policy) != spectral_present
+    ):
+        raise RuntimeError("online and EMA RISE spectral adapters do not match")
     return {
         "condition_adapter_present": False,
+        "rise_spectral_adapter_present": spectral_present,
+        "rise_spectral_hidden_dims": (
+            tuple(spectral_adapter.hidden_dims) if spectral_present else None
+        ),
     }
 
 
@@ -1188,6 +1212,13 @@ def build_single_loader(
                 dynamics_prediction_offsets=tuple(
                     getattr(args, "dynamics_prediction_offsets", ())
                 ),
+                validity_key=str(
+                    getattr(
+                        args,
+                        "sparse_chunk_validity_key",
+                        "chunk_critic_valid",
+                    )
+                ),
             )
         elif sparse_one_step_loader:
             dataset = SparseOneStepSequenceDataset(
@@ -1316,7 +1347,10 @@ def make_temporal_critic_optimizer(
 
 def set_actor_obs_encoder_trainable(actor_algo, trainable: bool) -> None:
     """Freeze only the online actor encoder; the diffusion U-Net keeps training."""
-    actor_algo.nets["policy"]["obs_encoder"].requires_grad_(bool(trainable))
+    policy = actor_algo.nets["policy"]
+    policy["obs_encoder"].requires_grad_(bool(trainable))
+    if "rise_spectral_adapter" in policy:
+        policy["rise_spectral_adapter"].requires_grad_(bool(trainable))
 
 
 def set_critic_encoders_trainable(
@@ -1336,10 +1370,17 @@ def set_vf_encoder_trainable(vf: nn.Module, trainable: bool) -> None:
 def rise_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
     if args.reward_mode == "task":
         reward_alignment = "source_environment_task_reward"
+    elif args.reward_mode == "rise_source_binary":
+        reward_alignment = "expert_transition_one_non_expert_transition_zero"
     elif args.reward_mode == "terminal_success":
         reward_alignment = "canonical_first_success_terminal_reward_with_truncation"
     else:
         reward_alignment = "canonical_signed_terminal_outcome_reward_with_truncation"
+    actor_alignment = (
+        "pretrained_DP_actor_plus_RISE_512_512_spectral_feature_MLP"
+        if float(getattr(args, "spectral_penalty_weight", 0.0)) > 0.0
+        else "unconditioned_pretrained_DP_actor_with_full_chunk_diffusion_BC"
+    )
     return {
         "matched": [
             "one uniformly shuffled mixed SequenceDataset",
@@ -1347,7 +1388,7 @@ def rise_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
             "independent_two_frame_temporal_Q1_Q2_target_Q1_target_Q2_V",
             "one_step_IQL_Q_and_expectile_V_equations",
             "Q_then_target_soft_update_then_V_update_order",
-            "unconditioned_pretrained_DP_actor_with_full_chunk_diffusion_BC",
+            actor_alignment,
             "causal_temporal_state_and_FiLM_action_fusion",
         ],
         "post_deployment_adaptations": [
@@ -1835,7 +1876,7 @@ def dataset_audit(
                 f"train with --reward-mode {reward_mode}"
             )
         task_reward_audit = None
-        if reward_mode in ("task", "terminal_success", "rise"):
+        if reward_mode in ("task", "rise_source_binary", "terminal_success", "rise"):
             missing_source_labels = [
                 key
                 for key, episode in handle["data"].items()
@@ -1874,6 +1915,33 @@ def dataset_audit(
                         f"task-reward dataset data/{episode_key} contains "
                         "non-finite rewards"
                     )
+                if reward_mode == "rise_source_binary":
+                    if source not in {
+                        "expert",
+                        "non_expert_success",
+                        "non_expert_failure",
+                    }:
+                        raise ValueError(
+                            f"unsupported {reward_mode} source={source!r}"
+                        )
+                    expected_rewards = np.full_like(
+                        rewards,
+                        1.0 if source == "expert" else 0.0,
+                    )
+                    if not np.array_equal(rewards, expected_rewards):
+                        raise ValueError(
+                            f"{reward_mode} data/{episode_key} has incorrect "
+                            "expert-versus-play transition rewards"
+                        )
+                    if "dones" not in episode:
+                        raise ValueError(f"data/{episode_key} is missing dones")
+                    dones = np.asarray(episode["dones"][:], dtype=np.float32)
+                    expected_dones = np.zeros_like(rewards)
+                    expected_dones[-1] = 1.0
+                    if not np.array_equal(dones, expected_dones):
+                        raise ValueError(
+                            f"data/{episode_key} has invalid terminal dones"
+                        )
                 if reward_mode in ("terminal_success", "rise"):
                     if source not in {"expert", "non_expert_success", "non_expert_failure"}:
                         raise ValueError(
@@ -2313,6 +2381,8 @@ def checkpoint_payload(
         TEMPORAL_ONE_STEP_MARKER: True,
         "hybrid_dp_chunk_actor_iql": True,
         "visual_critic_idql": True,
+        "rise_spectral_baseline": bool(args.spectral_penalty_weight > 0.0),
+        "dinov2_augmentation": False,
         "actor_model": actor_algo.serialize(),
         "critics": [critic.state_dict() for critic in critics],
         "critic_targets": [critic.state_dict() for critic in critic_targets],
@@ -2364,6 +2434,13 @@ def checkpoint_payload(
         "reward_mode": str(args.reward_mode),
         "reward_definition": REWARD_DEFINITIONS[args.reward_mode],
         "actor_training_objective": "diffusion_bc_full_chunk",
+        "actor_regularization": (
+            "rise_final_feature_mlp_exact_spectral_norm"
+            if args.spectral_penalty_weight > 0.0
+            else None
+        ),
+        "spectral_penalty_weight": float(args.spectral_penalty_weight),
+        "spectral_hidden_dims": tuple(args.spectral_hidden_dims),
         "actor_grouped_optimizer": bool(args.actor_grouped_optimizer),
         "actor_unet_lr": float(args.actor_unet_lr),
         "actor_obs_encoder_lr": float(args.actor_obs_encoder_lr),
@@ -2386,6 +2463,8 @@ def checkpoint_payload(
         "critic_training_objective": (
             "task_reward_one_step_iql"
             if args.reward_mode == "task"
+            else "rise_source_binary_reward_one_step_iql"
+            if args.reward_mode == "rise_source_binary"
             else "terminal_success_reward_one_step_iql"
             if args.reward_mode == "terminal_success"
             else "signed_terminal_outcome_one_step_iql"
@@ -2393,6 +2472,8 @@ def checkpoint_payload(
         "critic_reward_source": (
             "rewards=source_environment_task_reward"
             if args.reward_mode == "task"
+            else "rewards=expert_transition_one_non_expert_transition_zero"
+            if args.reward_mode == "rise_source_binary"
             else "rewards=canonical_first_success_terminal_reward"
             if args.reward_mode == "terminal_success"
             else "rewards=canonical_signed_terminal_outcome"
@@ -2554,6 +2635,8 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "actor_obs_encoder_lr",
         "actor_obs_encoder_freeze_steps",
         "resolved_actor_obs_encoder_freeze_steps",
+        "spectral_penalty_weight",
+        "spectral_hidden_dims",
         "critic_lr",
         "encoder_lr",
         "encoder_freeze_steps",
@@ -2627,6 +2710,24 @@ def train(args: argparse.Namespace) -> dict:
         raise RuntimeError(
             "trainable actor does not exactly match the pretrained deployed EMA"
         )
+    spectral_weight = float(args.spectral_penalty_weight)
+    actor_algo.rise_spectral_penalty_weight = spectral_weight
+    spectral_adapter_present = (
+        "rise_spectral_adapter" in actor_algo.nets["policy"]
+    )
+    if spectral_weight == 0.0 and spectral_adapter_present:
+        raise RuntimeError(
+            "the original one-step IDQL baseline cannot load a RISE spectral "
+            "actor unless --spectral-penalty-weight is positive"
+        )
+    if spectral_weight > 0.0:
+        actor_algo.install_rise_spectral_adapter(
+            hidden_dims=tuple(args.spectral_hidden_dims)
+        )
+        if not actor_matches_deployed_ema(actor_algo):
+            raise RuntimeError(
+                "online and EMA RISE spectral adapters were not initialized equally"
+            )
     # The serialized weights have been copied into the local-rank actor.
     dp_checkpoint.pop("model", None)
 
@@ -3024,6 +3125,8 @@ def train(args: argparse.Namespace) -> dict:
         "critic_late_fusion_key": args.critic_late_fusion_key,
     }
     startup = {
+        "baseline": getattr(args, "baseline", "rgb_dp_one_step_idql"),
+        "dinov2_augmentation": False,
         "task": str(args.task),
         "actor_initialization": {
             "checkpoint": str(args.checkpoint),
@@ -3140,6 +3243,8 @@ def train(args: argparse.Namespace) -> dict:
             "resolved_actor_obs_encoder_freeze_steps": int(
                 args.resolved_actor_obs_encoder_freeze_steps
             ),
+            "spectral_penalty_weight": float(args.spectral_penalty_weight),
+            "spectral_hidden_dims": tuple(args.spectral_hidden_dims),
             "critic_lr": float(args.critic_lr),
             "encoder_lr": float(args.encoder_lr),
             "encoder_freeze_steps": int(args.encoder_freeze_steps),
@@ -3540,7 +3645,7 @@ def train(args: argparse.Namespace) -> dict:
     return final_summary
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument(
@@ -3662,6 +3767,22 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Reference-batch optimizer steps to freeze the actor encoder.",
     )
+    parser.add_argument(
+        "--spectral-penalty-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight on the exact spectral norm of the final RISE feature-MLP "
+            "matrix. Zero keeps the original pretrained DP architecture."
+        ),
+    )
+    parser.add_argument(
+        "--spectral-hidden-dims",
+        type=int,
+        nargs="+",
+        default=(512, 512),
+        help="Hidden dimensions of the RISE post-encoder feature MLP.",
+    )
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--encoder-lr", type=float, default=1e-5)
     parser.add_argument(
@@ -3725,7 +3846,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--snapshot-every-epochs", type=int, default=0)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     for key in (
         "dataset",
         "validation_dataset",
@@ -3752,6 +3873,15 @@ def parse_args() -> argparse.Namespace:
     ):
         if int(getattr(args, key)) < 0:
             parser.error(f"--{key.replace('_', '-')} must be non-negative")
+    if float(args.spectral_penalty_weight) < 0.0:
+        parser.error("--spectral-penalty-weight must be non-negative")
+    args.spectral_hidden_dims = tuple(
+        int(value) for value in args.spectral_hidden_dims
+    )
+    if not args.spectral_hidden_dims or any(
+        value <= 0 for value in args.spectral_hidden_dims
+    ):
+        parser.error("--spectral-hidden-dims values must be positive")
     if args.hdf5_cache_mode == "none":
         args.hdf5_cache_mode = None
     if not args.critic_late_fusion_key:

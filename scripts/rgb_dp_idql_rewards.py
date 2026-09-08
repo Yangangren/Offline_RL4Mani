@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 
-LEGACY_RISE_REWARD_DEFINITION = "expert_transition=1; non_expert_transition=0"
+RISE_SOURCE_BINARY_REWARD_DEFINITION = (
+    "expert_transition=1; non_expert_transition=0"
+)
+# Retained for detecting old files that ambiguously used reward_mode="rise".
+LEGACY_RISE_REWARD_DEFINITION = RISE_SOURCE_BINARY_REWARD_DEFINITION
 
 REWARD_DEFINITIONS = {
     "task": "source_task_reward",
@@ -19,4 +23,9 @@ REWARD_DEFINITIONS = {
     ),
 }
 
+
+ONE_STEP_REWARD_DEFINITIONS = {
+    **REWARD_DEFINITIONS,
+    "rise_source_binary": RISE_SOURCE_BINARY_REWARD_DEFINITION,
+}
 CANONICAL_TERMINAL_REWARD_MODES = frozenset(("terminal_success", "rise"))

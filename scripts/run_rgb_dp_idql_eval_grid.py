@@ -227,6 +227,15 @@ def artifact_signature(path: Path) -> tuple[int, int, int, int, int] | None:
 def common_experiment_inputs(args: argparse.Namespace) -> dict[str, object]:
     """Inputs shared by every pair and chunk in one evaluation grid."""
     return {
+        "eval_script": file_identity(
+            Path(
+                getattr(
+                    args,
+                    "eval_script",
+                    "scripts/eval_rgb_dp_idql.py",
+                )
+            )
+        ),
         "checkpoints": {
             "idql": file_identity(args.idql_checkpoint),
             "dp": file_identity(args.dp_checkpoint),
@@ -440,7 +449,7 @@ def eval_command(
     cmd = [
         str(PYTHON),
         "-B",
-        "scripts/eval_rgb_dp_idql.py",
+        str(getattr(args, "eval_script", Path("scripts/eval_rgb_dp_idql.py"))),
         "--idql-checkpoint",
         str(args.idql_checkpoint),
         "--dp-checkpoint",
@@ -1230,6 +1239,11 @@ def summarize(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--idql-checkpoint", type=Path, default=DEFAULT_IDQL)
+    parser.add_argument(
+        "--eval-script",
+        type=Path,
+        default=Path("scripts/eval_rgb_dp_idql.py"),
+    )
     parser.add_argument("--dp-checkpoint", type=Path, default=DEFAULT_DP)
     parser.add_argument(
         "--expected-task",
@@ -1342,6 +1356,9 @@ def main() -> None:
             "--selection epsilon_greedy"
         )
 
+    args.eval_script = args.eval_script.resolve()
+    if not args.eval_script.is_file():
+        parser.error(f"--eval-script does not exist: {args.eval_script}")
     args.idql_checkpoint = args.idql_checkpoint.resolve()
     args.dp_checkpoint = args.dp_checkpoint.resolve()
     args.output_dir = args.output_dir.resolve()
