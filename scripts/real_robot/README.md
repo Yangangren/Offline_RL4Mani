@@ -1,7 +1,7 @@
 # Real-robot RGB Diffusion Policy pipelines
 
-This folder contains the offline real-robot pipelines for the pick-cup and
-stack-cup tasks. They convert the recorded packages, validate the results,
+This folder contains the offline real-robot pipelines for the PickCup,
+StackCup, and MoveSpoon tasks. They convert the recorded packages, validate the results,
 prepare standard robomimic Diffusion Policy configs, and launch training. ROS
 and robot-control deployment are deliberately out of scope.
 
@@ -10,16 +10,16 @@ and robot-control deployment are deliberately out of scope.
 Run these commands from the repository root with the robomimic environment:
 
 ```bash
-# Revalidate the published shards and regenerate the production config.
+# Revalidate the published dataset and regenerate the production config.
 /home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
   scripts/real_robot/run_pick_cup_rgb_dp_baseline.py --stages validate prepare
 
-# Train the production baseline (250 epochs by default).
+# Train the production baseline (200 epochs by default).
 /home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
   scripts/real_robot/run_pick_cup_rgb_dp_baseline.py --stages prepare train
 ```
 
-To exercise the original 20 Hz model and checkpoint path without starting a
+To exercise the 20 Hz model and checkpoint path without starting a
 production run:
 
 ```bash
@@ -28,10 +28,11 @@ production run:
   --stages prepare train --smoke
 ```
 
-The converted 20 Hz dataset already lives in `datasets/real_robot/pick_cup`. To
-build it again from the source package, use `--stages dataset prepare`; existing
-valid shards are reused only when their conversion settings match the request.
-Add `--force-dataset` only when intentionally replacing both shards.
+The converted 20 Hz dataset is
+`datasets/real_robot/pick_cup/pick_cup_rgb.hdf5`. To build it again from
+`/home/ryan/datasets_new/pick_cup/human`, use `--stages dataset prepare`;
+an existing file is reused only when source-backed validation passes. Add
+`--force-dataset` only when intentionally replacing that file.
 
 ## Stack-cup 20 Hz baseline
 
@@ -93,64 +94,49 @@ motion MAE/RMSE, physical translation and rotation RMSE, and gripper sign
 accuracy per slot. These remain open-loop imitation diagnostics, not robot
 success measurements.
 
-## Move-spoon DDIM-100 rollout processing
+## Canonical real-robot IDQL sources
 
-The finalized MoveSpoon rollout handoff is read from
-`/home/ryan/datasets/move_spoon/rollout`. Convert and source-validate it with:
+PickCup, StackCup, and MoveSpoon use the same episode-layout schema under
+`/home/ryan/datasets_new/{pick_cup,stack_cup,move_spoon}/{human,rollout}`.
+Build the request-aligned chunk sources with:
 
 ```bash
 /home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
-  scripts/real_robot/build_move_spoon_processed_rollout_hdf5.py
+  scripts/real_robot/build_episode_layout_idql_sources.py --task pick_cup
+/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
+  scripts/real_robot/build_episode_layout_idql_sources.py --task stack_cup
+/home/ryan/miniconda3/envs/robomimic_stable/bin/python -B \
+  scripts/real_robot/build_episode_layout_idql_sources.py --task move_spoon
 ```
 
-The output is
-`datasets/real_robot/move_spoon/idql/move_spoon_epoch200_ddim100_20hz_rollouts.hdf5`.
-The converter verifies the published checksums and exact deployed checkpoint,
-dataset, server, and DDIM-100 identities. It removes repeated wall-clock rows,
-retains the exact normalized controller proposal for each immutable source
-action, and chooses the latest causal main/wrist RGB pair at that source time.
+Use `build_episode_layout_one_step_sources.py --task TASK` for one-step IDQL.
+Both converters verify every published checksum plus the exact deployed
+checkpoint and runtime contract. PickCup records its native DDIM-10 sampler in
+the `checkpoint_contract` identity layout; StackCup and MoveSpoon record
+the checkpoint DDIM-10 plus the deployed DDIM-100 runtime override. These are
+separate strict task profiles, not interchangeable sampler assumptions.
+Human actions are kept on their recorded
+20 Hz target grid and mapped to the latest causal paired camera frame; only an
+initial action prefix before the first camera frame is dropped. PickCup
+rollouts keep all 400 actions and expose 50 digest-verified requests. StackCup
+and MoveSpoon keep all 600 actions and expose 75 requests. Chunk sources expose
+the exact request inputs;
+one-step sources hold each request camera pair inside its proposal and insert
+the exact per-action pre-command low-dimensional state. The one-step source
+masks each nonterminal substep-7 transition across the variable inference
+pause and retains the final terminal row (351 valid rows per PickCup rollout,
+526 for StackCup and MoveSpoon).
 
-The deterministic validation masks contain five successes and four failures.
-They are stratified across the three collection placement regimes (episodes
-1-25, 26-29, and 30-40) as well as by outcome. Every episode also stores
-`provenance/source_action_delta_sec` and
-`provenance/dynamics_transition_valid`. The latter is zero at terminals, across
-missing source indices, and whenever the elapsed source-action time exceeds
-0.1 seconds; fixed-20-Hz dynamics objectives must honor this mask.
+The immutable human split is 45/5 for all three tasks. PickCup rollouts split
+23/11 train success/failure and 6/3 validation. StackCup uses 20/10 and 6/4;
+MoveSpoon uses 20/11 and 5/4. Thus every rollout belongs to either fitting or
+validation. The mixed builders use external links, so their small HDF5 files depend
+on the canonical source files and validate their identities before training.
 
 ## 20 Hz mixed-data chunk IDQL
 
-The real pick-cup chunk-IDQL task is exposed as `pick_cup` in the repository
-launcher. Raw deployment rollouts are read from
-`/home/ryan/datasets/pick_cup/rollout/{success,failure}` and converted to
-`datasets/real_robot/pick_cup/idql/pick_cup_epoch200_20hz_rollouts.hdf5`.
-The converter preserves 20 Hz state and normalized seven-dimensional policy
-actions while sampling RGB on a causal wall-clock 5 Hz grid. Images normally
-repeat for about four action rows; after a blocking gripper or control pause,
-the next row advances to the latest causal grid tick instead of retaining a
-stale pre-pause frame.
-
-One held-out successful rollout has a documented recorder-startup gap. Its
-first seven source actions are trimmed as one disconnected prefix (rather than
-using a future frame or relaxing the 0.5 s image-age contract); this does not
-change any fitting-set count. Every retained rollout row remains causal.
-
-The deterministic fitting split contains exactly 99 episodes:
-
-- 65 human demonstrations: 44 `train` episodes from round 1 and 21 from round
-  2. The two source `valid` masks (five episodes per round) remain excluded.
-- 23 of 29 successful rollouts, with the other six in `success_valid`.
-- 11 of 14 failed rollouts, with the other three in `failure_valid`.
-
-The mixed fitting output is
-`datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_65demo_23success_11failure_terminal_success_human_success_condition.hdf5`.
-The chunk launcher also builds the disjoint held-out file
-`datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_validation_10demo_6success_3failure_terminal_success_human_success_condition.hdf5`.
-It contains all 10 human validation episodes, six successful validation
-rollouts, and three failed validation rollouts (7,964 windows total). Both
-files retain source episode identities, and training aborts if any identity
-appears in both.
-It uses `terminal_success`: a successful episode has its sole reward of 1 on
+The three task wrappers share the same mixed builder. It uses
+`terminal_success`: a successful episode has its sole reward of 1 on
 the final recorded transition, while a failure has zero reward throughout;
 both terminate at the recorded episode end. The default chunk-actor condition
 is `human_success`: human and successful-rollout rows have condition 1, while
@@ -170,10 +156,6 @@ Running the same stage again without `OVERWRITE_DATASET=1` is the launcher
 validation path: it checks raw-source provenance, deterministic masks, source
 identities, schema, reward terminals, action/observation shapes, and the mixed
 dataset contract without replacing either output.
-
-```bash
-bash run_rgb_dp_chunk_idql.sh pick_cup build_dataset
-```
 
 Only after that command succeeds, launch the default joint-actor run:
 
@@ -200,7 +182,7 @@ must not be used as a real-robot execution client.
 
 ## 20 Hz mixed-data one-step IDQL
 
-The one-step launcher trains `pick_cup` and `stack_cup`. It uses an
+The one-step launcher trains `pick_cup`, `stack_cup`, and `move_spoon`. It uses an
 unconditioned diffusion actor and one-step `rise_temporal_v2` Q/V networks;
 stored `actor_condition` labels are provenance only and are not actor inputs in
 this recipe. Before training, the launcher revalidates the converted rollout
@@ -216,17 +198,18 @@ bash run_rgb_dp_idql.sh pick_cup train_resilient
 The run initializes its trainable diffusion actor from the deployed epoch-200
 checkpoint and uses `robot0_gripper_state` as the critic's late-fusion key.
 Outputs go to
-`trained_models/real_robot/pick_cup_rgb_dp/idql/65demo_23success_11failure_terminal_success`.
+`trained_models/real_robot/pick_cup_rgb_dp/idql/45demo_23success_11failure_terminal_success_rise_temporal_v2_episode_layout_v1`.
 The launcher's generic `eval`, `eval_grid_resilient`, and composed evaluation
 stages are rejected for `pick_cup` because they instantiate robomimic
 simulation rather than the guarded real-robot client.
 
-For StackCup, build or validate the action-state-v3 lineage and start training
-with:
+For StackCup or MoveSpoon, use the same build and training stages:
 
 ```bash
 bash run_rgb_dp_idql.sh stack_cup build_dataset
 bash run_rgb_dp_idql.sh stack_cup train_resilient
+bash run_rgb_dp_idql.sh move_spoon build_dataset
+bash run_rgb_dp_idql.sh move_spoon train_resilient
 ```
 
 The StackCup rollout has an exact pre-command pose and logical gripper state at
@@ -238,16 +221,17 @@ variable DDIM inference pause, while retaining the final terminal row. This
 admits 526 of 600 transitions per rollout. These substep-1-through-7 inputs are
 explicitly marked as composite training states, not new request captures.
 
-## Stack-cup mixed-data chunk IDQL
+## Request-aligned mixed-data chunk IDQL
 
-The chunk-IDQL launcher exposes the current proposal-v3 corpus as `stack_cup`.
-The source `/home/ryan/datasets/stack_cup/rollout` contains 40 finalized policy
-rollouts and 49 selected human demonstrations. Conversion verifies the complete
-published checksum manifest, the deployed epoch-200 checkpoint, the exact
-26-success / 14-failure rollout partition, and the runtime DDIM-100 override.
+StackCup remains the reference implementation; PickCup and MoveSpoon use the
+same conversion, sparse-loader, model, validation, and training contract.
+PickCup has 43 finalized policy rollouts; the other tasks have 40. Every task
+has 50 human demonstrations. Conversion verifies the complete checksum
+manifests, deployed epoch-200 checkpoint, and runtime contract.
 
-Every policy rollout has 600 recorded normalized actions grouped into 75 exact
-H8 proposals. Each proposal stores the original `chunk_XXXX_input.npz` as an
+Each StackCup and MoveSpoon policy rollout has 600 recorded normalized actions
+grouped into 75 exact H8 proposals; PickCup has 400 actions and 50 proposals.
+Each proposal stores the original `chunk_XXXX_input.npz` as an
 exact two-frame `request_obs` tensor for both cameras and all three low-dimensional
 state keys. The sparse loader admits only the 75 proposal starts and directly
 uses `request_obs`; it never reconstructs those observations from adjacent
@@ -263,32 +247,27 @@ The diffusion actor still uses its normal full 16-step denoising objective at
 each admitted row. There is no `actor_action_loss_mask` and no change to the
 Diffusion Policy loss implementation.
 
-The mixed fitting file is
-`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_request_v3_44demo_20success_10failure_ddim100_terminal_success_human_success_condition.hdf5`.
-It contains 74 episodes and 33,506 stored action rows: 15,506 human, 12,000
-successful rollout, and 6,000 failed rollout. The sparse loader admits 17,756
-H8 decisions: 15,506 overlapping human starts, 1,500 exact successful-rollout
-proposals, and 750 exact failed-rollout proposals. The file uses external HDF5
-links and virtual shifted `next_obs`, so the image data are not copied into the
-small mixed file.
-The chunk launcher additionally builds
-`datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_request_v3_validation_5demo_6success_4failure_ddim100_terminal_success_human_success_condition.hdf5`,
-containing the five held-out human episodes and the 6/4 held-out successful /
-failed rollouts (7,538 stored rows and 2,288 admitted H8 decisions: 1,538 human
-starts plus 750 exact rollout proposals). It is
-evaluated in full after every epoch using EMA actor weights, with the lowest
-held-out actor loss retained as `best_validation.pt`.
+The StackCup fitting set has 36,841 stored rows and 21,091 admitted H8 starts:
+18,841 stride-one human starts plus 2,250 exact rollout proposals. Its held-out
+set has 8,325 stored rows and 3,075 admitted starts. MoveSpoon has 37,104 / 20,829
+for fitting and 7,477 / 2,752 held out. The refreshed PickCup human source has
+17,127 fitting rows and 1,612 held-out rows; its mixed totals depend on the next
+rollout package. Validation is evaluated in full after every epoch
+using EMA actor weights, with the lowest held-out actor loss saved as
+`best_validation.pt`.
 
 Build or revalidate the rollout and mixed datasets through the chunk launcher:
 
 ```bash
+bash run_rgb_dp_chunk_idql.sh pick_cup build_dataset
 bash run_rgb_dp_chunk_idql.sh stack_cup build_dataset
+bash run_rgb_dp_chunk_idql.sh move_spoon build_dataset
 ```
 
-The converter writes separate request-v3 rollout and human HDF5 sources, so it
-does not overwrite the older converted data. Later runs validate the existing
-sources and mixed files fail-closed. Use both overwrite flags only to rebuild
-those request-v3 outputs from the immutable source package.
+The converter writes separate request-aligned, one-step, and human HDF5 sources.
+Later runs validate existing sources and mixed files fail-closed. Set
+`OVERWRITE_ROLLOUT_DATASET=1 OVERWRITE_DATASET=1` only to rebuild them from the
+immutable source package.
 
 If the raw rollout handoff is not mounted, an existing converted rollout file
 is accepted only after an output-only audit of its embedded immutable manifest,
@@ -302,12 +281,14 @@ fail-closed and is never silently downgraded to output-only validation.
 Start the default chunked run (joint actor and critic, not separate training):
 
 ```bash
+bash run_rgb_dp_chunk_idql.sh pick_cup train_chunk_idql_resilient
 bash run_rgb_dp_chunk_idql.sh stack_cup train_chunk_idql_resilient
+bash run_rgb_dp_chunk_idql.sh move_spoon train_chunk_idql_resilient
 ```
 
-The default model and evaluation directory names contain `human_stride1`, so a
-completed checkpoint from the earlier 4,117-sample recipe cannot be mistaken
-for this dataset revision.
+The default model and evaluation directory names contain `episode_layout_v1`
+and `human_stride1`, so an older checkpoint cannot be mistaken for this
+dataset revision.
 
 It initializes the actor from
 `trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260902111545/models/model_epoch_200.pth`,
@@ -325,16 +306,17 @@ real-robot task.
 
 ## Data contract
 
-- Two HDF5 shards preserve collection rounds 1 and 2. The standard robomimic
-  `MetaDataset` gives each round equal total sampling mass.
+- One canonical PickCup HDF5 contains the fixed 45/5 episode split and is
+  shared by baseline DP, IDQL, and chunk IDQL.
 - Observations are paired main and wrist RGB images at 96x128, EEF position,
   EEF quaternion in `xyzw` order, and the logical gripper state before the
   current action.
 - Actions are six already-normalized Cartesian motion channels plus a dense
   post-action gripper target (`-1` closed, `+1` open).
 - Image selection is causal against the actual camera header timestamps, not
-  nominal frame times. A sample is rejected if its selected pair is more than
-  0.5 seconds old.
+  nominal frame times. The refreshed PickCup package uses an explicit 1.0 s
+  ceiling because 23 recorded action rows contain real camera stalls between
+  0.5 and 0.914 s; StackCup and MoveSpoon retain the 0.5 s ceiling.
 - Raw gripper events, source row indices, timestamps, selected frame indices,
   camera stamps, and image ages are retained under each demo's `provenance`
   group.
@@ -343,13 +325,11 @@ real-robot task.
 
 ## Implementation map
 
-- `build_pick_cup_dataset.py`: source audit, conversion, split creation, and
-  rollback-safe two-shard publication guarded by a generation commit marker.
-- `validate_pick_cup_dataset.py`: independent schema, timing, provenance,
-  gripper, mask, and cross-shard validation.
+- `build_episode_layout_idql_sources.py --task pick_cup --source-kind human`:
+  checksum-backed source audit, causal conversion, fixed split creation, and
+  atomic single-file publication.
 - `run_pick_cup_rgb_dp_baseline.py`: config generation, standard-loader
-  preflight, balanced multi-shard sampling, and training launch.
-- `pick_cup_common.py`: shared schema and source-contract helpers.
+  preflight, source-backed validation, and training launch.
 
 The baseline reuses `robomimic/algo/diffusion_policy.py` and the existing
 robomimic dataset loader. Its default horizons are observation/action/prediction
@@ -360,13 +340,11 @@ steps, EMA, and the full `[256, 512, 1024]` temporal U-Net.
 
 ```bash
 /home/ryan/miniconda3/envs/robomimic_stable/bin/python -m unittest \
-  tests.real_robot.test_build_pick_cup_dataset \
-  tests.real_robot.test_pick_cup_rgb_dp_baseline \
+  tests.test_real_robot_episode_layout_profiles \
   tests.test_train_utils_validation_scheduler -v
 ```
 
-The converter also writes `datasets/real_robot/pick_cup/conversion_summary.json`
-with episode counts, sample counts, causal prefix drops, and maximum image ages.
-`dataset_commit.json` is the publication marker; the launcher rejects missing or
-mixed shard generations. Training configs also fingerprint each shard, so an old
-checkpoint is never silently reused after data or hyperparameters change.
+The canonical HDF5 embeds its source identity and conversion manifest. The
+launcher verifies that manifest against the current episode-layout source and
+fingerprints the dataset in the generated training config, so an old checkpoint
+is never silently reused after data or hyperparameters change.

@@ -18,7 +18,7 @@ USER_REAL_ROBOT_ROLLOUT_SOURCE_ROOT_SET=${REAL_ROBOT_ROLLOUT_SOURCE_ROOT+x}
 first_arg=${1:-}
 first_arg=${first_arg,,}
 first_arg=${first_arg//-/_}
-if [[ "$first_arg" == "square" || "$first_arg" == "can" || "$first_arg" == "transport" || "$first_arg" == "tool_hang" || "$first_arg" == "pick_cup" || "$first_arg" == "stack_cup" ]]; then
+if [[ "$first_arg" == "square" || "$first_arg" == "can" || "$first_arg" == "transport" || "$first_arg" == "tool_hang" || "$first_arg" == "pick_cup" || "$first_arg" == "stack_cup" || "$first_arg" == "move_spoon" ]]; then
   TASK=$first_arg
   shift
 fi
@@ -31,6 +31,7 @@ TASK_CHUNK_CONDITION_HIDDEN_DIM=256
 TASK_DEFAULT_IDQL_REWARD_MODE=task
 TASK_REAL_ROBOT=0
 TASK_REAL_ROBOT_HUMAN_DATASETS=
+TASK_REAL_ROBOT_HUMAN_SOURCE_ROOT=
 TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=
 TASK_REAL_ROBOT_ROLLOUT_BUILDER=
 TASK_REAL_ROBOT_CONVERTED_HUMAN_DATASET=
@@ -38,6 +39,8 @@ TASK_REAL_ROBOT_MIXED_BUILDER=
 TASK_REAL_ROBOT_VALIDATION_DATASET=
 TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=-1
 TASK_REAL_ROBOT_MAX_DYNAMICS_GAP_SEC=
+TASK_CHUNK_RISE_V2_DENSE_DYNAMICS=1
+TASK_CHUNK_DYNAMICS_PREDICTION_OFFSETS="2 4 6 8"
 
 case "$TASK" in
   square)
@@ -139,46 +142,50 @@ case "$TASK" in
     TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     ;;
   pick_cup)
-    TASK_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_50.pth
-    TASK_EXPERT_DATASET=datasets/real_robot/pick_cup/round1_rgb.hdf5
-    TASK_ROLLOUT_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_epoch200_20hz_rollouts.hdf5
-    TASK_IDQL_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_65demo_23success_11failure_terminal_success.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/idql/65demo_23success_11failure_terminal_success
-    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/chunk_idql/65demo_23success_11failure_h8_dynamics_human_condition_terminal_success
+    TASK_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_200.pth
+    TASK_EXPERT_DATASET=datasets/real_robot/pick_cup/pick_cup_rgb.hdf5
+    TASK_ROLLOUT_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_episode_layout_v1_request_rollouts.hdf5
+    TASK_IDQL_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_episode_layout_v1_45demo_23success_11failure_terminal_success.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/idql/45demo_23success_11failure_terminal_success
+    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/chunk_idql/45demo_23success_11failure_h8_episode_layout_v1_human_stride1_dynamics_offsets4_8_human_condition_terminal_success
     TASK_EXPERT_MASK=train
-    TASK_EXPERT_COUNT=65
+    TASK_EXPERT_COUNT=45
     TASK_SUCCESS_MASK=success_train
     TASK_SUCCESS_COUNT=23
     TASK_FAILURE_MASK=failure_train
     TASK_FAILURE_COUNT=11
     TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
-    TASK_CHUNK_EPOCHS=25
+    TASK_CHUNK_EPOCHS=50
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
-    TASK_CHUNK_EVAL_OUTPUT=rollouts/real_robot/pick_cup/chunk_idql/65demo_23success_11failure_h8_dynamics_human_condition_terminal_success
+    TASK_CHUNK_EVAL_OUTPUT=rollouts/real_robot/pick_cup/chunk_idql/45demo_23success_11failure_h8_episode_layout_v1_human_stride1_dynamics_offsets4_8_human_condition_terminal_success
     TASK_COMPOSED_DP_CHECKPOINT=$TASK_DP_CHECKPOINT
-    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/real_robot/pick_cup/chunk_idql/65demo_23success_11failure_h8_dynamics_human_condition_terminal_success_epoch200_actor
+    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/real_robot/pick_cup/chunk_idql/45demo_23success_11failure_h8_episode_layout_v1_human_stride1_dynamics_offsets4_8_human_condition_terminal_success_epoch200_actor
     TASK_EVAL_HORIZON=400
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
     TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     TASK_REAL_ROBOT=1
-    TASK_REAL_ROBOT_HUMAN_DATASETS="datasets/real_robot/pick_cup/round1_rgb.hdf5 datasets/real_robot/pick_cup/round2_rgb.hdf5"
-    TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets/pick_cup/rollout
-    TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_pick_cup_rollout_hdf5.py
+    TASK_CHUNK_RISE_V2_DENSE_DYNAMICS=1
+    TASK_CHUNK_DYNAMICS_PREDICTION_OFFSETS="4 8"
+    TASK_REAL_ROBOT_CONVERTED_HUMAN_DATASET=datasets/real_robot/pick_cup/pick_cup_rgb.hdf5
+    TASK_REAL_ROBOT_HUMAN_DATASETS=$TASK_REAL_ROBOT_CONVERTED_HUMAN_DATASET
+    TASK_REAL_ROBOT_HUMAN_SOURCE_ROOT=/home/ryan/datasets_new/pick_cup/human
+    TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets_new/pick_cup/rollout
+    TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_episode_layout_idql_sources.py
     TASK_REAL_ROBOT_MIXED_BUILDER=scripts/real_robot/build_pick_cup_chunk_idql_dataset.py
-    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_validation_10demo_6success_3failure_terminal_success.hdf5
-    TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=4371
+    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_chunk_idql_episode_layout_v1_validation_5demo_6success_3failure_terminal_success.hdf5
+    TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=1612
     ;;
   stack_cup)
     TASK_DP_CHECKPOINT=trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260902111545/models/model_epoch_200.pth
     TASK_EXPERT_DATASET=datasets/real_robot/stack_cup/stack_cup_rgb.hdf5
-    TASK_ROLLOUT_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_epoch200_ddim100_request_v3_rollouts.hdf5
-    TASK_IDQL_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_request_v3_44demo_20success_10failure_ddim100_terminal_success.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/idql/44demo_20success_10failure_ddim100_terminal_success
-    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/chunk_idql/44demo_20success_10failure_ddim100_h8_request_v3_human_stride1_dynamics_offsets4_8_human_success_condition_terminal_success
+    TASK_ROLLOUT_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_episode_layout_v1_request_rollouts.hdf5
+    TASK_IDQL_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_episode_layout_v1_45demo_20success_10failure_terminal_success.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/idql/45demo_20success_10failure_terminal_success
+    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/chunk_idql/45demo_20success_10failure_h8_episode_layout_v1_human_stride1_dynamics_offsets4_8_human_success_condition_terminal_success
     TASK_EXPERT_MASK=train
-    TASK_EXPERT_COUNT=44
+    TASK_EXPERT_COUNT=45
     TASK_SUCCESS_MASK=success_train
     TASK_SUCCESS_COUNT=20
     TASK_FAILURE_MASK=failure_train
@@ -188,23 +195,62 @@ case "$TASK" in
     TASK_CRITIC_GROUP_NORM=0
     TASK_VF_ENCODER_FREEZE_STEPS=1000
     TASK_ENCODER_FREEZE_STEPS=1000
-    TASK_CHUNK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/chunk_idql/44demo_20success_10failure_ddim100_h8_request_v3_human_stride1_dynamics_offsets4_8_human_success_condition_terminal_success
+    TASK_CHUNK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/chunk_idql/45demo_20success_10failure_h8_episode_layout_v1_human_stride1_dynamics_offsets4_8_human_success_condition_terminal_success
     TASK_COMPOSED_DP_CHECKPOINT=$TASK_DP_CHECKPOINT
-    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/chunk_idql/44demo_20success_10failure_ddim100_h8_request_v3_human_stride1_dynamics_offsets4_8_human_success_condition_terminal_success_epoch200_actor
+    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/chunk_idql/45demo_20success_10failure_h8_episode_layout_v1_human_stride1_dynamics_offsets4_8_human_success_condition_terminal_success_epoch200_actor
     TASK_EVAL_HORIZON=600
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
     TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     TASK_REAL_ROBOT=1
-    TASK_REAL_ROBOT_CONVERTED_HUMAN_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_proposal_v3_human.hdf5
+    TASK_CHUNK_RISE_V2_DENSE_DYNAMICS=1
+    TASK_CHUNK_DYNAMICS_PREDICTION_OFFSETS="4 8"
+    TASK_REAL_ROBOT_CONVERTED_HUMAN_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_episode_layout_v1_human.hdf5
     TASK_REAL_ROBOT_HUMAN_DATASETS=$TASK_REAL_ROBOT_CONVERTED_HUMAN_DATASET
-    TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets/stack_cup/rollout
-    TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_stack_cup_processed_rollout_hdf5.py
+    TASK_REAL_ROBOT_HUMAN_SOURCE_ROOT=/home/ryan/datasets_new/stack_cup/human
+    TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets_new/stack_cup/rollout
+    TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_episode_layout_idql_sources.py
     TASK_REAL_ROBOT_MIXED_BUILDER=scripts/real_robot/build_stack_cup_chunk_idql_dataset.py
-    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_request_v3_validation_5demo_6success_4failure_ddim100_terminal_success.hdf5
-    TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=1538
+    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_chunk_idql_episode_layout_v1_validation_5demo_6success_4failure_terminal_success.hdf5
+    TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=2325
+    ;;
+  move_spoon)
+    TASK_DP_CHECKPOINT=trained_models/real_robot/move_spoon_rgb_dp/move_spoon_rgb_dp_ddim_s1/20260903104112/models/model_epoch_200.pth
+    TASK_EXPERT_DATASET=datasets/real_robot/move_spoon/move_spoon_rgb.hdf5
+    TASK_ROLLOUT_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_episode_layout_v1_request_rollouts.hdf5
+    TASK_IDQL_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_chunk_idql_episode_layout_v1_45demo_20success_11failure_terminal_success.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/idql/45demo_20success_11failure_terminal_success
+    TASK_CHUNK_IDQL_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/chunk_idql/45demo_20success_11failure_h8_episode_layout_v1_human_stride1_dynamics_offsets4_8_human_success_condition_terminal_success
+    TASK_EXPERT_MASK=train
+    TASK_EXPERT_COUNT=45
+    TASK_SUCCESS_MASK=success_train
+    TASK_SUCCESS_COUNT=20
+    TASK_FAILURE_MASK=failure_train
+    TASK_FAILURE_COUNT=11
+    TASK_CHUNK_INITIALIZATION=pretrained_dp_joint
+    TASK_CHUNK_EPOCHS=50
+    TASK_CRITIC_GROUP_NORM=0
+    TASK_VF_ENCODER_FREEZE_STEPS=1000
+    TASK_ENCODER_FREEZE_STEPS=1000
+    TASK_CHUNK_EVAL_OUTPUT=rollouts/real_robot/move_spoon/chunk_idql/45demo_20success_11failure_h8_episode_layout_v1_human_stride1_dynamics_offsets4_8_human_success_condition_terminal_success
+    TASK_COMPOSED_DP_CHECKPOINT=$TASK_DP_CHECKPOINT
+    TASK_COMPOSED_CHUNK_EVAL_OUTPUT=rollouts/real_robot/move_spoon/chunk_idql/45demo_20success_11failure_h8_episode_layout_v1_human_stride1_dynamics_offsets4_8_human_success_condition_terminal_success_epoch200_actor
+    TASK_EVAL_HORIZON=600
+    TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
+    TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
+    TASK_REAL_ROBOT=1
+    TASK_CHUNK_RISE_V2_DENSE_DYNAMICS=1
+    TASK_CHUNK_DYNAMICS_PREDICTION_OFFSETS="4 8"
+    TASK_REAL_ROBOT_CONVERTED_HUMAN_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_episode_layout_v1_human.hdf5
+    TASK_REAL_ROBOT_HUMAN_DATASETS=$TASK_REAL_ROBOT_CONVERTED_HUMAN_DATASET
+    TASK_REAL_ROBOT_HUMAN_SOURCE_ROOT=/home/ryan/datasets_new/move_spoon/human
+    TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets_new/move_spoon/rollout
+    TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_episode_layout_idql_sources.py
+    TASK_REAL_ROBOT_MIXED_BUILDER=scripts/real_robot/build_move_spoon_chunk_idql_dataset.py
+    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_chunk_idql_episode_layout_v1_validation_5demo_5success_4failure_terminal_success.hdf5
+    TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=2077
     ;;
   *)
-    echo "Unsupported TASK=$TASK. Use square, can, transport, tool_hang, pick_cup, or stack_cup." >&2
+    echo "Unsupported TASK=$TASK. Use square, can, transport, tool_hang, pick_cup, stack_cup, or move_spoon." >&2
     exit 2
     ;;
 esac
@@ -227,7 +273,7 @@ case "$TASK" in
     TASK_COLLECTION_CAMERA_SIZE=240
     TASK_COLLECTION_RGB_TAG=rgb2
     ;;
-  pick_cup|stack_cup)
+  pick_cup|stack_cup|move_spoon)
     # These values only keep generic launcher defaults well-formed. Real-robot
     # evaluation and collection use the dedicated deployment stack and are
     # rejected below rather than entering the robomimic simulation pipeline.
@@ -285,6 +331,7 @@ DP_CHECKPOINT=${DP_CHECKPOINT:-$TASK_DP_CHECKPOINT}
 EXPERT_DATASET=${EXPERT_DATASET:-$TASK_EXPERT_DATASET}
 ROLLOUT_DATASET=${ROLLOUT_DATASET:-$TASK_ROLLOUT_DATASET}
 REAL_ROBOT_HUMAN_DATASETS=${REAL_ROBOT_HUMAN_DATASETS:-$TASK_REAL_ROBOT_HUMAN_DATASETS}
+REAL_ROBOT_HUMAN_SOURCE_ROOT=${REAL_ROBOT_HUMAN_SOURCE_ROOT:-$TASK_REAL_ROBOT_HUMAN_SOURCE_ROOT}
 REAL_ROBOT_ROLLOUT_SOURCE_ROOT=${REAL_ROBOT_ROLLOUT_SOURCE_ROOT:-$TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT}
 REAL_ROBOT_CONVERTED_HUMAN_DATASET=${REAL_ROBOT_CONVERTED_HUMAN_DATASET:-$TASK_REAL_ROBOT_CONVERTED_HUMAN_DATASET}
 REAL_ROBOT_VALIDATION_DATASET=${REAL_ROBOT_VALIDATION_DATASET:-$TASK_REAL_ROBOT_VALIDATION_DATASET}
@@ -386,8 +433,8 @@ CHUNK_INITIALIZATION=${CHUNK_INITIALIZATION:-$TASK_CHUNK_INITIALIZATION}
 CHUNK_CONDITIONED_ACTOR=${CHUNK_CONDITIONED_ACTOR:-1}
 TRAIN_ACTOR_ONLY=${TRAIN_ACTOR_ONLY:-0}
 CHUNK_RISE_V2_FUSION_MODE=${CHUNK_RISE_V2_FUSION_MODE:-film}
-CHUNK_RISE_V2_DENSE_DYNAMICS=${CHUNK_RISE_V2_DENSE_DYNAMICS:-1}
-CHUNK_DYNAMICS_PREDICTION_OFFSETS=${CHUNK_DYNAMICS_PREDICTION_OFFSETS:-2 4 6 8}
+CHUNK_RISE_V2_DENSE_DYNAMICS=${CHUNK_RISE_V2_DENSE_DYNAMICS:-$TASK_CHUNK_RISE_V2_DENSE_DYNAMICS}
+CHUNK_DYNAMICS_PREDICTION_OFFSETS=${CHUNK_DYNAMICS_PREDICTION_OFFSETS:-$TASK_CHUNK_DYNAMICS_PREDICTION_OFFSETS}
 
 # critic choice
 case "$CHUNK_CRITIC_ARCHITECTURE" in
@@ -895,6 +942,10 @@ ensure_real_robot_rollout_dataset() {
   local -a temporal_args=()
   local -a related_output_args=()
   local -a overwrite_args=()
+  local -a source_contract_args=()
+  if [[ -n "$REAL_ROBOT_HUMAN_SOURCE_ROOT" ]]; then
+    source_contract_args=(--task "$TASK" --human-source-root "$REAL_ROBOT_HUMAN_SOURCE_ROOT")
+  fi
   if [[ -n "$REAL_ROBOT_MAX_DYNAMICS_GAP_SEC" ]]; then
     temporal_args=(--max-dynamics-gap-sec "$REAL_ROBOT_MAX_DYNAMICS_GAP_SEC")
   fi
@@ -905,6 +956,7 @@ ensure_real_robot_rollout_dataset() {
     if [[ "${REAL_ROBOT_ROLLOUT_OUTPUT_ONLY_VALIDATION:-0}" == "1" ]]; then
       echo "[rgb_dp_chunk_idql task=$TASK] output-only rollout validation was explicitly requested: $ROLLOUT_DATASET" >&2
       "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
+        "${source_contract_args[@]}" \
         --output "$ROLLOUT_DATASET" \
         "${related_output_args[@]}" \
         "${temporal_args[@]}" \
@@ -912,6 +964,7 @@ ensure_real_robot_rollout_dataset() {
     elif [[ -d "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" || -n "$USER_REAL_ROBOT_ROLLOUT_SOURCE_ROOT_SET" ]]; then
       echo "[rgb_dp_chunk_idql task=$TASK] validating converted rollout provenance: $ROLLOUT_DATASET" >&2
       "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
+        "${source_contract_args[@]}" \
         --source-root "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" \
         --output "$ROLLOUT_DATASET" \
         "${related_output_args[@]}" \
@@ -920,6 +973,7 @@ ensure_real_robot_rollout_dataset() {
     else
       echo "[rgb_dp_chunk_idql task=$TASK] raw rollout source is unavailable; validating the HDF5 and its embedded immutable manifest: $ROLLOUT_DATASET" >&2
       "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
+        "${source_contract_args[@]}" \
         --output "$ROLLOUT_DATASET" \
         "${related_output_args[@]}" \
         "${temporal_args[@]}" \
@@ -937,6 +991,7 @@ ensure_real_robot_rollout_dataset() {
   fi
   echo "[rgb_dp_chunk_idql task=$TASK] converting real-robot rollouts: $ROLLOUT_DATASET" >&2
   "$PYTHON" -B "$TASK_REAL_ROBOT_ROLLOUT_BUILDER" \
+    "${source_contract_args[@]}" \
     --source-root "$REAL_ROBOT_ROLLOUT_SOURCE_ROOT" \
     --output "$ROLLOUT_DATASET" \
     "${related_output_args[@]}" \
@@ -964,6 +1019,9 @@ run_real_robot_mixed_builder() {
     echo "REAL_ROBOT_HUMAN_DATASETS must contain at least one human HDF5 path." >&2
     exit 2
   fi
+  # The episode-layout converter creates both the rollout source and the
+  # canonical human source. Run it before checking the human output path.
+  ensure_real_robot_rollout_dataset
   for dataset_path in "${human_datasets[@]}"; do
     if [[ ! -f "$dataset_path" || ! -s "$dataset_path" ]]; then
       echo "[rgb_dp_chunk_idql task=$TASK] human dataset does not exist or is empty: $dataset_path" >&2
@@ -971,7 +1029,6 @@ run_real_robot_mixed_builder() {
     fi
     human_args+=(--human-dataset "$dataset_path")
   done
-  ensure_real_robot_rollout_dataset
   if [[ "$validation_only" == "1" || ( -f "$IDQL_DATASET" && "${OVERWRITE_DATASET:-0}" != "1" && "${OVERWRITE_ROLLOUT_DATASET:-0}" != "1" ) ]]; then
     mode_args=(--validate-only)
   elif [[ "${OVERWRITE_DATASET:-0}" == "1" || "${OVERWRITE_ROLLOUT_DATASET:-0}" == "1" ]]; then
@@ -1749,7 +1806,7 @@ case "$STAGE" in
     ;;
 
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang|pick_cup|stack_cup] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_recap_actor_grid_resilient|eval_recap_condition_ablation_grid_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang|pick_cup|stack_cup|move_spoon] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_recap_actor_grid_resilient|eval_recap_condition_ablation_grid_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
     exit 2
     ;;
 esac

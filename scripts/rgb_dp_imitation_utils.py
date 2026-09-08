@@ -134,6 +134,11 @@ def configure_actor_optimizer(
         )
 
 
+def set_actor_obs_encoder_trainable(actor_algo, trainable: bool) -> None:
+    """Freeze only the online actor encoder; the diffusion U-Net keeps training."""
+    actor_algo.nets["policy"]["obs_encoder"].requires_grad_(bool(trainable))
+
+
 def actor_trainability_summary(actor_algo) -> dict[str, Any]:
     policy = actor_algo.nets["policy"]
     obs_encoder = policy["obs_encoder"]
@@ -382,6 +387,7 @@ __all__ = [
     "build_actor_loader",
     "configure_actor_optimizer",
     "initialize_actor_from_deployed_ema",
+    "set_actor_obs_encoder_trainable",
     "jsonable",
     "write_json",
 ]

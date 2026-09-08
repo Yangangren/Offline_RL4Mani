@@ -29,6 +29,7 @@ from rgb_dp_imitation_utils import (
     build_actor_loader,
     configure_actor_optimizer,
     initialize_actor_from_deployed_ema,
+    set_actor_obs_encoder_trainable,
     jsonable,
     write_json,
 )
@@ -89,6 +90,7 @@ def save_policy_checkpoint(
     global_step: int,
     history: list[dict],
     mode_name: str,
+    actor_obs_encoder_freeze_steps: int,
     distributed_context: DistributedContext,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,6 +103,7 @@ def save_policy_checkpoint(
         "self_imitation": True,
         "posttrain_mode": str(mode_name),
         "success_conditioned": str(mode_name) == "success_conditioned_mixed_quality_imitation_learning",
+        "actor_obs_encoder_freeze_steps": int(actor_obs_encoder_freeze_steps),
         "distributed_training": {
             "enabled": bool(distributed_context.enabled),
             "world_size": int(distributed_context.world_size),
@@ -269,6 +272,7 @@ def make_summary(
             "num_train_batches": int(policy_optim.num_train_batches),
             "num_epochs": int(policy_optim.num_epochs),
             "batch_size": int(actor_config.train.batch_size),
+            "obs_encoder_freeze_steps": int(args.actor_obs_encoder_freeze_steps),
             "seed": int(actor_config.train.seed),
         },
         "actor_normalization": {
@@ -440,7 +444,15 @@ def train(args: argparse.Namespace) -> dict:
         ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
         if "model" not in ckpt:
             raise ValueError(f"resume checkpoint is not a robomimic policy checkpoint: {args.resume_checkpoint}")
-        saved_distributed = (ckpt.get("variable_state", {}) or {}).get(
+        variable_state = ckpt.get("variable_state", {}) or {}
+        saved_freeze_steps = int(variable_state.get("actor_obs_encoder_freeze_steps", 0))
+        if saved_freeze_steps != int(args.actor_obs_encoder_freeze_steps):
+            raise ValueError(
+                "actor observation-encoder freeze schedule must match on resume: "
+                f"checkpoint={saved_freeze_steps} "
+                f"requested={args.actor_obs_encoder_freeze_steps}"
+            )
+        saved_distributed = variable_state.get(
             "distributed_training",
             {},
         )
@@ -464,7 +476,6 @@ def train(args: argparse.Namespace) -> dict:
             num_epochs=args.epochs,
             preserve_current_lr=True,
         )
-        variable_state = ckpt.get("variable_state", {}) or {}
         start_epoch = int(variable_state.get("epoch", 0))
         global_step = int(variable_state.get("global_step", start_epoch * int(args.steps_per_epoch)))
         summary_path = args.output_dir / "partial_summary.json"
@@ -529,6 +540,7 @@ def train(args: argparse.Namespace) -> dict:
                         ),
                         "batch_size": int(args.actor_batch_size),
                         "seed": int(args.seed),
+                        "obs_encoder_freeze_steps": int(args.actor_obs_encoder_freeze_steps),
                         "steps_per_epoch": int(args.steps_per_epoch),
                         "steps_per_epoch_source": str(args.steps_per_epoch_source),
                         "actor_dataset_size": int(len(actor_dataset)),
@@ -593,6 +605,13 @@ def train(args: argparse.Namespace) -> dict:
             except StopIteration:
                 actor_iterator = iter(actor_loader)
                 actor_batch = next(actor_iterator)
+            actor_obs_encoder_trainable = (
+                global_step >= int(args.actor_obs_encoder_freeze_steps)
+            )
+            set_actor_obs_encoder_trainable(
+                actor_algo,
+                actor_obs_encoder_trainable,
+            )
             global_step += 1
             if synchronize_training_buffers:
                 broadcast_module_buffers(synchronized_modules, distributed)
@@ -604,6 +623,9 @@ def train(args: argparse.Namespace) -> dict:
                 materialize_log=distributed.is_main_process,
             )
             if distributed.is_main_process:
+                actor_log["Actor/Obs_Encoder_Trainable"] = float(
+                    actor_obs_encoder_trainable
+                )
                 epoch_logs.append(actor_log)
             if distributed.is_main_process and global_step % int(args.log_every) == 0:
                 payload = {"epoch": int(epoch), "global_step": int(global_step)}
@@ -644,6 +666,7 @@ def train(args: argparse.Namespace) -> dict:
                 global_step=global_step,
                 history=history,
                 mode_name=infer_mode_name(args),
+                actor_obs_encoder_freeze_steps=args.actor_obs_encoder_freeze_steps,
                 distributed_context=distributed,
             )
 
@@ -667,6 +690,7 @@ def train(args: argparse.Namespace) -> dict:
                     history=history,
                     mode_name=infer_mode_name(args),
                     distributed_context=distributed,
+                    actor_obs_encoder_freeze_steps=args.actor_obs_encoder_freeze_steps,
                 )
             shutil.copyfile(latest, args.output_dir / "last_bak.pth")
             last_checkpoint = latest
@@ -813,6 +837,15 @@ def main() -> None:
         help="Defaults to the policy learning rate from the pretrained DP checkpoint.",
     )
     parser.add_argument(
+        "--actor-obs-encoder-freeze-steps",
+        type=int,
+        default=0,
+        help=(
+            "Freeze only the online actor observation encoder for this many "
+            "optimizer updates; the diffusion U-Net continues training."
+        ),
+    )
+    parser.add_argument(
         "--actor-disable-lr-scheduler",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -825,6 +858,9 @@ def main() -> None:
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tensorboard-dir", type=Path, default=None)
     args = parser.parse_args()
+
+    if args.actor_obs_encoder_freeze_steps < 0:
+        parser.error("actor-obs-encoder-freeze-steps must be non-negative")
 
     for key in ("checkpoint", "demo_dataset", "success_dataset", "failure_dataset", "output_dir"):
         setattr(args, key, getattr(args, key).resolve())

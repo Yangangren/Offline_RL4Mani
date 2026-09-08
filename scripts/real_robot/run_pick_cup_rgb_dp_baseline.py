@@ -22,26 +22,15 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.real_robot.build_pick_cup_dataset import (  # noqa: E402
-    BuildOptions,
-    build_datasets,
-)
+from scripts.real_robot import build_episode_layout_idql_sources as DatasetBuilder  # noqa: E402
 from scripts.real_robot.pick_cup_common import (  # noqa: E402
     DEFAULT_CROP_HEIGHT,
     DEFAULT_CROP_WIDTH,
-    DEFAULT_DATASET_DIR,
     DEFAULT_IMAGE_HEIGHT,
     DEFAULT_IMAGE_WIDTH,
-    DEFAULT_MAX_IMAGE_AGE_SEC,
-    DEFAULT_SOURCE,
-    CONVERSION_MANIFEST_ATTR,
     LOW_DIM_KEYS,
     RGB_KEYS,
     atomic_write_json,
-    round_paths,
-)
-from scripts.real_robot.validate_pick_cup_dataset import (  # noqa: E402
-    validate_published_datasets,
 )
 
 
@@ -52,6 +41,12 @@ PYTHON = Path(
     )
 )
 TEMPLATE = ROOT / "robomimic/exps/templates/diffusion_policy.json"
+PROFILE = DatasetBuilder.TASK_PROFILES["pick_cup"]
+DEFAULT_SOURCE = PROFILE.human_source_root
+DEFAULT_DATASET_DIR = PROFILE.human_output.parent
+DEFAULT_DATASET = PROFILE.human_output
+DEFAULT_MAX_IMAGE_AGE_SEC = PROFILE.max_human_image_age_sec
+CONVERSION_MANIFEST_ATTR = DatasetBuilder.MANIFEST_ATTR
 DEFAULT_CONFIG_DIR = ROOT / "robomimic/exps/templates/real_robot/pick_cup"
 DEFAULT_MODEL_ROOT = ROOT / "trained_models/real_robot/pick_cup_rgb_dp"
 
@@ -76,7 +71,7 @@ class TrainingOptions:
     sampler: str = "ddim"
     ddim_steps: int = 10
     seed: int = 1
-    epochs: int = 250
+    epochs: int = 200
     steps_per_epoch: int = 100
     validation_steps: int = 10
     batch_size: int = 64
@@ -226,14 +221,15 @@ def make_config(
     config["experiment"]["validation_epoch_every_n_steps"] = validation_steps
     config["experiment"]["ckpt_path"] = None
 
-    shard_paths = round_paths(options.dataset_dir.expanduser().resolve())
+    dataset_path = (
+        options.dataset_dir.expanduser().resolve() / DEFAULT_DATASET.name
+    )
     config["train"]["data"] = [
         {
-            "path": str(path),
+            "path": str(dataset_path),
             "weight": 1.0,
-            "dataset_fingerprint": dataset_fingerprint(path),
+            "dataset_fingerprint": dataset_fingerprint(dataset_path),
         }
-        for path in shard_paths
     ]
     config["train"]["output_dir"] = str(options.model_root.expanduser().resolve())
     config["train"]["normalize_weights_by_ds_size"] = True
@@ -323,24 +319,20 @@ def standard_loader_preflight(config_dict: dict[str, Any]) -> dict[str, Any]:
     config.lock()
     ObsUtils.initialize_obs_utils_with_config(config)
 
-    signatures = []
-    for dataset_config in config.train.data:
-        signature = FileUtils.get_shape_metadata_from_dataset(
-            dataset_config=dataset_config,
-            action_keys=config.train.action_keys,
-            all_obs_keys=config.all_obs_keys,
-            verbose=False,
-        )
-        signatures.append(
-            {
-                "ac_dim": int(signature["ac_dim"]),
-                "all_shapes": {
-                    key: list(value) for key, value in signature["all_shapes"].items()
-                },
-            }
-        )
-    if signatures[0] != signatures[1]:
-        raise ValueError("round shards expose different loader schemas")
+    if len(config.train.data) != 1:
+        raise ValueError("PickCup baseline requires exactly one dataset shard")
+    signature = FileUtils.get_shape_metadata_from_dataset(
+        dataset_config=config.train.data[0],
+        action_keys=config.train.action_keys,
+        all_obs_keys=config.all_obs_keys,
+        verbose=False,
+    )
+    public_signature = {
+        "ac_dim": int(signature["ac_dim"]),
+        "all_shapes": {
+            key: list(value) for key, value in signature["all_shapes"].items()
+        },
+    }
 
     trainset, validset = TrainUtils.load_data_for_training(
         config,
@@ -370,21 +362,11 @@ def standard_loader_preflight(config_dict: dict[str, Any]) -> dict[str, Any]:
                         f"{label} loader {key} sample has invalid shape/content"
                     )
 
-        sampler = trainset.get_dataset_sampler()
-        weights = np.asarray(sampler.weights, dtype=np.float64)
-        bins = np.asarray(trainset._ds_ind_bins, dtype=np.int64)
-        masses = [
-            float(np.sum(weights[start:end]))
-            for start, end in zip(bins[:-1], bins[1:])
-        ]
-        if not np.allclose(masses, masses[0], rtol=1e-6, atol=1e-9):
-            raise ValueError(f"round sampling mass is not balanced: {masses}")
         return {
             "validated": True,
-            "schema": signatures[0],
+            "schema": public_signature,
             "train_sequences": int(len(trainset)),
             "valid_sequences": int(len(validset)),
-            "round_sampling_mass": masses,
             "sample_action_shape": list(train_sample["actions"].shape),
         }
     finally:
@@ -579,8 +561,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_WIDTH)
     parser.add_argument("--crop-height", type=int, default=DEFAULT_CROP_HEIGHT)
     parser.add_argument("--crop-width", type=int, default=DEFAULT_CROP_WIDTH)
-    parser.add_argument("--validation-count-per-round", type=int, default=5)
-    parser.add_argument("--split-seed", type=int, default=1)
     parser.add_argument(
         "--max-image-age-sec",
         type=float,
@@ -610,25 +590,80 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def validate_episode_layout_dataset(
+    dataset: Path,
+    *,
+    source_root: Path,
+) -> dict[str, Any]:
+    """Validate the canonical human HDF5 and its immutable source identity."""
+
+    records, identity = DatasetBuilder.discover_episodes(
+        source_root,
+        kind="human",
+        profile=PROFILE,
+    )
+    report = DatasetBuilder.validate_output(
+        dataset,
+        kind="human",
+        profile=PROFILE,
+    )
+    with h5py.File(dataset, "r") as handle:
+        manifest = json.loads(
+            DatasetBuilder._text(handle.attrs[CONVERSION_MANIFEST_ATTR])
+        )
+        if manifest.get("source_identity") != identity:
+            raise DatasetBuilder.ProposalConversionError(
+                f"{dataset}: source identity changed"
+            )
+        first = handle["data"][sorted(handle["data"].keys())[0]]
+        image_shape = list(first["obs/main_image"].shape[1:])
+        action_dim = int(first["actions"].shape[-1])
+    if len(records) != PROFILE.expected_humans:
+        raise AssertionError("source-backed validation lost human episodes")
+    return {
+        **report,
+        "source_backed": True,
+        "schema_signature": {
+            "image_shape": image_shape,
+            "action_dim": action_dim,
+            "rgb_keys": list(RGB_KEYS),
+            "low_dim_keys": list(LOW_DIM_KEYS),
+        },
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     args = parse_args(argv)
     source = args.source.expanduser().resolve()
     dataset_dir = args.dataset_dir.expanduser().resolve()
     options = _training_options(args)
+    dataset = dataset_dir / DEFAULT_DATASET.name
     report: dict[str, Any] = {}
 
     if "dataset" in args.stages:
-        report["dataset"] = build_datasets(
-            BuildOptions(
-                source_root=source,
-                output_dir=dataset_dir,
-                image_height=args.image_height,
-                image_width=args.image_width,
-                validation_count_per_round=args.validation_count_per_round,
-                split_seed=args.split_seed,
-                max_image_age_sec=args.max_image_age_sec,
+        if (args.image_height, args.image_width) != (
+            DEFAULT_IMAGE_HEIGHT,
+            DEFAULT_IMAGE_WIDTH,
+        ):
+            raise ValueError("episode-layout RGB is fixed at 96x128")
+        if not np.isclose(
+            args.max_image_age_sec,
+            PROFILE.max_human_image_age_sec,
+            atol=1e-12,
+            rtol=0.0,
+        ):
+            raise ValueError(
+                "PickCup uses the profile image-age limit "
+                f"{PROFILE.max_human_image_age_sec:.1f}s"
+            )
+        report["dataset"] = DatasetBuilder.build_dataset(
+            DatasetBuilder.BuildOptions(
+                task="pick_cup",
+                human_source_root=source,
+                human_output=dataset,
                 compression=args.compression,
                 overwrite=args.force_dataset,
+                source_kind="human",
             )
         )
 
@@ -637,8 +672,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     )
     validation = None
     if needs_validation:
-        validation = validate_published_datasets(
-            dataset_dir,
+        validation = validate_episode_layout_dataset(
+            dataset,
             source_root=source,
         )
         report["validation"] = validation

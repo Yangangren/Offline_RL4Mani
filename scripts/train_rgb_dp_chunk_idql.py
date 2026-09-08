@@ -116,6 +116,11 @@ JOINT_ACTOR_INITIALIZATIONS = frozenset(
 )
 LATEST_CHECKPOINT_NAME = "latest.pt"
 LATEST_CHECKPOINT_TEMP_PREFIX = f".{LATEST_CHECKPOINT_NAME}.tmp-"
+RERANKING_PROXY_VERSION = 1
+RERANKING_SELECTION_METRIC = (
+    "validation/reranking/rollout_outcome_advantage_auc"
+)
+RERANKING_CHECKPOINT_NAME = "best_reranking.pt"
 
 
 def checkpoint_for_unfiltered_mixed_dataset(dp_checkpoint: dict) -> dict:
@@ -515,6 +520,7 @@ SAMPLE_SCALED_STEP_FIELDS = (
     "dynamics_warmup_steps",
     "encoder_freeze_steps",
     "vf_encoder_freeze_steps",
+    "reranking_min_post_warmup_steps",
 )
 
 
@@ -553,11 +559,16 @@ def configure_batch_semantics(
         float(effective_batch_size) / float(reference_batch_size)
     )
     for field in SAMPLE_SCALED_STEP_FIELDS:
+        reference_steps = getattr(
+            args,
+            field,
+            1_000 if field == "reranking_min_post_warmup_steps" else 0,
+        )
         setattr(
             args,
             f"resolved_{field}",
             batch_scaled_step_count(
-                getattr(args, field),
+                reference_steps,
                 reference_batch_size,
                 effective_batch_size,
             ),
@@ -568,6 +579,32 @@ def configure_batch_semantics(
     args.resolved_target_tau = float(args.target_tau)
     args.resolved_dynamics_target_sync_interval = int(
         args.dynamics_target_sync_interval
+    )
+    critic_startup_boundaries = [
+        int(args.resolved_critic_vf_lr_warmup_steps),
+        int(args.resolved_encoder_freeze_steps),
+        int(args.resolved_vf_encoder_freeze_steps),
+    ]
+    if float(getattr(args, "dynamics_weight", 0.0)) > 0.0:
+        critic_startup_boundaries.append(
+            int(args.resolved_dynamics_warmup_steps)
+        )
+    if str(getattr(args, "initialization", "")) in JOINT_ACTOR_INITIALIZATIONS:
+        critic_startup_boundaries.extend(
+            (
+                int(args.resolved_actor_lr_warmup_steps),
+                int(args.resolved_actor_obs_encoder_freeze_steps),
+            )
+        )
+    args.resolved_reranking_startup_boundary_step = max(
+        critic_startup_boundaries,
+        default=0,
+    )
+    # Do not select a deployment critic immediately when its encoders unfreeze.
+    # Require a full configurable period of mature joint updates afterward.
+    args.resolved_reranking_min_global_step = (
+        int(args.resolved_reranking_startup_boundary_step)
+        + int(args.resolved_reranking_min_post_warmup_steps)
     )
 
 
@@ -760,6 +797,212 @@ class WeightedScalarMetricAccumulator:
         }
 
 
+def binary_ranking_auc(scores, positive_labels) -> float:
+    """Return tie-aware P(score_positive > score_negative).
+
+    This is the Mann-Whitney interpretation of ROC AUC. Keeping the small
+    implementation local avoids adding a scikit-learn dependency to robot
+    training and makes the exact tie behavior explicit.
+    """
+
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    labels = np.asarray(positive_labels).reshape(-1).astype(bool)
+    if scores.shape != labels.shape or scores.size == 0:
+        raise ValueError("ranking AUC scores and labels must be nonempty and aligned")
+    if not np.isfinite(scores).all():
+        raise ValueError("ranking AUC scores must be finite")
+    positive_count = int(labels.sum())
+    negative_count = int(labels.size - positive_count)
+    if positive_count == 0 or negative_count == 0:
+        raise ValueError("ranking AUC requires both positive and negative rows")
+
+    order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
+    sorted_ranks = np.empty(scores.size, dtype=np.float64)
+    start = 0
+    while start < scores.size:
+        end = start + 1
+        while end < scores.size and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        # Ranks are one-indexed; tied values receive their average rank.
+        sorted_ranks[start:end] = 0.5 * ((start + 1) + end)
+        start = end
+    ranks = np.empty_like(sorted_ranks)
+    ranks[order] = sorted_ranks
+    positive_rank_sum = float(ranks[labels].sum())
+    u_statistic = positive_rank_sum - positive_count * (positive_count + 1) / 2.0
+    return float(u_statistic / (positive_count * negative_count))
+
+
+class LoggedActionRerankingAccumulator:
+    """Collect held-out logged-action diagnostics for deployment reranking.
+
+    The primary proxy compares successful and failed *rollout* chunks using
+    min(Q1,Q2)-V. Human rows are still reported, but excluded from the AUROC so
+    the checkpoint cannot win merely by recognizing the human data source.
+    """
+
+    def __init__(self):
+        self._packed_batches: list[np.ndarray] = []
+
+    @torch.no_grad()
+    def update(
+        self,
+        *,
+        q_predictions: torch.Tensor,
+        value: torch.Tensor,
+        mismatched_q_predictions: torch.Tensor,
+        condition_labels: torch.Tensor,
+        source_is_expert: torch.Tensor,
+    ) -> None:
+        if q_predictions.ndim != 2 or q_predictions.shape[1] < 2:
+            raise ValueError(
+                "reranking diagnostics require at least twin [B,C] Q predictions"
+            )
+        if mismatched_q_predictions.shape != q_predictions.shape:
+            raise ValueError("logged and mismatched Q predictions must align")
+        rows = int(q_predictions.shape[0])
+        value = value.reshape(rows)
+        condition_labels = condition_labels.reshape(rows).to(q_predictions.device)
+        source_is_expert = source_is_expert.reshape(rows).to(q_predictions.device)
+        for name, labels in (
+            ("condition_labels", condition_labels),
+            ("source_is_expert", source_is_expert),
+        ):
+            if not torch.all((labels == 0) | (labels == 1)):
+                raise ValueError(f"{name} must contain only binary values")
+
+        q_min = q_predictions.min(dim=1).values
+        mismatch_q_min = mismatched_q_predictions.min(dim=1).values
+        twin_gap = q_predictions.max(dim=1).values - q_min
+        packed = torch.stack(
+            (
+                q_min,
+                value,
+                q_min - value,
+                twin_gap,
+                mismatch_q_min,
+                q_min - mismatch_q_min,
+                condition_labels.to(q_min.dtype),
+                source_is_expert.to(q_min.dtype),
+            ),
+            dim=1,
+        )
+        if not torch.isfinite(packed).all():
+            raise ValueError("reranking diagnostics contain non-finite values")
+        self._packed_batches.append(packed.detach().cpu().numpy())
+
+    def metrics(self) -> dict[str, float]:
+        if not self._packed_batches:
+            return {}
+        values = np.concatenate(self._packed_batches, axis=0)
+        q_min, value, advantage, twin_gap, _, mismatch_margin, condition, expert = (
+            values.T
+        )
+        condition = condition >= 0.5
+        expert = expert >= 0.5
+        human = expert
+        rollout_success = (~expert) & condition
+        rollout_failure = (~expert) & (~condition)
+        condition_zero = ~condition
+
+        def preference_rate(mask: np.ndarray) -> float:
+            selected = mismatch_margin[mask]
+            wins = (selected > 0.0).astype(np.float64)
+            ties = (selected == 0.0).astype(np.float64)
+            return float((wins + 0.5 * ties).mean())
+
+        result = {
+            "proxy_version": float(RERANKING_PROXY_VERSION),
+            "windows": float(values.shape[0]),
+            "human_windows": float(human.sum()),
+            "rollout_success_windows": float(rollout_success.sum()),
+            "rollout_failure_windows": float(rollout_failure.sum()),
+            "online_q_min_mean": float(q_min.mean()),
+            "value_mean": float(value.mean()),
+            "advantage_mean": float(advantage.mean()),
+            "online_twin_gap_mean": float(twin_gap.mean()),
+            "logged_over_mismatched_rate": preference_rate(
+                np.ones(values.shape[0], dtype=bool)
+            ),
+            "logged_mismatched_margin_mean": float(mismatch_margin.mean()),
+        }
+
+        def add_group(name: str, mask: np.ndarray) -> None:
+            if not np.any(mask):
+                return
+            result[f"{name}_q_min_mean"] = float(q_min[mask].mean())
+            result[f"{name}_advantage_mean"] = float(advantage[mask].mean())
+            result[f"{name}_twin_gap_mean"] = float(twin_gap[mask].mean())
+            result[f"{name}_logged_over_mismatched_rate"] = preference_rate(mask)
+
+        add_group("human", human)
+        add_group("rollout_success", rollout_success)
+        add_group("rollout_failure", rollout_failure)
+        add_group("condition_1", condition)
+        add_group("condition_0", condition_zero)
+
+        if np.any(condition) and np.any(condition_zero):
+            result["condition_advantage_gap"] = float(
+                advantage[condition].mean() - advantage[condition_zero].mean()
+            )
+            result["condition_advantage_auc"] = binary_ranking_auc(
+                advantage,
+                condition,
+            )
+        rollout_rows = rollout_success | rollout_failure
+        if np.any(rollout_success) and np.any(rollout_failure):
+            rollout_labels = rollout_success[rollout_rows]
+            rollout_advantage = advantage[rollout_rows]
+            rollout_q = q_min[rollout_rows]
+            result["rollout_outcome_advantage_gap"] = float(
+                advantage[rollout_success].mean()
+                - advantage[rollout_failure].mean()
+            )
+            result["rollout_outcome_q_gap"] = float(
+                q_min[rollout_success].mean() - q_min[rollout_failure].mean()
+            )
+            result["rollout_outcome_advantage_auc"] = binary_ranking_auc(
+                rollout_advantage,
+                rollout_labels,
+            )
+            result["rollout_outcome_q_auc"] = binary_ranking_auc(
+                rollout_q,
+                rollout_labels,
+            )
+        return result
+
+
+def best_reranking_record(
+    history: list[dict[str, Any]],
+    *,
+    min_global_step: int,
+) -> dict[str, float | int | str] | None:
+    """Return the best mature held-out reranking record in existing history."""
+
+    best = None
+    for completed_epoch in history:
+        step = int(completed_epoch.get("global_step", -1))
+        metrics = completed_epoch.get("metrics", {})
+        candidate = metrics.get(RERANKING_SELECTION_METRIC)
+        eligible = float(metrics.get("validation/reranking/checkpoint_eligible", 0.0))
+        if (
+            step < int(min_global_step)
+            or eligible < 0.5
+            or candidate is None
+            or not np.isfinite(float(candidate))
+        ):
+            continue
+        if best is None or float(candidate) > float(best["value"]):
+            best = {
+                "metric": RERANKING_SELECTION_METRIC,
+                "value": float(candidate),
+                "epoch": int(completed_epoch.get("epoch", -1)),
+                "global_step": step,
+            }
+    return best
+
+
 @torch.no_grad()
 def materialize_local_scalar_metrics(
     metrics: dict[str, Any],
@@ -802,6 +1045,15 @@ def validate_training_mode(args: argparse.Namespace) -> None:
     """Keep actor-only training explicit and impossible to misconfigure."""
     actor_only = bool(getattr(args, "actor_only", False))
     initialization = str(args.initialization)
+    if int(getattr(args, "reranking_min_post_warmup_steps", 0)) < 0:
+        raise ValueError("reranking_min_post_warmup_steps must be non-negative")
+    actor_loss_degradation = float(
+        getattr(args, "reranking_max_actor_loss_degradation", 0.05)
+    )
+    if not np.isfinite(actor_loss_degradation) or actor_loss_degradation < 0.0:
+        raise ValueError(
+            "reranking_max_actor_loss_degradation must be finite and non-negative"
+        )
     if actor_only:
         if not bool(args.conditioned_actor):
             raise ValueError("actor-only training requires --conditioned-actor")
@@ -3428,6 +3680,44 @@ def source_condition_labels(
     return is_one.to(dtype=torch.float32)
 
 
+def source_expert_labels(
+    raw_batch: dict,
+    *,
+    current_index: int,
+) -> torch.Tensor:
+    """Read binary human-versus-rollout identity at the current transition."""
+
+    batch_size = int(raw_batch["actions"].shape[0])
+    labels_by_time = raw_batch.get("source_is_expert")
+    if labels_by_time is None:
+        raise KeyError(
+            "reranking validation requires source_is_expert in the mixed dataset"
+        )
+    if labels_by_time.ndim < 2 or labels_by_time.shape[1] <= current_index:
+        raise ValueError(
+            "source_is_expert does not contain the current transition at index "
+            f"{current_index}: shape={tuple(labels_by_time.shape)}"
+        )
+    labels = labels_by_time[:, current_index].reshape(batch_size, -1)
+    if labels.shape[1] != 1:
+        raise ValueError(
+            "source_is_expert requires one scalar label per transition, got "
+            f"shape={tuple(labels.shape)}"
+        )
+    labels = labels[:, 0].float()
+    zeros = torch.zeros_like(labels)
+    ones = torch.ones_like(labels)
+    is_zero = torch.isclose(labels, zeros, atol=1e-6, rtol=0.0)
+    is_one = torch.isclose(labels, ones, atol=1e-6, rtol=0.0)
+    if not torch.all(is_zero | is_one):
+        invalid = labels[~(is_zero | is_one)]
+        raise ValueError(
+            "source_is_expert expected values 0 or 1, got "
+            f"values={invalid[:8].detach().cpu().tolist()}"
+        )
+    return is_one.to(dtype=torch.float32)
+
+
 def add_actor_condition(
     actor_batch: dict,
     condition_labels: torch.Tensor,
@@ -4216,6 +4506,7 @@ def compute_rise_v2_chunk_losses(
     use_huber: bool,
     dynamics_weight: float,
     distributed_context: DistributedContext | None = None,
+    collect_reranking_diagnostics: bool = False,
 ) -> tuple[list[torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
     """RISE IQL with causal history, direct fusion, and optional dense JEPA loss."""
     if not critics or len(critics) != len(targets):
@@ -4354,6 +4645,33 @@ def compute_rise_v2_chunk_losses(
     )
     vf_loss = (vf_weight * vf_error.square()).mean()
     q_predictions = torch.cat([output["q"] for output in outputs], dim=1)
+    mismatched_q_predictions = None
+    if collect_reranking_diagnostics:
+        # Pair each held-out state with another row's action chunk while reusing
+        # the exact logged-action state encoding. This cheaply checks whether Q
+        # has learned state-action compatibility instead of only state value. A
+        # one-row final batch necessarily self-pairs and contributes a tied
+        # counterfactual margin, without invalidating the outcome AUROC.
+        shift = max(1, batch_size // 2)
+        permutation = (
+            torch.arange(batch_size, device=device, dtype=torch.long) + shift
+        ) % batch_size
+        mismatched_actions = batch["actions"].index_select(0, permutation)
+        mismatched_action_mask = batch["action_mask"].index_select(
+            0,
+            permutation,
+        )
+        mismatched_q_predictions = torch.cat(
+            [
+                critic.q_from_state(
+                    {"temporal_state": output["temporal_state"]},
+                    mismatched_actions,
+                    mismatched_action_mask,
+                )
+                for critic, output in zip(critics, outputs)
+            ],
+            dim=1,
+        )
 
     if prediction_offsets:
         rows = valid_mask.reshape(-1) > 0.5
@@ -4467,6 +4785,12 @@ def compute_rise_v2_chunk_losses(
         info[f"dynamics/offset_{offset}_valid_count"] = offset_valid_counts[
             offset_index
         ].detach()
+    if collect_reranking_diagnostics:
+        info["_reranking/q_predictions"] = q_predictions.detach()
+        info["_reranking/value"] = vf_pred.detach()
+        info["_reranking/mismatched_q_predictions"] = (
+            mismatched_q_predictions.detach()
+        )
     return critic_losses, vf_loss, info
 
 
@@ -4906,6 +5230,16 @@ def evaluate_validation_epoch(
 ) -> dict[str, float]:
     """Run deterministic, full-coverage held-out evaluation on rank zero."""
     accumulator = WeightedScalarMetricAccumulator(device)
+    reranking_accumulator = (
+        LoggedActionRerankingAccumulator()
+        if (
+            not actor_only
+            and is_rise_v2
+            and bool(args.conditioned_actor)
+            and str(args.actor_condition_mode) == "human_success"
+        )
+        else None
+    )
     batch_count = 0
     window_count = 0
     actor_was_training = bool(actor_algo.nets.training)
@@ -4942,14 +5276,22 @@ def evaluate_validation_epoch(
                 )
                 rows = int(raw_batch["actions"].shape[0])
                 metrics: dict[str, Any] = {}
-                if trains_joint_actor(args):
-                    actor_batch = raw_batch
-                    if args.conditioned_actor:
-                        current_index = int(args.observation_horizon) - 1
-                        condition_labels = source_condition_labels(
+                condition_labels = None
+                source_expert = None
+                if args.conditioned_actor:
+                    current_index = int(args.observation_horizon) - 1
+                    condition_labels = source_condition_labels(
+                        raw_batch,
+                        current_index=current_index,
+                    )
+                    if reranking_accumulator is not None:
+                        source_expert = source_expert_labels(
                             raw_batch,
                             current_index=current_index,
                         )
+                if trains_joint_actor(args):
+                    actor_batch = raw_batch
+                    if args.conditioned_actor:
                         actor_batch = add_actor_condition(
                             actor_batch,
                             condition_labels,
@@ -5015,6 +5357,9 @@ def evaluate_validation_epoch(
                             use_huber=args.use_huber,
                             dynamics_weight=args.dynamics_weight,
                             distributed_context=None,
+                            collect_reranking_diagnostics=(
+                                reranking_accumulator is not None
+                            ),
                         )
                     else:
                         _, _, critic_info = compute_chunk_losses(
@@ -5031,6 +5376,33 @@ def evaluate_validation_epoch(
                                 args.dynamics_cosine_weight
                             ),
                             distributed_context=None,
+                        )
+                    reranking_payload = {
+                        key: critic_info.pop(key)
+                        for key in tuple(critic_info)
+                        if key.startswith("_reranking/")
+                    }
+                    if reranking_accumulator is not None:
+                        expected = {
+                            "_reranking/q_predictions",
+                            "_reranking/value",
+                            "_reranking/mismatched_q_predictions",
+                        }
+                        if set(reranking_payload) != expected:
+                            raise RuntimeError(
+                                "RISE-v2 validation did not return complete "
+                                "reranking diagnostics"
+                            )
+                        reranking_accumulator.update(
+                            q_predictions=reranking_payload[
+                                "_reranking/q_predictions"
+                            ],
+                            value=reranking_payload["_reranking/value"],
+                            mismatched_q_predictions=reranking_payload[
+                                "_reranking/mismatched_q_predictions"
+                            ],
+                            condition_labels=condition_labels,
+                            source_is_expert=source_expert,
                         )
                     metrics.update(critic_info)
                 prefixed = {
@@ -5083,6 +5455,13 @@ def evaluate_validation_epoch(
             )
     result["validation/batches"] = float(batch_count)
     result["validation/windows"] = float(window_count)
+    if reranking_accumulator is not None:
+        result.update(
+            {
+                f"validation/reranking/{key}": value
+                for key, value in reranking_accumulator.metrics().items()
+            }
+        )
     return result
 
 
@@ -6774,7 +7153,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     *[
                         (f"resolved_{field}", int)
                         for field in SAMPLE_SCALED_STEP_FIELDS
-                        if field != "actor_obs_encoder_freeze_steps"
+                        if field
+                        not in (
+                            "actor_obs_encoder_freeze_steps",
+                            "reranking_min_post_warmup_steps",
+                        )
                     ],
                     ("resolved_dynamics_target_sync_interval", int),
                     ("resolved_target_tau", float),
@@ -7640,6 +8023,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "actor_reference_distillation": actor_reference_audit,
         "warm_start": warm_start_audit,
     }
+    reranking_proxy_enabled = bool(
+        validation_loader is not None
+        and not actor_only
+        and is_rise_v2
+        and args.conditioned_actor
+        and str(args.actor_condition_mode) == "human_success"
+    )
     startup = {
         "actor_only": actor_only,
         "critic_trained": not actor_only,
@@ -7709,6 +8099,41 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     if trains_joint_actor(args)
                     else None
                 ),
+                "reranking_proxy": {
+                    "enabled": reranking_proxy_enabled,
+                    "version": RERANKING_PROXY_VERSION,
+                    "selection_metric": (
+                        RERANKING_SELECTION_METRIC
+                        if reranking_proxy_enabled
+                        else None
+                    ),
+                    "selection_direction": "maximize",
+                    "critic_weights": "online_min_over_twin_critics",
+                    "score": "min_Q_minus_V",
+                    "positive_rows": "success_rollout",
+                    "negative_rows": "failure_rollout",
+                    "human_rows_in_primary_auc": False,
+                    "counterfactual": (
+                        "same_encoded_state_with_deterministically_"
+                        "mismatched_validation_action_chunk"
+                    ),
+                    "minimum_global_step": int(
+                        args.resolved_reranking_min_global_step
+                    ),
+                    "startup_boundary_step": int(
+                        args.resolved_reranking_startup_boundary_step
+                    ),
+                    "post_warmup_steps": int(
+                        args.resolved_reranking_min_post_warmup_steps
+                    ),
+                    "max_actor_loss_relative_degradation": float(
+                        args.reranking_max_actor_loss_degradation
+                    ),
+                    "limitation": (
+                        "offline proxy on logged and mismatched chunks; true "
+                        "generated-candidate ranking requires rollout outcomes"
+                    ),
+                },
             }
             if args.validation_dataset is not None
             else {"enabled": False}
@@ -7908,6 +8333,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 args.vf_encoder_freeze_steps
             ),
             "vf_head_freeze_steps": 0,
+            "reranking_min_post_warmup_steps": int(
+                args.reranking_min_post_warmup_steps
+            ),
+            "reranking_min_global_step": int(
+                args.resolved_reranking_min_global_step
+            ),
+            "reranking_max_actor_loss_degradation": float(
+                args.reranking_max_actor_loss_degradation
+            ),
             "q_loss": "huber" if args.use_huber else "mse",
             "max_gradient_norm": (
                 float(args.max_gradient_norm)
@@ -7999,6 +8433,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         ):
             best_validation_loss = float(candidate)
             best_validation_epoch = int(completed_epoch.get("epoch", -1))
+    best_reranking = best_reranking_record(
+        history,
+        min_global_step=int(args.resolved_reranking_min_global_step),
+    )
 
     shared_action_range_validated = False
     for epoch in range(start_epoch + 1, int(args.epochs) + 1):
@@ -8407,6 +8845,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
         validation_metrics: dict[str, float] = {}
         validation_improved = False
+        reranking_improved = False
         if validation_loader is not None:
             validation_metrics = evaluate_validation_epoch(
                 args=args,
@@ -8444,6 +8883,56 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     best_validation_loss = float(selection_loss)
                     best_validation_epoch = int(epoch)
                     validation_improved = True
+            if reranking_proxy_enabled:
+                reranking_candidate = validation_metrics.get(
+                    RERANKING_SELECTION_METRIC
+                )
+                step_eligible = (
+                    int(global_step)
+                    >= int(args.resolved_reranking_min_global_step)
+                )
+                actor_guard_eligible = True
+                if selection_loss is not None and best_validation_loss is not None:
+                    actor_guard_eligible = float(selection_loss) <= (
+                        float(best_validation_loss)
+                        * (
+                            1.0
+                            + float(
+                                args.reranking_max_actor_loss_degradation
+                            )
+                        )
+                    )
+                checkpoint_eligible = bool(
+                    step_eligible
+                    and actor_guard_eligible
+                    and reranking_candidate is not None
+                    and np.isfinite(float(reranking_candidate))
+                )
+                validation_metrics.update(
+                    {
+                        "validation/reranking/step_eligible": float(
+                            step_eligible
+                        ),
+                        "validation/reranking/actor_guard_eligible": float(
+                            actor_guard_eligible
+                        ),
+                        "validation/reranking/checkpoint_eligible": float(
+                            checkpoint_eligible
+                        ),
+                    }
+                )
+                if checkpoint_eligible and (
+                    best_reranking is None
+                    or float(reranking_candidate)
+                    > float(best_reranking["value"])
+                ):
+                    best_reranking = {
+                        "metric": RERANKING_SELECTION_METRIC,
+                        "value": float(reranking_candidate),
+                        "epoch": int(epoch),
+                        "global_step": int(global_step),
+                    }
+                    reranking_improved = True
             if writer is not None:
                 for key, value in validation_metrics.items():
                     writer.add_scalar(key, value, global_step)
@@ -8453,19 +8942,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                         "epoch": epoch,
                         "global_step": global_step,
                         "validation_best": validation_improved,
+                        "reranking_best": reranking_improved,
                         **validation_metrics,
                     }
                 ),
                 flush=True,
             )
         if distributed.enabled:
-            improvement_flag = torch.tensor(
-                int(validation_improved),
+            improvement_flags = torch.tensor(
+                (int(validation_improved), int(reranking_improved)),
                 device=device,
                 dtype=torch.int32,
             )
-            dist.broadcast(improvement_flag, src=0)
-            validation_improved = bool(improvement_flag.item())
+            dist.broadcast(improvement_flags, src=0)
+            validation_improved = bool(improvement_flags[0].item())
+            reranking_improved = bool(improvement_flags[1].item())
 
         epoch_metrics = (
             metric_accumulator.means()
@@ -8492,12 +8983,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "value": best_validation_loss,
                 "epoch": best_validation_epoch,
             },
+            "best_reranking": best_reranking,
             "checkpoints": {
                 "latest": str(args.output_dir / "latest.pt"),
                 "last": str(args.output_dir / "last.pt"),
                 "best_validation": (
                     str(args.output_dir / "best_validation.pt")
                     if best_validation_epoch is not None
+                    else None
+                ),
+                "best_reranking": (
+                    str(args.output_dir / RERANKING_CHECKPOINT_NAME)
+                    if best_reranking is not None
                     else None
                 ),
             },
@@ -8509,7 +9006,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             epoch % int(args.save_every_epochs) == 0
             or epoch == int(args.epochs)
         )
-        if regular_checkpoint or validation_improved:
+        if regular_checkpoint or validation_improved or reranking_improved:
             rank_runtime_states = (
                 gather_rank_runtime_states(loader_generator, distributed)
                 if distributed.enabled
@@ -8526,6 +9023,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     replace_with_hardlink(
                         latest,
                         args.output_dir / "best_validation.pt",
+                    )
+                if reranking_improved:
+                    replace_with_hardlink(
+                        latest,
+                        args.output_dir / RERANKING_CHECKPOINT_NAME,
                     )
                 if epoch == int(args.epochs):
                     replace_with_hardlink(latest, args.output_dir / "last.pt")
@@ -8561,7 +9063,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--task",
-        choices=("square", "can", "transport", "tool_hang", "pick_cup", "stack_cup"),
+        choices=(
+            "square",
+            "can",
+            "transport",
+            "tool_hang",
+            "pick_cup",
+            "stack_cup",
+            "move_spoon",
+        ),
         default="square",
     )
     parser.add_argument(
@@ -8601,6 +9111,24 @@ def make_parser() -> argparse.ArgumentParser:
         type=int,
         default=10_000,
         help="Fixed RNG seed used for comparable validation losses.",
+    )
+    parser.add_argument(
+        "--reranking-min-post-warmup-steps",
+        type=int,
+        default=1_000,
+        help=(
+            "Optimizer updates required after the latest actor/critic warmup or "
+            "encoder-freeze boundary before best_reranking.pt is eligible."
+        ),
+    )
+    parser.add_argument(
+        "--reranking-max-actor-loss-degradation",
+        type=float,
+        default=0.05,
+        help=(
+            "Maximum relative EMA actor validation-loss degradation from the "
+            "best actor seen so far for a reranking checkpoint."
+        ),
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)

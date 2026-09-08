@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build or validate the stack-cup human/rollout mixed IDQL dataset."""
+"""Build or validate the MoveSpoon mixed one-step IDQL dataset."""
 
 from __future__ import annotations
 
@@ -15,17 +15,18 @@ from scripts.real_robot import build_real_robot_mixed_idql_dataset as core
 
 
 DEFAULT_HUMAN_DATASET = (
-    ROOT / "datasets/real_robot/stack_cup/idql/stack_cup_episode_layout_v1_human.hdf5"
+    ROOT / "datasets/real_robot/move_spoon/idql/move_spoon_episode_layout_v1_human.hdf5"
 )
 DEFAULT_ROLLOUT_DATASET = (
     ROOT
-    / "datasets/real_robot/stack_cup/idql/stack_cup_episode_layout_v1_request_rollouts.hdf5"
+    / "datasets/real_robot/move_spoon/idql/"
+    "move_spoon_episode_layout_v1_one_step_rollouts.hdf5"
 )
 DEFAULT_OUTPUT = (
     ROOT
-    / "datasets/real_robot/stack_cup/idql/"
-    "stack_cup_chunk_idql_episode_layout_v1_45demo_20success_10failure_"
-    "terminal_success_human_success_condition.hdf5"
+    / "datasets/real_robot/move_spoon/idql/"
+    "move_spoon_idql_episode_layout_v1_45demo_20success_11failure_"
+    "terminal_success.hdf5"
 )
 
 
@@ -34,20 +35,17 @@ def configure_core() -> None:
     core.DEFAULT_HUMAN_DATASETS = (DEFAULT_HUMAN_DATASET,)
     core.DEFAULT_ROLLOUT_DATASET = DEFAULT_ROLLOUT_DATASET
     core.DEFAULT_OUTPUT = DEFAULT_OUTPUT
-    core.TASK = "stack_cup"
-    core.BUILDER_VERSION = (
-        "stack_cup_chunk_idql_mixed_v6_episode_layout_stride_one_human"
-    )
+    core.TASK = "move_spoon"
+    core.BUILDER_VERSION = "move_spoon_idql_mixed_v1_episode_layout_one_step"
     core.REQUIRE_CRITIC_VALIDITY = True
-    core.EXPERT_CHUNK_VALIDITY_MODE = "stride_one"
+    core.EXPERT_CHUNK_VALIDITY_MODE = "source"
     core.DEFAULT_HUMAN_COUNT = 45
-    core.DEFAULT_EXPECTED_HUMAN_TRANSITIONS = 18_841
+    core.DEFAULT_EXPECTED_HUMAN_TRANSITIONS = 18_504
     core.DEFAULT_SUCCESS_COUNT = 20
-    core.DEFAULT_FAILURE_COUNT = 10
-    core.DEFAULT_ACTOR_CONDITION_MODE = "human_success"
+    core.DEFAULT_FAILURE_COUNT = 11
+    core.DEFAULT_ACTOR_CONDITION_MODE = "human_only"
     core.DEFAULT_HUMAN_DATASETS_HELP = (
-        "Stack-cup human HDF5; every selected human action row is used as an "
-        "overlapping H8 start (defaults to the fixed 45-episode train split)."
+        "MoveSpoon human HDF5 (defaults to the fixed 45-episode train split)."
     )
 
 

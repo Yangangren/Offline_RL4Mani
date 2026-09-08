@@ -394,6 +394,8 @@ def load_episode_payload(
                     f"{actions_path}.samples[{index}] physical action differs "
                     "from the normalized policy proposal and controller scales"
                 )
+        else:
+            action = stored_action
         if np.any(action < -1.000001) or np.any(action > 1.000001):
             raise ValueError(
                 f"{actions_path}.samples[{index}].action is outside normalized [-1,1]"

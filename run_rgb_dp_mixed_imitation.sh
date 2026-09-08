@@ -3,12 +3,24 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-if [[ "${1:-}" == "can" || "${1:-}" == "Can" || "${1:-}" == "square" || "${1:-}" == "Square" || "${1:-}" == "transport" || "${1:-}" == "Transport" || "${1:-}" == "tool_hang" || "${1:-}" == "ToolHang" ]]; then
-  TASK=$1
-  shift
-fi
+first_arg=${1:-}
+first_arg=${first_arg,,}
+first_arg=${first_arg//-/_}
+case "$first_arg" in
+  can|square|transport|tool_hang|toolhang|pick_cup|pickup|stack_cup|stackcup|move_spoon|movespoon)
+    TASK=$first_arg
+    shift
+    ;;
+esac
 TASK=${TASK:-${RGB_DP_TASK:-can}}
 TASK=${TASK,,}
+TASK=${TASK//-/_}
+case "$TASK" in
+  toolhang) TASK=tool_hang ;;
+  pickup) TASK=pick_cup ;;
+  stackcup) TASK=stack_cup ;;
+  movespoon) TASK=move_spoon ;;
+esac
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
@@ -36,6 +48,18 @@ if (( IMITATION_NUM_GPUS > 1 )) && [[ "${DEVICE:-cuda}" != "cuda" ]]; then
   echo "IMITATION_NUM_GPUS>1 requires DEVICE=cuda." >&2
   exit 2
 fi
+
+TASK_REAL_ROBOT=0
+DEFAULT_DEMO_FILTER_KEY=
+DEFAULT_SUCCESS_SOURCE_FILTER_KEY=success
+DEFAULT_FAILURE_SOURCE_FILTER_KEY=failure
+DEFAULT_SUCCESS_FILTER_SIZE=100
+DEFAULT_ACTOR_BATCH_SIZE=100
+DEFAULT_ACTOR_LR=
+DEFAULT_ACTOR_OBS_ENCODER_FREEZE_STEPS=0
+DEFAULT_EXPECTED_DEMO_FILTER_COUNT=-1
+DEFAULT_EXPECTED_SUCCESS_FILTER_COUNT=-1
+DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=
 
 case "$TASK" in
   can)
@@ -90,11 +114,87 @@ case "$TASK" in
     DEFAULT_EVAL_OUTPUT=rollouts/tool_hang_rgb_dp/imitation_eval
     DEFAULT_HORIZON=700
     ;;
+  pick_cup)
+    TASK_REAL_ROBOT=1
+    TASK_RGB_PREFIX=pick_cup_rgb_dp
+    DEFAULT_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_200.pth
+    DEFAULT_DEMO_DATASET=datasets/real_robot/pick_cup/pick_cup_rgb.hdf5
+    DEFAULT_ROLLOUT_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_episode_layout_v1_request_rollouts.hdf5
+    DEFAULT_DEMO_FILTER_KEY=train
+    DEFAULT_SUCCESS_SOURCE_FILTER_KEY=success_train
+    DEFAULT_FAILURE_SOURCE_FILTER_KEY=failure_train
+    DEFAULT_SUCCESS_FILTER_SIZE=23
+    DEFAULT_FAILURE_FILTER_SIZE=11
+    DEFAULT_FAILURE_FILTER_KEY=failure_train
+    DEFAULT_EXPECTED_DEMO_FILTER_COUNT=45
+    DEFAULT_EXPECTED_SUCCESS_FILTER_COUNT=23
+    DEFAULT_ACTOR_BATCH_SIZE=64
+    DEFAULT_ACTOR_LR=1e-5
+    DEFAULT_ACTOR_OBS_ENCODER_FREEZE_STEPS=1000
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/self_imitation/45demo_23success_episode_layout_v1
+    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/mixed_imitation/45demo_23success_11failure_episode_layout_v1
+    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/mixed_imitation/45demo_23success_11failure_episode_layout_v1_conditioned
+    DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=pick_cup_rgb_dp_self_imitation_45demo_23success_episode_layout_v1
+    DEFAULT_EVAL_OUTPUT=rollouts/real_robot/pick_cup/imitation_eval
+    DEFAULT_HORIZON=400
+    ;;
+  stack_cup)
+    TASK_REAL_ROBOT=1
+    TASK_RGB_PREFIX=stack_cup_rgb_dp
+    DEFAULT_DP_CHECKPOINT=trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260902111545/models/model_epoch_200.pth
+    DEFAULT_DEMO_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_episode_layout_v1_human.hdf5
+    DEFAULT_ROLLOUT_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_episode_layout_v1_request_rollouts.hdf5
+    DEFAULT_DEMO_FILTER_KEY=train
+    DEFAULT_SUCCESS_SOURCE_FILTER_KEY=success_train
+    DEFAULT_FAILURE_SOURCE_FILTER_KEY=failure_train
+    DEFAULT_SUCCESS_FILTER_SIZE=20
+    DEFAULT_FAILURE_FILTER_SIZE=10
+    DEFAULT_FAILURE_FILTER_KEY=failure_train
+    DEFAULT_EXPECTED_DEMO_FILTER_COUNT=45
+    DEFAULT_EXPECTED_SUCCESS_FILTER_COUNT=20
+    DEFAULT_ACTOR_BATCH_SIZE=64
+    DEFAULT_ACTOR_LR=1e-5
+    DEFAULT_ACTOR_OBS_ENCODER_FREEZE_STEPS=1000
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/self_imitation/45demo_20success_episode_layout_v1
+    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/mixed_imitation/45demo_20success_10failure_episode_layout_v1
+    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/mixed_imitation/45demo_20success_10failure_episode_layout_v1_conditioned
+    DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=stack_cup_rgb_dp_self_imitation_45demo_20success_episode_layout_v1
+    DEFAULT_EVAL_OUTPUT=rollouts/real_robot/stack_cup/imitation_eval
+    DEFAULT_HORIZON=600
+    ;;
+  move_spoon)
+    TASK_REAL_ROBOT=1
+    TASK_RGB_PREFIX=move_spoon_rgb_dp
+    DEFAULT_DP_CHECKPOINT=trained_models/real_robot/move_spoon_rgb_dp/move_spoon_rgb_dp_ddim_s1/20260903104112/models/model_epoch_200.pth
+    DEFAULT_DEMO_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_episode_layout_v1_human.hdf5
+    DEFAULT_ROLLOUT_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_episode_layout_v1_request_rollouts.hdf5
+    DEFAULT_DEMO_FILTER_KEY=train
+    DEFAULT_SUCCESS_SOURCE_FILTER_KEY=success_train
+    DEFAULT_FAILURE_SOURCE_FILTER_KEY=failure_train
+    DEFAULT_SUCCESS_FILTER_SIZE=20
+    DEFAULT_FAILURE_FILTER_SIZE=11
+    DEFAULT_FAILURE_FILTER_KEY=failure_train
+    DEFAULT_EXPECTED_DEMO_FILTER_COUNT=45
+    DEFAULT_EXPECTED_SUCCESS_FILTER_COUNT=20
+    DEFAULT_ACTOR_BATCH_SIZE=64
+    DEFAULT_ACTOR_LR=1e-5
+    DEFAULT_ACTOR_OBS_ENCODER_FREEZE_STEPS=1000
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/self_imitation/45demo_20success_episode_layout_v1
+    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/mixed_imitation/45demo_20success_11failure_episode_layout_v1
+    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/mixed_imitation/45demo_20success_11failure_episode_layout_v1_conditioned
+    DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=move_spoon_rgb_dp_self_imitation_45demo_20success_episode_layout_v1
+    DEFAULT_EVAL_OUTPUT=rollouts/real_robot/move_spoon/imitation_eval
+    DEFAULT_HORIZON=600
+    ;;
   *)
-    echo "Unsupported TASK=$TASK. Use TASK=can, TASK=square, TASK=transport, or TASK=tool_hang." >&2
+    echo "Unsupported TASK=$TASK. Use can, square, transport, tool_hang, pick_cup, stack_cup, or move_spoon." >&2
     exit 2
     ;;
 esac
+
+if [[ -z "$DEFAULT_SELF_IMITATION_EXPERIMENT_NAME" ]]; then
+  DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=${TASK_RGB_PREFIX}_self_imitation_200demo_all_success
+fi
 
 STAGE=${1:-train_self_imitation_resilient}
 IMITATION_KIND=${IMITATION_KIND:-self}
@@ -175,6 +275,11 @@ if [[ "$IMITATION_KIND" != "self" && "$IMITATION_KIND" != "mixed" ]]; then
   exit 2
 fi
 
+if [[ "$TASK_REAL_ROBOT" == "1" && "$IMITATION_KIND" != "self" ]]; then
+  echo "TASK=$TASK currently supports self-imitation only; real-robot mixed and conditioned imitation are intentionally out of scope." >&2
+  exit 2
+fi
+
 # post-training
 DP_CHECKPOINT=${DP_CHECKPOINT:-$DEFAULT_DP_CHECKPOINT}
 DEMO_DATASET=${DEMO_DATASET:-$DEFAULT_DEMO_DATASET}
@@ -183,8 +288,9 @@ SUCCESS_DATASET=${SUCCESS_DATASET:-$ROLLOUT_DATASET}
 FAILURE_DATASET=${FAILURE_DATASET:-$ROLLOUT_DATASET}
 HORIZON=${HORIZON:-$DEFAULT_HORIZON}
 
-ACTOR_BATCH_SIZE=${ACTOR_BATCH_SIZE:-100}
-ACTOR_LR=${ACTOR_LR:-}
+ACTOR_BATCH_SIZE=${ACTOR_BATCH_SIZE:-$DEFAULT_ACTOR_BATCH_SIZE}
+ACTOR_LR=${ACTOR_LR:-$DEFAULT_ACTOR_LR}
+ACTOR_OBS_ENCODER_FREEZE_STEPS=${ACTOR_OBS_ENCODER_FREEZE_STEPS:-$DEFAULT_ACTOR_OBS_ENCODER_FREEZE_STEPS}
 ACTOR_HDF5_CACHE_MODE=${ACTOR_HDF5_CACHE_MODE:-}
 ACTOR_NUM_WORKERS=${ACTOR_NUM_WORKERS:-4}
 ACTOR_UNIFORM_SAMPLE_POOL=${ACTOR_UNIFORM_SAMPLE_POOL:-1}
@@ -198,14 +304,16 @@ SELF_IMITATION_OUTPUT_DIR=${SELF_IMITATION_OUTPUT_DIR:-$DEFAULT_SELF_IMITATION_O
 MIXED_IMITATION_OUTPUT_DIR=${MIXED_IMITATION_OUTPUT_DIR:-$DEFAULT_MIXED_IMITATION_OUTPUT_DIR}
 CONDITIONED_IMITATION_OUTPUT_DIR=${CONDITIONED_IMITATION_OUTPUT_DIR:-$DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR}
 
-SUCCESS_SOURCE_FILTER_KEY=${SUCCESS_SOURCE_FILTER_KEY:-success}
-SUCCESS_FILTER_SIZE=${SUCCESS_FILTER_SIZE:-100}
+SUCCESS_SOURCE_FILTER_KEY=${SUCCESS_SOURCE_FILTER_KEY:-$DEFAULT_SUCCESS_SOURCE_FILTER_KEY}
+SUCCESS_FILTER_SIZE=${SUCCESS_FILTER_SIZE:-$DEFAULT_SUCCESS_FILTER_SIZE}
 SUCCESS_FILTER_SUFFIX=${SUCCESS_FILTER_SUFFIX:-100}
 SUCCESS_SELECTION_SEED=${SUCCESS_SELECTION_SEED:-0}
-FAILURE_SOURCE_FILTER_KEY=${FAILURE_SOURCE_FILTER_KEY:-failure}
+FAILURE_SOURCE_FILTER_KEY=${FAILURE_SOURCE_FILTER_KEY:-$DEFAULT_FAILURE_SOURCE_FILTER_KEY}
 FAILURE_FILTER_SIZE=${FAILURE_FILTER_SIZE:-$DEFAULT_FAILURE_FILTER_SIZE}
 FAILURE_SELECTION_SEED=${FAILURE_SELECTION_SEED:-0}
-DEMO_FILTER_KEY=${DEMO_FILTER_KEY:-}
+DEMO_FILTER_KEY=${DEMO_FILTER_KEY-$DEFAULT_DEMO_FILTER_KEY}
+EXPECTED_DEMO_FILTER_COUNT=${EXPECTED_DEMO_FILTER_COUNT:-$DEFAULT_EXPECTED_DEMO_FILTER_COUNT}
+EXPECTED_SUCCESS_FILTER_COUNT=${EXPECTED_SUCCESS_FILTER_COUNT:-$DEFAULT_EXPECTED_SUCCESS_FILTER_COUNT}
 
 if [[ "$IMITATION_KIND" == "self" ]]; then
   if [[ "${CONDITIONED_MIXED_IMITATION:-0}" == "1" ]]; then
@@ -221,9 +329,9 @@ if [[ "$IMITATION_KIND" == "self" ]]; then
   # A smaller explicit mask can still be selected with
   # SELF_IMITATION_SUCCESS_FILTER_KEY when reproducing an older experiment.
   SUCCESS_FILTER_KEY=${SELF_IMITATION_SUCCESS_FILTER_KEY:-${SUCCESS_FILTER_KEY:-$SUCCESS_SOURCE_FILTER_KEY}}
-  FAILURE_FILTER_KEY=${FAILURE_FILTER_KEY:-failure}
+  FAILURE_FILTER_KEY=${FAILURE_FILTER_KEY:-$DEFAULT_FAILURE_FILTER_KEY}
   IMITATION_MODE_NAME_VALUE="${SELF_IMITATION_MODE_NAME:-${IMITATION_MODE_NAME:-self_imitation_learning}}"
-  IMITATION_EXPERIMENT_NAME_VALUE="${SELF_IMITATION_EXPERIMENT_NAME:-${IMITATION_EXPERIMENT_NAME:-${TASK_RGB_PREFIX}_self_imitation_200demo_all_success}}"
+  IMITATION_EXPERIMENT_NAME_VALUE="${SELF_IMITATION_EXPERIMENT_NAME:-${IMITATION_EXPERIMENT_NAME:-$DEFAULT_SELF_IMITATION_EXPERIMENT_NAME}}"
   IMITATION_DEMO_WEIGHT_VALUE="${SELF_IMITATION_DEMO_WEIGHT:-${IMITATION_DEMO_WEIGHT:-1.0}}"
   IMITATION_SUCCESS_WEIGHT_VALUE="${SELF_IMITATION_SUCCESS_WEIGHT:-${IMITATION_SUCCESS_WEIGHT:-1.0}}"
   IMITATION_FAILURE_WEIGHT_VALUE=0.0
@@ -436,6 +544,7 @@ check_datasets() {
     "$ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE" \
     "$SUCCESS_SELECTION_MANIFEST" \
     "$FAILURE_SELECTION_MANIFEST" \
+    "$ACTOR_OBS_ENCODER_FREEZE_STEPS" \
     "$ACTOR_BATCH_SIZE" \
     "$ACTOR_LR" \
     "${ACTOR_DISABLE_LR_SCHEDULER:-0}" \
@@ -448,7 +557,11 @@ check_datasets() {
     "${CONDITIONED_MIXED_IMITATION:-0}" \
     "${MIXED_IMITATION_FAILURE_DEMO_START_ONLY:-0}" \
     "${MIXED_IMITATION_FAILURE_SAMPLE_START_OFFSET:-0}" \
-    "$IMITATION_NUM_GPUS" <<'PYCHECK'
+    "$IMITATION_NUM_GPUS" \
+    "$TASK" \
+    "$TASK_REAL_ROBOT" \
+    "$EXPECTED_DEMO_FILTER_COUNT" \
+    "$EXPECTED_SUCCESS_FILTER_COUNT" <<'PYCHECK'
 import json
 import sys
 from pathlib import Path
@@ -470,6 +583,7 @@ import torch
     normalize_by_ds_size,
     success_selection_manifest,
     failure_selection_manifest,
+    actor_obs_encoder_freeze_steps,
     actor_batch_size,
     actor_lr,
     disable_lr_scheduler,
@@ -483,7 +597,11 @@ import torch
     failure_demo_start_only,
     failure_sample_start_offset,
     num_gpus,
-) = sys.argv[1:27]
+    task,
+    task_real_robot,
+    expected_demo_filter_count,
+    expected_success_filter_count,
+) = sys.argv[1:32]
 
 checkpoint_dict = torch.load(checkpoint, map_location="cpu", weights_only=False)
 checkpoint_config = json.loads(checkpoint_dict["config"])
@@ -567,6 +685,103 @@ def masks(path):
             return {}
         return {k: len(f[f"mask/{k}"]) for k in sorted(f["mask"].keys())}
 
+def validate_real_robot_source(path, filter_key, expected_count, source_kind):
+    expected_obs_keys = {
+        "main_image",
+        "wrist_image",
+        "robot0_eef_pos",
+        "robot0_eef_quat",
+        "robot0_gripper_state",
+    }
+    with h5py.File(path, "r") as f:
+        actual_task = str(f.attrs.get("task", ""))
+        if actual_task != task:
+            raise ValueError(
+                f"{path} has task={actual_task!r}; expected real-robot task={task!r}"
+            )
+        actual_source_kind = str(f.attrs.get("source_kind", ""))
+        if actual_source_kind != source_kind:
+            raise ValueError(
+                f"{path} has source_kind={actual_source_kind!r}; "
+                f"expected {source_kind!r}"
+            )
+        mask_path = f"mask/{filter_key}"
+        if not filter_key or mask_path not in f:
+            raise ValueError(f"{path} is missing required split mask/{filter_key}")
+        selected_demos = decode(f[mask_path][:])
+        expected_count = int(expected_count)
+        if expected_count >= 0 and len(selected_demos) != expected_count:
+            raise ValueError(
+                f"{path} mask/{filter_key} contains {len(selected_demos)} demos; "
+                f"expected {expected_count}"
+            )
+        if not selected_demos:
+            raise ValueError(f"{path} mask/{filter_key} is empty")
+        for demo_key in selected_demos:
+            demo = f[f"data/{demo_key}"]
+            num_samples = int(demo.attrs["num_samples"])
+            if demo["actions"].ndim != 2 or demo["actions"].shape != (num_samples, 7):
+                raise ValueError(
+                    f"{path} data/{demo_key}/actions has shape "
+                    f"{demo['actions'].shape}; expected ({num_samples}, 7)"
+                )
+            actual_obs_keys = set(demo["obs"].keys())
+            if actual_obs_keys != expected_obs_keys:
+                raise ValueError(
+                    f"{path} data/{demo_key}/obs keys={sorted(actual_obs_keys)}; "
+                    f"expected {sorted(expected_obs_keys)}"
+                )
+            for obs_key in expected_obs_keys:
+                if int(demo[f"obs/{obs_key}"].shape[0]) != num_samples:
+                    raise ValueError(
+                        f"{path} data/{demo_key}/obs/{obs_key} is not aligned "
+                        f"to num_samples={num_samples}"
+                    )
+
+if task_real_robot == "1":
+    expected_obs_keys = {
+        "main_image",
+        "wrist_image",
+        "robot0_eef_pos",
+        "robot0_eef_quat",
+        "robot0_gripper_state",
+    }
+    checkpoint_obs = checkpoint_config["observation"]["modalities"]["obs"]
+    checkpoint_obs_keys = set(checkpoint_obs["low_dim"]) | set(checkpoint_obs["rgb"])
+    if checkpoint_obs_keys != expected_obs_keys:
+        raise ValueError(
+            f"{checkpoint} observation keys={sorted(checkpoint_obs_keys)}; "
+            f"expected {sorted(expected_obs_keys)}"
+        )
+    checkpoint_horizon = checkpoint_config["algo"]["horizon"]
+    actual_horizons = (
+        int(checkpoint_horizon["observation_horizon"]),
+        int(checkpoint_horizon["action_horizon"]),
+        int(checkpoint_horizon["prediction_horizon"]),
+    )
+    if actual_horizons != (2, 8, 16):
+        raise ValueError(
+            f"{checkpoint} DP horizons={actual_horizons}; expected (2, 8, 16)"
+        )
+    if checkpoint_train["action_config"] != {
+        "actions": {"normalization": None}
+    }:
+        raise ValueError(
+            f"{checkpoint} must use identity-normalized seven-dimensional actions"
+        )
+    validate_real_robot_source(
+        demo_dataset,
+        demo_filter,
+        expected_demo_filter_count,
+        "human",
+    )
+    validate_real_robot_source(
+        rollout_dataset,
+        success_filter,
+        expected_success_filter_count,
+        "rollout",
+    )
+
 def selected_num_sequences(path, key, demo_start_only=False):
     with h5py.File(path, "r") as f:
         if key:
@@ -625,6 +840,7 @@ report = {
         "scheduler_warmup_steps": int(
             checkpoint_policy_optim["learning_rate"]["warmup_steps"]
         ),
+        "actor_obs_encoder_freeze_steps": int(actor_obs_encoder_freeze_steps),
         "scheduler_num_cycles": float(
             checkpoint_policy_optim["learning_rate"]["num_cycles"]
         ),
@@ -748,6 +964,10 @@ maybe_prepare_filters() {
       prepare_failure_filter
     fi
   fi
+  if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
+    echo "[rgb_dp_self_imitation task=$TASK] validating the fixed real-robot training split" >&2
+    check_datasets
+  fi
 }
 
 run_train() {
@@ -801,6 +1021,7 @@ run_train() {
     "${ACTOR_NORMALIZE_WEIGHTS_ARGS[@]}" \
     "${ACTOR_LR_ARGS[@]}" \
     "${ACTOR_LR_SCHEDULER_ARGS[@]}" \
+    --actor-obs-encoder-freeze-steps "$ACTOR_OBS_ENCODER_FREEZE_STEPS" \
     --save-every-epochs "$IMITATION_SAVE_EVERY_EPOCHS" \
     --save-latest-every-epochs "$IMITATION_SAVE_LATEST_EVERY_EPOCHS" \
     --log-every "$LOG_EVERY"
@@ -853,6 +1074,11 @@ run_resilient_train() {
 }
 
 run_eval_grid_resilient() {
+  if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
+    echo "[rgb_dp_self_imitation task=$TASK] simulation evaluation is unavailable for real-robot tasks." >&2
+    echo "Use the task's dedicated 20 Hz real-robot shadow or guarded deployment path." >&2
+    exit 2
+  fi
   if [[ ! -f "$EVAL_DP_CHECKPOINT" ]]; then
     echo "[eval_grid_resilient] EVAL_DP_CHECKPOINT does not exist: $EVAL_DP_CHECKPOINT" >&2
     exit 2
@@ -927,7 +1153,7 @@ case "$STAGE" in
     run_eval_grid_resilient
     ;;
   *)
-    echo "Usage: $0 [can|square|transport|tool_hang] {check|check_self|check_mixed|prepare_filters|prepare_self_filters|prepare_mixed_filters|train_self_imitation|train_self_imitation_resilient|train_mixed_imitation|train_mixed_imitation_resilient|train_conditioned|train_conditioned_resilient|train_conditioned_mixed_imitation|train_conditioned_imitation_resilient|eval_self_grid_resilient|eval_mixed_grid_resilient|eval_conditioned_grid_resilient|eval_grid_resilient|all|all_self|all_mixed}" >&2
+    echo "Usage: $0 [can|square|transport|tool_hang|pick_cup|stack_cup|move_spoon] {check|check_self|check_mixed|prepare_filters|prepare_self_filters|prepare_mixed_filters|train_self_imitation|train_self_imitation_resilient|train_mixed_imitation|train_mixed_imitation_resilient|train_conditioned|train_conditioned_resilient|train_conditioned_mixed_imitation|train_conditioned_imitation_resilient|eval_self_grid_resilient|eval_mixed_grid_resilient|eval_conditioned_grid_resilient|eval_grid_resilient|all|all_self|all_mixed}" >&2
     exit 2
     ;;
 esac

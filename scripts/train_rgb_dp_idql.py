@@ -3554,7 +3554,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--task",
-        choices=("square", "can", "transport", "tool_hang", "pick_cup", "stack_cup"),
+        choices=(
+            "square",
+            "can",
+            "transport",
+            "tool_hang",
+            "pick_cup",
+            "stack_cup",
+            "move_spoon",
+        ),
         default="square",
     )
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
