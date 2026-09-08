@@ -2663,6 +2663,16 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
 
 def train(args: argparse.Namespace) -> dict:
     distributed = initialize_distributed(args)
+    expected_world_size = getattr(args, "expected_world_size", None)
+    if (
+        expected_world_size is not None
+        and int(distributed.world_size) != int(expected_world_size)
+    ):
+        raise RuntimeError(
+            "distributed launch world-size mismatch: "
+            f"requested {int(expected_world_size)}, initialized "
+            f"{int(distributed.world_size)}"
+        )
     args.distributed = bool(distributed.enabled)
     args.distributed_rank = int(distributed.rank)
     args.distributed_local_rank = int(distributed.local_rank)
@@ -3699,6 +3709,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=None,
         help="Local process rank supplied by torchrun; the environment wins.",
     )
+    parser.add_argument(
+        "--expected-world-size",
+        type=int,
+        default=None,
+        help=(
+            "Fail unless the initialized distributed world has this size. "
+            "The RISE launcher uses this to prevent silent serial fallback."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument(
@@ -3896,6 +3915,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("schedule-reference-batch-size must be positive")
     if args.gradient_bucket_cap_mb <= 0.0:
         parser.error("gradient-bucket-cap-mb must be positive")
+    if args.expected_world_size is not None and args.expected_world_size <= 0:
+        parser.error("--expected-world-size must be positive")
     if args.lr_num_cycles <= 0.0:
         parser.error("lr-num-cycles must be positive")
     if args.save_every_epochs <= 0:
