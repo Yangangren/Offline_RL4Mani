@@ -1659,12 +1659,12 @@ class DiffusionPolicyUNet(PolicyAlgo):
                 # frame stacking is not invoked when sequence length is 1
                 inputs["obs"][k] = inputs["obs"][k].unsqueeze(1)
             assert inputs["obs"][k].ndim - 2 == len(self.obs_shapes[k])
-        obs_features = TensorUtils.time_distributed(inputs, nets["policy"]["obs_encoder"], inputs_as_kwargs=True)
-        assert obs_features.ndim == 3  # [B, T, D]
-        B = obs_features.shape[0]
-
-        # reshape observation to (B,obs_horizon*obs_dim)
-        obs_cond = obs_features.flatten(start_dim=1)
+        # Keep rollout conditioning identical to the training path. In
+        # particular, RISE checkpoints insert their spectral feature MLP in
+        # ``_encode_obs``; bypassing this helper feeds the denoiser raw encoder
+        # features at inference even though it was trained on adapted features.
+        obs_cond = self._encode_obs(inputs, nets)
+        B = obs_cond.shape[0]
         obs_cond, _ = self._apply_success_condition(
             obs_cond,
             nets=nets,
