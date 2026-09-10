@@ -833,6 +833,8 @@ class RiseStyleRGBIDQLPolicy:
         self.last_adv: np.ndarray | None = None
         self.last_selected_index: int | None = None
         self.last_selection_is_random: bool | None = None
+        self.last_normalized_trajectories: np.ndarray | None = None
+        self.last_env_trajectories: np.ndarray | None = None
 
         horizon = self.algo.algo_config.horizon
         actor_observation_horizon = int(horizon.observation_horizon)
@@ -859,6 +861,8 @@ class RiseStyleRGBIDQLPolicy:
         self.last_adv = None
         self.last_selected_index = None
         self.last_selection_is_random = None
+        self.last_normalized_trajectories = None
+        self.last_env_trajectories = None
 
     def choose_index(self, q: torch.Tensor, v: torch.Tensor) -> int:
         selected, explored = choose_candidate_index(
@@ -909,6 +913,8 @@ class RiseStyleRGBIDQLPolicy:
             self.last_adv = None
             self.last_selected_index = None
             self.last_selection_is_random = None
+            self.last_normalized_trajectories = None
+            self.last_env_trajectories = None
             return self.action_queue.popleft().astype(np.float64, copy=True)
 
         prepared_obs = self.dp_policy._prepare_observation(ob, batched_ob=False)
@@ -1056,6 +1062,10 @@ class RiseStyleRGBIDQLPolicy:
             self.dp_policy,
             normalized_trajectories,
         )
+        self.last_normalized_trajectories = (
+            normalized_trajectories.detach().cpu().numpy().copy()
+        )
+        self.last_env_trajectories = np.asarray(env_trajectories).copy()
         selected_trajectory = env_trajectories[
             selected,
             : self.execution_horizon,

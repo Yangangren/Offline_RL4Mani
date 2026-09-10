@@ -30,6 +30,9 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SCHEMA = "stack_cup_proposal_episode_layout.v1"
 CONVERSION_VERSION = "real_robot_episode_layout_idql_sources_v1"
+ROLLOUT_CONVERSION_VERSION = (
+    "real_robot_episode_layout_idql_sources_v2_variable_requests"
+)
 MANIFEST_ATTR = "real_robot_conversion_manifest"
 OBS_KEYS = (
     "main_image",
@@ -58,7 +61,10 @@ HUMAN_VALIDATION_EPISODES = {
     "move_spoon": frozenset({5, 15, 27, 35, 45}),
 }
 ROLLOUT_VALIDATION_EPISODES = {
-    "pick_cup": frozenset({1, 8, 11, 13, 23, 24, 26, 32, 34}),
+    # The new PickCup collection is 30 success / 10 failure. Keep a fixed,
+    # outcome-stratified 6 / 2 held-out split and exercise both full and partial
+    # operator-ended final requests in validation.
+    "pick_cup": frozenset({1, 8, 13, 20, 23, 29, 36, 40}),
     "stack_cup": frozenset({1, 4, 6, 11, 15, 16, 22, 23, 32, 36}),
     "move_spoon": frozenset({2, 12, 14, 20, 23, 26, 28, 30, 39}),
 }
@@ -75,10 +81,18 @@ class TaskProfile:
     rollout_output: Path
     expected_humans: int
     expected_rollouts: int
-    expected_rollout_actions: int
-    expected_requests_per_rollout: int
+    # Fixed-length collections set the per-episode fields. Operator-ended
+    # collections set them to None and are audited by their exact corpus totals.
+    expected_rollout_actions: int | None
+    expected_requests_per_rollout: int | None
+    expected_rollout_transition_total: int
+    expected_request_total: int
+    expected_action_valid_request_total: int
+    expected_full_h8_request_total: int
     expected_outcomes: Mapping[str, int]
     expected_checkpoint_sha256: str
+    expected_checkpoint_epoch: int
+    expected_completion_reasons: tuple[str, ...]
     expected_human_transitions: int
     expected_experiment_name: str
     rollout_identity_layout: str
@@ -87,7 +101,7 @@ class TaskProfile:
 
     @property
     def expected_requests(self) -> int:
-        return self.expected_rollouts * self.expected_requests_per_rollout
+        return self.expected_request_total
 
 
 TASK_PROFILES = {
@@ -100,15 +114,21 @@ TASK_PROFILES = {
         human_output=ROOT / "datasets/real_robot/pick_cup/pick_cup_rgb.hdf5",
         rollout_output=ROOT / "datasets/real_robot/pick_cup/idql/pick_cup_episode_layout_v1_request_rollouts.hdf5",
         expected_humans=50,
-        expected_rollouts=43,
-        expected_rollout_actions=400,
-        expected_requests_per_rollout=50,
-        expected_outcomes={"success": 29, "failure": 14},
-        expected_checkpoint_sha256="0d37bc1e57987d603ef46c4808f87e3b8ae281b673b6cb4e3bf07b9666b87742",
+        expected_rollouts=40,
+        expected_rollout_actions=None,
+        expected_requests_per_rollout=None,
+        expected_rollout_transition_total=11_301,
+        expected_request_total=1_440,
+        expected_action_valid_request_total=1_418,
+        expected_full_h8_request_total=1_405,
+        expected_outcomes={"success": 30, "failure": 10},
+        expected_checkpoint_sha256="a58535ea0d5779127be96c3eca4b5a183810cf811c1a369bf00689073607b247",
+        expected_checkpoint_epoch=50,
+        expected_completion_reasons=("operator_end_key",),
         expected_human_transitions=18_739,
         expected_experiment_name="pick_cup_rgb_dp_ddim_s1",
-        rollout_identity_layout="legacy_checkpoint_contract",
-        expected_runtime_inference_steps=10,
+        rollout_identity_layout="runtime_sampler_override",
+        expected_runtime_inference_steps=100,
         max_human_image_age_sec=1.0,
     ),
     "stack_cup": TaskProfile(
@@ -123,8 +143,14 @@ TASK_PROFILES = {
         expected_rollouts=40,
         expected_rollout_actions=600,
         expected_requests_per_rollout=75,
+        expected_rollout_transition_total=24_000,
+        expected_request_total=3_000,
+        expected_action_valid_request_total=3_000,
+        expected_full_h8_request_total=3_000,
         expected_outcomes={"success": 26, "failure": 14},
         expected_checkpoint_sha256="b1bbe2f6be8eeb1317ba270777c0b17e265464c33906134164f4d62d7b4bfa6d",
+        expected_checkpoint_epoch=200,
+        expected_completion_reasons=("max_actions",),
         expected_human_transitions=21_166,
         expected_experiment_name="stack_cup_rgb_dp_ddim_s1",
         rollout_identity_layout="runtime_sampler_override",
@@ -143,8 +169,14 @@ TASK_PROFILES = {
         expected_rollouts=40,
         expected_rollout_actions=600,
         expected_requests_per_rollout=75,
+        expected_rollout_transition_total=24_000,
+        expected_request_total=3_000,
+        expected_action_valid_request_total=3_000,
+        expected_full_h8_request_total=3_000,
         expected_outcomes={"success": 25, "failure": 15},
         expected_checkpoint_sha256="c20a6497c82ffedc6dd8849a4bbaad9f29612bff70bb02015b8e2fa59f65ecdf",
+        expected_checkpoint_epoch=200,
+        expected_completion_reasons=("max_actions",),
         expected_human_transitions=20_581,
         expected_experiment_name="move_spoon_rgb_dp_ddim_s1",
         rollout_identity_layout="runtime_sampler_override",
@@ -377,8 +409,26 @@ def discover_episodes(
             record.split not in {"train", "valid"}
             or not record.run_id
             or record.proposal_exact != (kind == "rollout")
+            or record.actions < 1
+            or record.frames < 1
+            or record.windows < 1
         ):
             raise ProposalConversionError(f"{name} has invalid split or run ID")
+        if kind == "rollout":
+            if (
+                profile.expected_rollout_actions is not None
+                and record.actions != profile.expected_rollout_actions
+            ) or (
+                profile.expected_requests_per_rollout is not None
+                and record.windows != profile.expected_requests_per_rollout
+            ):
+                raise ProposalConversionError(
+                    f"{name} rollout dimensions differ from the task profile"
+                )
+            if record.frames != 2 * record.windows:
+                raise ProposalConversionError(
+                    f"{name} must contain exactly two frames per request"
+                )
         episode_dir = episodes_root / name
         required = [
             "actions.json",
@@ -416,8 +466,26 @@ def discover_episodes(
             raise ProposalConversionError(f"{name} contract or QA differs")
         records.append(record)
 
-    if kind == "rollout" and int(ready.get("exact_requests", -1)) != profile.expected_requests:
-        raise ProposalConversionError("DATASET_READY exact request count differs")
+    episode_numbers = [record.episode_number for record in records]
+    if len(episode_numbers) != len(set(episode_numbers)):
+        raise ProposalConversionError("proposal source episode numbers are not unique")
+    if kind == "rollout":
+        action_total = sum(record.actions for record in records)
+        request_total = sum(record.windows for record in records)
+        if (
+            int(ready.get("actions", -1)) != profile.expected_rollout_transition_total
+            or action_total != profile.expected_rollout_transition_total
+        ):
+            raise ProposalConversionError(
+                "DATASET_READY rollout action total differs"
+            )
+        if (
+            int(ready.get("exact_requests", -1)) != profile.expected_requests
+            or request_total != profile.expected_requests
+        ):
+            raise ProposalConversionError(
+                "DATASET_READY exact request count differs"
+            )
     expected_split = ROLLOUT_VALIDATION_EPISODES[profile.task]
     if kind == "rollout" and {
         record.episode_number for record in records if record.split == "valid"
@@ -534,8 +602,8 @@ def _validate_policy_identity(
     if (
         run.get("episode_id") != record.run_id
         or run.get("status") != "PASS"
-        or run.get("completion_reason") != "max_actions"
-        or int(run.get("actions_completed", -1)) != profile.expected_rollout_actions
+        or run.get("completion_reason") not in profile.expected_completion_reasons
+        or int(run.get("actions_completed", -1)) != record.actions
         or outcome.get("episode_id") != record.run_id
         or outcome.get("task_outcome") not in {"success", "failure"}
         or outcome.get("discarded") is not False
@@ -554,7 +622,8 @@ def _validate_policy_identity(
         != EXPECTED_CONTRACT_SHA256
         or checkpoint_contract.get("experiment_name")
         != profile.expected_experiment_name
-        or int(checkpoint_contract.get("epoch", -1)) != 200
+        or int(checkpoint_contract.get("epoch", -1))
+        != profile.expected_checkpoint_epoch
         or int(checkpoint_contract.get("action_horizon", -1)) != ACTION_HORIZON
         or int(checkpoint_contract.get("observation_horizon", -1)) != 2
     ):
@@ -562,11 +631,11 @@ def _validate_policy_identity(
     if profile.rollout_identity_layout == "runtime_sampler_override":
         sampler = identity.get("sampler", {})
         if (
-            sampler.get("kind") != "ddim"
+            sampler.get("kind", sampler.get("sampler")) != "ddim"
             or int(sampler.get("checkpoint_num_inference_steps", -1)) != 10
             or int(sampler.get("num_inference_steps", -1))
             != profile.expected_runtime_inference_steps
-            or identity.get("task") != profile.task
+            or identity.get("task", profile.task) != profile.task
         ):
             raise ProposalConversionError(
                 f"{episode_dir}: DDIM-{profile.expected_runtime_inference_steps} "
@@ -605,14 +674,14 @@ def _policy_payload(
     record: EpisodeRecord,
     profile: TaskProfile,
 ) -> dict[str, Any]:
-    if (
-        record.actions != profile.expected_rollout_actions
-        or record.frames != 2 * profile.expected_requests_per_rollout
-        or record.windows != profile.expected_requests_per_rollout
-    ):
+    if record.frames != 2 * record.windows:
         raise ProposalConversionError(f"{episode_dir}: rollout dimensions differ")
     _, samples, actions = _read_actions(episode_dir, record.actions)
-    windows = _read_windows(episode_dir, record.windows)
+    windows = _read_windows(
+        episode_dir,
+        record.windows,
+        require_all_valid=False,
+    )
     frames_doc = _load_json(episode_dir / "frames.json")
     frames = frames_doc.get("frames")
     if not isinstance(frames, list) or len(frames) != record.frames:
@@ -627,23 +696,54 @@ def _policy_payload(
     request_main_times = []
     request_wrist_times = []
     request_files = []
+    request_action_starts = []
+    request_action_counts = []
+    request_action_valid = []
+    request_dataset_terminal = []
+    policy_chunk_indices = np.full(record.actions, -1, dtype=np.int64)
+    policy_chunk_offsets = np.full(record.actions, 255, dtype=np.uint8)
+    action_cursor = 0
+    terminal_request_indices = []
     for request_index, (window, chunk) in enumerate(zip(windows, chunks)):
-        expected_indices = list(
-            range(request_index * ACTION_HORIZON, (request_index + 1) * ACTION_HORIZON)
-        )
+        action_indices = window.get("action_indices")
+        if not isinstance(action_indices, list):
+            raise ProposalConversionError(
+                f"{episode_dir}: request {request_index} action indices differ"
+            )
+        action_count = len(action_indices)
+        expected_indices = list(range(action_cursor, action_cursor + action_count))
+        action_valid = action_count > 0
+        dataset_terminal = bool(window.get("dataset_terminal"))
+        bootstrap_valid = bool(window.get("bootstrap_valid"))
         if (
             int(window.get("window_id", -1)) != request_index
             or window.get("kind") != "exact_rollout_request"
             or window.get("proposal_exact") is not True
-            or window.get("action_indices") != expected_indices
+            or not 0 <= action_count <= ACTION_HORIZON
+            or action_indices != expected_indices
+            or int(window.get("action_samples", -1)) != action_count
+            or int(window.get("start_action_index", -1)) != action_cursor
+            or int(window.get("end_action_index_exclusive", -1))
+            != action_cursor + action_count
+            or bool(window.get("action_valid")) != action_valid
             or window.get("frame_indices") != [2 * request_index, 2 * request_index + 1]
             or int(chunk.get("chunk", -1)) != request_index
+            or int(chunk.get("start_action_index", -1)) != action_cursor
+            or int(chunk.get("end_action_index", -1))
+            != action_cursor + action_count
         ):
             raise ProposalConversionError(
                 f"{episode_dir}: request window {request_index} differs"
             )
         raw_actions = np.asarray(chunk.get("raw_actions"), dtype=np.float32)
-        if not np.array_equal(raw_actions, actions[expected_indices]):
+        if (
+            raw_actions.shape != (ACTION_HORIZON, 7)
+            or not np.isfinite(raw_actions).all()
+            or np.any(np.abs(raw_actions) > 1.000001)
+            or not np.array_equal(
+                raw_actions[:action_count], actions[expected_indices]
+            )
+        ):
             raise ProposalConversionError(
                 f"{episode_dir}: request {request_index} actions differ"
             )
@@ -710,23 +810,104 @@ def _policy_payload(
         request_main_times.append(main_times)
         request_wrist_times.append(wrist_times)
         request_files.append(str(window["input_npz"]))
-        if request_index + 1 < len(windows):
+        request_action_starts.append(action_cursor)
+        request_action_counts.append(action_count)
+        request_action_valid.append(action_valid)
+        request_dataset_terminal.append(dataset_terminal)
+        if action_valid:
+            policy_chunk_indices[expected_indices] = request_index
+            policy_chunk_offsets[expected_indices] = np.arange(
+                action_count, dtype=np.uint8
+            )
+            action_cursor += action_count
+        if dataset_terminal:
+            terminal_request_indices.append(request_index)
+        if bootstrap_valid:
+            if request_index + 1 >= len(windows):
+                raise ProposalConversionError(
+                    f"{episode_dir}: final request cannot bootstrap"
+                )
             successor = windows[request_index + 1]
             if (
                 window.get("next_input_npz") != successor.get("input_npz")
                 or window.get("next_frame_indices") != successor.get("frame_indices")
-                or window.get("bootstrap_valid") is not True
+                or action_count != ACTION_HORIZON
+                or not bool(successor.get("action_valid"))
+                or dataset_terminal
             ):
                 raise ProposalConversionError(
                     f"{episode_dir}: request {request_index} successor differs"
                 )
-        elif (
-            window.get("next_input_npz") is not None
-            or window.get("next_frame_indices") is not None
-            or window.get("bootstrap_valid") is not False
-            or window.get("dataset_terminal") is not True
+        elif window.get("next_input_npz") is not None or window.get(
+            "next_frame_indices"
+        ) is not None:
+            raise ProposalConversionError(
+                f"{episode_dir}: non-bootstrapping request has a successor"
+            )
+        if dataset_terminal and (
+            not action_valid or action_cursor != record.actions
         ):
-            raise ProposalConversionError(f"{episode_dir}: final request differs")
+            raise ProposalConversionError(
+                f"{episode_dir}: dataset terminal is not the final action request"
+            )
+        if not action_valid and (
+            bootstrap_valid
+            or dataset_terminal
+            or window.get("start_time") is not None
+            or window.get("last_action_time") is not None
+        ):
+            raise ProposalConversionError(
+                f"{episode_dir}: empty request carries executable metadata"
+            )
+
+    if action_cursor != record.actions:
+        raise ProposalConversionError(
+            f"{episode_dir}: request windows cover {action_cursor} of "
+            f"{record.actions} actions"
+        )
+    if len(terminal_request_indices) != 1:
+        raise ProposalConversionError(
+            f"{episode_dir}: expected exactly one dataset-terminal request"
+        )
+    terminal_request_index = terminal_request_indices[0]
+    if any(request_action_counts[index] for index in range(terminal_request_index + 1, len(windows))):
+        raise ProposalConversionError(
+            f"{episode_dir}: executable request follows the dataset terminal"
+        )
+
+    expected_boundary = np.zeros(record.actions, dtype=np.uint8)
+    for start, count in zip(request_action_starts, request_action_counts):
+        if count:
+            expected_boundary[start + count - 1] = 1
+    timing_boundary = np.asarray(
+        [sample.get("timing_boundary") for sample in samples], dtype=np.uint8
+    )
+    sample_bootstrap = np.asarray(
+        [sample.get("bootstrap_valid") for sample in samples], dtype=np.uint8
+    )
+    expected_sample_bootstrap = np.ones(record.actions, dtype=np.uint8)
+    expected_sample_bootstrap[-1] = 0
+    sample_windows = np.asarray(
+        [sample.get("window_id", -1) for sample in samples], dtype=np.int64
+    )
+    sample_chunks = np.asarray(
+        [sample.get("chunk", -1) for sample in samples], dtype=np.int64
+    )
+    sample_offsets = np.asarray(
+        [sample.get("substep", -1) for sample in samples], dtype=np.int64
+    )
+    if (
+        not np.array_equal(timing_boundary, expected_boundary)
+        or not np.array_equal(sample_bootstrap, expected_sample_bootstrap)
+        or not np.array_equal(sample_windows, policy_chunk_indices)
+        or not np.array_equal(sample_chunks, policy_chunk_indices)
+        or not np.array_equal(
+            sample_offsets, policy_chunk_offsets.astype(np.int64)
+        )
+    ):
+        raise ProposalConversionError(
+            f"{episode_dir}: per-action request metadata differs"
+        )
 
     request_obs = {
         key: np.stack(values) for key, values in request_values.items()
@@ -735,7 +916,11 @@ def _policy_payload(
     # machinery intact. The request-aware sparse loader replaces these repeated
     # current observations with the exact two-frame request tensors.
     obs = {
-        key: np.repeat(request_obs[key][:, 1], ACTION_HORIZON, axis=0)
+        key: np.repeat(
+            request_obs[key][:, 1],
+            np.asarray(request_action_counts, dtype=np.int64),
+            axis=0,
+        )
         for key in OBS_KEYS
     }
     rewards = np.asarray([sample.get("reward") for sample in samples], dtype=np.float32)
@@ -760,7 +945,22 @@ def _policy_payload(
         "rewards": rewards,
         "dones": dones,
         "outcome": outcome,
-        "chunk_critic_valid": (source_indices % ACTION_HORIZON == 0).astype(np.uint8),
+        # Every executed request is a real semi-MDP transition. A partial final
+        # request is admitted too: the trainer derives its shorter action mask
+        # from the terminal label and verifies it against request_action_count.
+        "chunk_critic_valid": np.isin(
+            source_indices,
+            np.asarray(
+                [
+                    start
+                    for start, count in zip(
+                        request_action_starts, request_action_counts
+                    )
+                    if count > 0
+                ],
+                dtype=np.int64,
+            ),
+        ).astype(np.uint8),
         # This source is request-level H8 data, not a true one-step transition
         # corpus. Keeping this mask empty makes accidental one-step use fail.
         "one_step_critic_valid": np.zeros(record.actions, dtype=np.uint8),
@@ -773,23 +973,34 @@ def _policy_payload(
                 [sample.get("dt_to_next_action_sec") for sample in samples],
                 dtype=np.float64,
             ),
-            "timing_boundary": np.asarray(
-                [sample.get("timing_boundary") for sample in samples], dtype=np.uint8
-            ),
-            "policy_chunk_index": source_indices // ACTION_HORIZON,
-            "policy_chunk_offset": (source_indices % ACTION_HORIZON).astype(np.uint8),
+            "timing_boundary": timing_boundary,
+            "policy_chunk_index": policy_chunk_indices,
+            "policy_chunk_offset": policy_chunk_offsets,
             "action_before_pose": before_pose,
             "request_state_time": np.stack(request_state_times),
             "request_main_time": np.stack(request_main_times),
             "request_wrist_time": np.stack(request_wrist_times),
-            "request_action_start": np.arange(
-                0, record.actions, ACTION_HORIZON, dtype=np.int64
+            "request_action_start": np.asarray(
+                request_action_starts, dtype=np.int64
+            ),
+            "request_action_count": np.asarray(
+                request_action_counts, dtype=np.uint8
+            ),
+            "request_action_valid": np.asarray(
+                request_action_valid, dtype=np.uint8
+            ),
+            "request_dataset_terminal": np.asarray(
+                request_dataset_terminal, dtype=np.uint8
             ),
             "request_bootstrap_valid": np.asarray(
                 [window.get("bootstrap_valid") for window in windows], dtype=np.uint8
             ),
         },
         "request_files": request_files,
+        "action_valid_request_count": int(sum(request_action_valid)),
+        "full_h8_request_count": int(
+            sum(count == ACTION_HORIZON for count in request_action_counts)
+        ),
     }
 
 
@@ -1079,11 +1290,15 @@ def _write_source(
     written_counts: dict[str, int] = {}
     total = 0
     request_total = 0
+    action_valid_request_total = 0
     full_chunk_total = 0
     generation_id = uuid.uuid4().hex
     try:
         with h5py.File(temporary, "w") as target:
-            target.attrs["conversion_version"] = CONVERSION_VERSION
+            conversion_version = (
+                ROLLOUT_CONVERSION_VERSION if kind == "rollout" else CONVERSION_VERSION
+            )
+            target.attrs["conversion_version"] = conversion_version
             target.attrs["task"] = profile.task
             target.attrs["generation_id"] = generation_id
             target.attrs["source_kind"] = kind
@@ -1135,10 +1350,17 @@ def _write_source(
                     request_obs.attrs["source"] = "digest-verified chunk_XXXX_input.npz"
                     request_obs.attrs["files"] = json.dumps(payload["request_files"])
                     request_total += int(next(iter(payload["request_obs"].values())).shape[0])
+                    action_valid_request_total += int(
+                        payload["action_valid_request_count"]
+                    )
                 provenance = demo.create_group("provenance")
                 for name, values in payload["provenance"].items():
                     provenance.create_dataset(name, data=values)
-                full_chunk_total += int(np.sum(payload["chunk_critic_valid"]))
+                full_chunk_total += (
+                    int(payload["full_h8_request_count"])
+                    if record.proposal_exact
+                    else int(np.sum(payload["chunk_critic_valid"]))
+                )
                 total += count
                 outcomes[record.package_name] = str(payload["outcome"])
                 written_counts[record.package_name] = count
@@ -1165,16 +1387,20 @@ def _write_source(
             for name, values in mask_values.items():
                 masks.create_dataset(name, data=np.asarray(values, dtype="S"))
             manifest = {
-                "conversion_version": CONVERSION_VERSION,
+                "conversion_version": conversion_version,
                 "task": profile.task,
                 "rollout_policy_provenance": (
                     {
                         "identity_layout": profile.rollout_identity_layout,
                         "experiment_name": profile.expected_experiment_name,
                         "checkpoint_sha256": profile.expected_checkpoint_sha256,
+                        "checkpoint_epoch": profile.expected_checkpoint_epoch,
                         "sampler": "ddim",
                         "runtime_num_inference_steps": (
                             profile.expected_runtime_inference_steps
+                        ),
+                        "completion_reasons": list(
+                            profile.expected_completion_reasons
                         ),
                     }
                     if kind == "rollout"
@@ -1187,6 +1413,7 @@ def _write_source(
                 "episode_count": len(records),
                 "transition_count": total,
                 "request_count": request_total,
+                "action_valid_request_count": action_valid_request_total,
                 "full_h8_window_count": full_chunk_total,
                 "observation": {
                     "request_obs": (
@@ -1235,6 +1462,7 @@ def _write_source(
         "episodes": len(records),
         "transitions": total,
         "requests": request_total,
+        "action_valid_requests": action_valid_request_total,
         "full_h8_windows": full_chunk_total,
     }
 
@@ -1255,14 +1483,20 @@ def validate_output(
         profile.expected_rollouts if kind == "rollout" else profile.expected_humans
     )
     expected_transitions = (
-        profile.expected_rollouts * profile.expected_rollout_actions
+        profile.expected_rollout_transition_total
         if kind == "rollout"
         else profile.expected_human_transitions
     )
     expected_requests = profile.expected_requests if kind == "rollout" else 0
     errors = []
     with h5py.File(path, "r") as source:
-        if _text(source.attrs.get("conversion_version", "")) != CONVERSION_VERSION:
+        expected_conversion_version = (
+            ROLLOUT_CONVERSION_VERSION if kind == "rollout" else CONVERSION_VERSION
+        )
+        if (
+            _text(source.attrs.get("conversion_version", ""))
+            != expected_conversion_version
+        ):
             errors.append("conversion version differs")
         if _text(source.attrs.get("task", "")) != profile.task:
             errors.append("task differs")
@@ -1280,6 +1514,7 @@ def validate_output(
             errors.append(f"episode count={len(data)}, expected={expected_episodes}")
         total = 0
         requests = 0
+        action_valid_requests = 0
         full_chunks = 0
         for key, demo in data.items():
             count = int(demo.attrs.get("num_samples", -1))
@@ -1312,7 +1547,6 @@ def validate_output(
             values = np.asarray(demo["chunk_critic_valid"][:], dtype=np.uint8)
             if values.shape != (count,) or np.any(~np.isin(values, (0, 1))):
                 errors.append(f"{key}/chunk_critic_valid differs")
-            full_chunks += int(values.sum())
             one_step = np.asarray(demo["one_step_critic_valid"][:], dtype=np.uint8)
             if one_step.shape != (count,) or np.any(~np.isin(one_step, (0, 1))):
                 errors.append(f"{key}/one_step_critic_valid differs")
@@ -1320,10 +1554,11 @@ def validate_output(
             if request_aligned != (kind == "rollout"):
                 errors.append(f"{key} request_aligned differs")
             if kind == "rollout":
+                request_count = int(demo["request_obs/main_image"].shape[0])
                 for obs_key, trailing in OBS_SHAPES.items():
                     request_dataset = demo[f"request_obs/{obs_key}"]
                     if request_dataset.shape != (
-                        profile.expected_requests_per_rollout,
+                        request_count,
                         2,
                         *trailing,
                     ):
@@ -1336,17 +1571,47 @@ def validate_output(
                 starts = np.asarray(
                     demo["provenance/request_action_start"][:], dtype=np.int64
                 )
-                if not np.array_equal(
-                    starts,
-                    np.arange(
-                        0,
-                        profile.expected_rollout_actions,
-                        ACTION_HORIZON,
-                    ),
+                counts = np.asarray(
+                    demo["provenance/request_action_count"][:], dtype=np.uint8
+                )
+                request_valid = np.asarray(
+                    demo["provenance/request_action_valid"][:], dtype=np.uint8
+                )
+                dataset_terminal = np.asarray(
+                    demo["provenance/request_dataset_terminal"][:],
+                    dtype=np.uint8,
+                )
+                bootstrap = np.asarray(
+                    demo["provenance/request_bootstrap_valid"][:], dtype=np.uint8
+                )
+                expected_starts = np.concatenate(
+                    (
+                        np.zeros(1, dtype=np.int64),
+                        np.cumsum(counts[:-1], dtype=np.int64),
+                    )
+                )
+                if (
+                    any(
+                        array.shape != (request_count,)
+                        for array in (
+                            starts,
+                            counts,
+                            request_valid,
+                            dataset_terminal,
+                            bootstrap,
+                        )
+                    )
+                    or np.any(counts > ACTION_HORIZON)
+                    or not np.array_equal(starts, expected_starts)
+                    or int(counts.sum()) != count
+                    or not np.array_equal(request_valid, (counts > 0).astype(np.uint8))
+                    or int(dataset_terminal.sum()) != 1
+                    or np.any(~np.isin(bootstrap, (0, 1)))
                 ):
                     errors.append(f"{key} request starts differ")
                 expected_valid = np.zeros(count, dtype=np.uint8)
-                expected_valid[starts] = 1
+                nonempty_starts = starts[counts > 0]
+                expected_valid[nonempty_starts] = 1
                 if not np.array_equal(values, expected_valid):
                     errors.append(f"{key} proposal validity differs")
                 offsets = np.asarray(
@@ -1355,44 +1620,72 @@ def validate_output(
                 chunk_indices = np.asarray(
                     demo["provenance/policy_chunk_index"][:], dtype=np.int64
                 )
-                bootstrap = np.asarray(
-                    demo["provenance/request_bootstrap_valid"][:], dtype=np.uint8
+                expected_offsets = np.concatenate(
+                    [np.arange(int(value), dtype=np.uint8) for value in counts]
                 )
-                if not np.array_equal(
-                    offsets,
-                    np.tile(np.arange(ACTION_HORIZON, dtype=np.uint8), len(starts)),
-                ):
+                expected_indices = np.repeat(
+                    np.arange(request_count, dtype=np.int64), counts
+                )
+                if not np.array_equal(offsets, expected_offsets):
                     errors.append(f"{key} proposal offsets differ")
-                if not np.array_equal(
-                    chunk_indices,
-                    np.repeat(np.arange(len(starts), dtype=np.int64), ACTION_HORIZON),
-                ):
+                if not np.array_equal(chunk_indices, expected_indices):
                     errors.append(f"{key} proposal indices differ")
-                expected_bootstrap = np.ones(len(starts), dtype=np.uint8)
-                expected_bootstrap[-1] = 0
-                if not np.array_equal(bootstrap, expected_bootstrap):
+                terminal_indices = np.flatnonzero(dataset_terminal)
+                terminal_index = int(terminal_indices[0])
+                if (
+                    counts[terminal_index] == 0
+                    or starts[terminal_index] + counts[terminal_index] != count
+                    or np.any(counts[terminal_index + 1 :] != 0)
+                    or bootstrap[terminal_index] != 0
+                    or np.any(bootstrap[counts == 0] != 0)
+                    or any(
+                        bootstrap[index]
+                        and (
+                            index + 1 >= request_count
+                            or counts[index] != ACTION_HORIZON
+                            or counts[index + 1] == 0
+                        )
+                        for index in range(request_count)
+                    )
+                ):
                     errors.append(f"{key} request bootstrap validity differs")
                 if np.any(one_step != 0):
                     errors.append(f"{key} incorrectly enables one-step rollout rows")
                 for obs_key in OBS_KEYS:
-                    if not np.array_equal(
-                        demo[f"obs/{obs_key}"][starts],
+                    expected_obs = np.repeat(
                         demo[f"request_obs/{obs_key}"][:, -1],
-                    ):
+                        counts.astype(np.int64),
+                        axis=0,
+                    )
+                    if not np.array_equal(demo[f"obs/{obs_key}"][:], expected_obs):
                         errors.append(f"{key}/{obs_key} compatibility rows differ")
-                requests += len(starts)
+                requests += request_count
+                action_valid_requests += int(request_valid.sum())
+                full_chunks += int(np.sum(counts == ACTION_HORIZON))
             elif (
                 np.any(values != 1)
                 or np.any(one_step != 1)
                 or bool(demo.attrs.get("one_step_aligned", 0))
             ):
                 errors.append(f"{key} human stride-one validity differs")
+            else:
+                full_chunks += int(values.sum())
         if total != expected_transitions or int(data.attrs.get("total", -1)) != total:
             errors.append(f"transition total={total}, expected={expected_transitions}")
         if requests != expected_requests:
             errors.append(f"request total={requests}, expected={expected_requests}")
+        expected_action_valid_requests = (
+            profile.expected_action_valid_request_total
+            if kind == "rollout"
+            else 0
+        )
+        if action_valid_requests != expected_action_valid_requests:
+            errors.append(
+                "action-valid requests="
+                f"{action_valid_requests}, expected={expected_action_valid_requests}"
+            )
         expected_full_chunks = (
-            profile.expected_requests
+            profile.expected_full_h8_request_total
             if kind == "rollout"
             else profile.expected_human_transitions
         )
@@ -1405,6 +1698,11 @@ def validate_output(
             or int(manifest.get("transition_count", -1)) != total
             or int(manifest.get("request_count", -1)) != requests
             or int(manifest.get("full_h8_window_count", -1)) != full_chunks
+            or (
+                kind == "rollout"
+                and int(manifest.get("action_valid_request_count", -1))
+                != action_valid_requests
+            )
         ):
             errors.append("manifest totals differ")
         all_keys = set(_decode(masks["all"][:])) if "all" in masks else set()
@@ -1456,6 +1754,7 @@ def validate_output(
         "episodes": expected_episodes,
         "transitions": total,
         "requests": expected_requests,
+        "action_valid_requests": action_valid_requests,
         "full_h8_windows": full_chunks,
     }
 

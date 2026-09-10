@@ -25,7 +25,7 @@ DEFAULT_ROLLOUT_DATASET = (
 DEFAULT_OUTPUT = (
     ROOT
     / "datasets/real_robot/pick_cup/idql/"
-    "pick_cup_chunk_idql_episode_layout_v1_45demo_23success_11failure_"
+    "pick_cup_chunk_idql_episode_layout_v1_45demo_24success_8failure_"
     "terminal_success_human_success_condition.hdf5"
 )
 
@@ -37,14 +37,14 @@ def configure_core() -> None:
     core.DEFAULT_OUTPUT = DEFAULT_OUTPUT
     core.TASK = "pick_cup"
     core.BUILDER_VERSION = (
-        "pick_cup_chunk_idql_mixed_v2_episode_layout_stride_one_human"
+        "pick_cup_chunk_idql_mixed_v3_operator_ended_stride_one_human"
     )
     core.REQUIRE_CRITIC_VALIDITY = True
     core.EXPERT_CHUNK_VALIDITY_MODE = "stride_one"
     core.DEFAULT_HUMAN_COUNT = 45
     core.DEFAULT_EXPECTED_HUMAN_TRANSITIONS = 17_127
-    core.DEFAULT_SUCCESS_COUNT = 23
-    core.DEFAULT_FAILURE_COUNT = 11
+    core.DEFAULT_SUCCESS_COUNT = 24
+    core.DEFAULT_FAILURE_COUNT = 8
     core.DEFAULT_ACTOR_CONDITION_MODE = "human_success"
     core.DEFAULT_HUMAN_DATASETS_HELP = (
         "PickCup human HDF5; every selected human row is an overlapping H8 "

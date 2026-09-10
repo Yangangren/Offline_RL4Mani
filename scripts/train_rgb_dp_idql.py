@@ -1212,13 +1212,7 @@ def build_single_loader(
                 dynamics_prediction_offsets=tuple(
                     getattr(args, "dynamics_prediction_offsets", ())
                 ),
-                validity_key=str(
-                    getattr(
-                        args,
-                        "sparse_chunk_validity_key",
-                        "chunk_critic_valid",
-                    )
-                ),
+                validity_key="chunk_critic_valid",
             )
         elif sparse_one_step_loader:
             dataset = SparseOneStepSequenceDataset(
@@ -2663,16 +2657,6 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
 
 def train(args: argparse.Namespace) -> dict:
     distributed = initialize_distributed(args)
-    expected_world_size = getattr(args, "expected_world_size", None)
-    if (
-        expected_world_size is not None
-        and int(distributed.world_size) != int(expected_world_size)
-    ):
-        raise RuntimeError(
-            "distributed launch world-size mismatch: "
-            f"requested {int(expected_world_size)}, initialized "
-            f"{int(distributed.world_size)}"
-        )
     args.distributed = bool(distributed.enabled)
     args.distributed_rank = int(distributed.rank)
     args.distributed_local_rank = int(distributed.local_rank)
@@ -3915,8 +3899,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("schedule-reference-batch-size must be positive")
     if args.gradient_bucket_cap_mb <= 0.0:
         parser.error("gradient-bucket-cap-mb must be positive")
-    if args.expected_world_size is not None and args.expected_world_size <= 0:
-        parser.error("--expected-world-size must be positive")
     if args.lr_num_cycles <= 0.0:
         parser.error("lr-num-cycles must be positive")
     if args.save_every_epochs <= 0:

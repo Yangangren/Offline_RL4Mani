@@ -90,6 +90,7 @@ def save_policy_checkpoint(
     global_step: int,
     history: list[dict],
     mode_name: str,
+    actor_one_step_rollouts: bool,
     actor_obs_encoder_freeze_steps: int,
     distributed_context: DistributedContext,
 ) -> None:
@@ -103,6 +104,7 @@ def save_policy_checkpoint(
         "self_imitation": True,
         "posttrain_mode": str(mode_name),
         "success_conditioned": str(mode_name) == "success_conditioned_mixed_quality_imitation_learning",
+        "actor_one_step_rollouts": bool(actor_one_step_rollouts),
         "actor_obs_encoder_freeze_steps": int(actor_obs_encoder_freeze_steps),
         "distributed_training": {
             "enabled": bool(distributed_context.enabled),
@@ -294,6 +296,7 @@ def make_summary(
                 else "weighted_random_with_replacement"
             ),
             "source_weighting_enabled": not bool(args.actor_uniform_sample_pool),
+            "one_step_rollouts": bool(args.actor_one_step_rollouts),
             "source_weights": None if args.actor_uniform_sample_pool else {
                 "human_demo": float(args.actor_demo_weight),
                 "success_rollout": float(args.actor_success_weight),
@@ -445,6 +448,15 @@ def train(args: argparse.Namespace) -> dict:
         if "model" not in ckpt:
             raise ValueError(f"resume checkpoint is not a robomimic policy checkpoint: {args.resume_checkpoint}")
         variable_state = ckpt.get("variable_state", {}) or {}
+        saved_one_step_rollouts = bool(
+            variable_state.get("actor_one_step_rollouts", False)
+        )
+        if saved_one_step_rollouts != bool(args.actor_one_step_rollouts):
+            raise ValueError(
+                "actor one-step rollout setting must match on resume: "
+                f"checkpoint={saved_one_step_rollouts} "
+                f"requested={args.actor_one_step_rollouts}"
+            )
         saved_freeze_steps = int(variable_state.get("actor_obs_encoder_freeze_steps", 0))
         if saved_freeze_steps != int(args.actor_obs_encoder_freeze_steps):
             raise ValueError(
@@ -566,6 +578,7 @@ def train(args: argparse.Namespace) -> dict:
                             else "weighted_random_with_replacement"
                         ),
                         "source_weighting_enabled": not bool(args.actor_uniform_sample_pool),
+                        "one_step_rollouts": bool(args.actor_one_step_rollouts),
                     },
                     "distributed_training": {
                         "enabled": bool(distributed.enabled),
@@ -666,6 +679,7 @@ def train(args: argparse.Namespace) -> dict:
                 global_step=global_step,
                 history=history,
                 mode_name=infer_mode_name(args),
+                actor_one_step_rollouts=args.actor_one_step_rollouts,
                 actor_obs_encoder_freeze_steps=args.actor_obs_encoder_freeze_steps,
                 distributed_context=distributed,
             )
@@ -689,6 +703,7 @@ def train(args: argparse.Namespace) -> dict:
                     global_step=global_step,
                     history=history,
                     mode_name=infer_mode_name(args),
+                    actor_one_step_rollouts=args.actor_one_step_rollouts,
                     distributed_context=distributed,
                     actor_obs_encoder_freeze_steps=args.actor_obs_encoder_freeze_steps,
                 )
@@ -809,6 +824,15 @@ def main() -> None:
         "--actor-uniform-sample-pool",
         action=argparse.BooleanOptionalAction,
         default=False,
+    )
+    parser.add_argument(
+        "--actor-one-step-rollouts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the one-step IDQL validity mask and two-frame one_step_obs "
+            "contract for rollout sources while retaining stride-one human rows."
+        ),
     )
     parser.add_argument("--actor-failure-demo-start-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--actor-failure-sample-start-offset", type=int, default=0)

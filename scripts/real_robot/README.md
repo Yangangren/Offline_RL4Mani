@@ -111,24 +111,24 @@ Build the request-aligned chunk sources with:
 
 Use `build_episode_layout_one_step_sources.py --task TASK` for one-step IDQL.
 Both converters verify every published checksum plus the exact deployed
-checkpoint and runtime contract. PickCup records its native DDIM-10 sampler in
-the `checkpoint_contract` identity layout; StackCup and MoveSpoon record
-the checkpoint DDIM-10 plus the deployed DDIM-100 runtime override. These are
-separate strict task profiles, not interchangeable sampler assumptions.
+checkpoint and runtime contract. All current rollouts record the checkpoint
+DDIM-10 sampler plus the deployed DDIM-100 runtime override. PickCup is tied to
+its epoch-50 checkpoint; StackCup and MoveSpoon remain tied to epoch 200.
 Human actions are kept on their recorded
 20 Hz target grid and mapped to the latest causal paired camera frame; only an
-initial action prefix before the first camera frame is dropped. PickCup
-rollouts keep all 400 actions and expose 50 digest-verified requests. StackCup
-and MoveSpoon keep all 600 actions and expose 75 requests. Chunk sources expose
-the exact request inputs;
+initial action prefix before the first camera frame is dropped. The operator-ended
+PickCup corpus contains 11,301 actions in 1,440 digest-verified requests: 1,405
+full H8 requests, 13 partial terminal requests, and 22 empty final requests.
+StackCup and MoveSpoon keep all 600 actions and expose 75 requests per episode.
+Chunk sources expose the exact request inputs;
 one-step sources hold each request camera pair inside its proposal and insert
 the exact per-action pre-command low-dimensional state. The one-step source
-masks each nonterminal substep-7 transition across the variable inference
-pause and retains the final terminal row (351 valid rows per PickCup rollout,
-526 for StackCup and MoveSpoon).
+masks each nonterminal request-edge transition across the variable inference
+pause and retains the final terminal row (9,923 valid PickCup rows in total;
+526 per StackCup and MoveSpoon rollout).
 
 The immutable human split is 45/5 for all three tasks. PickCup rollouts split
-23/11 train success/failure and 6/3 validation. StackCup uses 20/10 and 6/4;
+24/8 train success/failure and 6/2 validation. StackCup uses 20/10 and 6/4;
 MoveSpoon uses 20/11 and 5/4. Thus every rollout belongs to either fitting or
 validation. The mixed builders use external links, so their small HDF5 files depend
 on the canonical source files and validate their identities before training.
@@ -143,7 +143,7 @@ is `human_success`: human and successful-rollout rows have condition 1, while
 failed-rollout rows have condition 0. Each build or validation prints these
 semantics and the positive/negative episode and transition counts. The first
 training run uses `pretrained_dp_joint`, initializing
-from the deployed epoch-200 Diffusion Policy and optimizing the actor jointly
+from the task's deployed Diffusion Policy and optimizing the actor jointly
 with Q/V; the actor is not frozen.
 
 From the repository root, build the converted rollout and mixed fitting data:
@@ -195,10 +195,10 @@ bash run_rgb_dp_idql.sh pick_cup build_dataset
 bash run_rgb_dp_idql.sh pick_cup train_resilient
 ```
 
-The run initializes its trainable diffusion actor from the deployed epoch-200
+The PickCup run initializes its trainable diffusion actor from the deployed epoch-50
 checkpoint and uses `robot0_gripper_state` as the critic's late-fusion key.
 Outputs go to
-`trained_models/real_robot/pick_cup_rgb_dp/idql/45demo_23success_11failure_terminal_success_rise_temporal_v2_episode_layout_v1`.
+`trained_models/real_robot/pick_cup_rgb_dp/idql/45demo_24success_8failure_terminal_success_rise_temporal_v2_episode_layout_v1`.
 The launcher's generic `eval`, `eval_grid_resilient`, and composed evaluation
 stages are rejected for `pick_cup` because they instantiate robomimic
 simulation rather than the guarded real-robot client.
@@ -225,12 +225,12 @@ explicitly marked as composite training states, not new request captures.
 
 StackCup remains the reference implementation; PickCup and MoveSpoon use the
 same conversion, sparse-loader, model, validation, and training contract.
-PickCup has 43 finalized policy rollouts; the other tasks have 40. Every task
-has 50 human demonstrations. Conversion verifies the complete checksum
-manifests, deployed epoch-200 checkpoint, and runtime contract.
+Every task has 40 finalized policy rollouts and 50 human demonstrations.
+Conversion verifies the complete checksum manifests, each task's exact
+deployed checkpoint, and the runtime contract.
 
 Each StackCup and MoveSpoon policy rollout has 600 recorded normalized actions
-grouped into 75 exact H8 proposals; PickCup has 400 actions and 50 proposals.
+grouped into 75 exact H8 proposals; PickCup uses variable operator-ended lengths.
 Each proposal stores the original `chunk_XXXX_input.npz` as an
 exact two-frame `request_obs` tensor for both cameras and all three low-dimensional
 state keys. The sparse loader admits only the 75 proposal starts and directly
@@ -241,7 +241,9 @@ is marked unavailable. Human demonstrations retain causal action-time
 observations. The mixed chunk-IDQL builder admits every selected human action
 row as a stride-one H8 start; terminal-adjacent rows are shortened by the
 existing action mask. Rollouts remain restricted to their exact recorded
-proposal starts.
+proposal starts. PickCup partial terminal requests are retained as shorter
+semi-MDP transitions; the trainer verifies their recorded action count against
+the terminal-derived action mask. Empty requests produce no training row.
 
 The diffusion actor still uses its normal full 16-step denoising objective at
 each admitted row. There is no `actor_action_loss_mask` and no change to the
@@ -251,8 +253,9 @@ The StackCup fitting set has 36,841 stored rows and 21,091 admitted H8 starts:
 18,841 stride-one human starts plus 2,250 exact rollout proposals. Its held-out
 set has 8,325 stored rows and 3,075 admitted starts. MoveSpoon has 37,104 / 20,829
 for fitting and 7,477 / 2,752 held out. The refreshed PickCup human source has
-17,127 fitting rows and 1,612 held-out rows; its mixed totals depend on the next
-rollout package. Validation is evaluated in full after every epoch
+17,127 fitting rows and 1,612 held-out rows. The PickCup mixed fitting set has
+26,129 stored rows and 18,256 admitted chunk starts; its held-out set has 3,911
+stored rows and 1,901 admitted starts. Validation is evaluated in full after every epoch
 using EMA actor weights, with the lowest held-out actor loss saved as
 `best_validation.pt`.
 

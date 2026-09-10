@@ -56,6 +56,7 @@ DEFAULT_FAILURE_SOURCE_FILTER_KEY=failure
 DEFAULT_SUCCESS_FILTER_SIZE=100
 DEFAULT_ACTOR_BATCH_SIZE=100
 DEFAULT_ACTOR_LR=
+DEFAULT_ACTOR_ONE_STEP_ROLLOUTS=0
 DEFAULT_ACTOR_OBS_ENCODER_FREEZE_STEPS=0
 DEFAULT_EXPECTED_DEMO_FILTER_COUNT=-1
 DEFAULT_EXPECTED_SUCCESS_FILTER_COUNT=-1
@@ -117,33 +118,34 @@ case "$TASK" in
   pick_cup)
     TASK_REAL_ROBOT=1
     TASK_RGB_PREFIX=pick_cup_rgb_dp
-    DEFAULT_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_200.pth
+    DEFAULT_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260908111825/models/model_epoch_50.pth
     DEFAULT_DEMO_DATASET=datasets/real_robot/pick_cup/pick_cup_rgb.hdf5
-    DEFAULT_ROLLOUT_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_episode_layout_v1_request_rollouts.hdf5
+    DEFAULT_ROLLOUT_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_episode_layout_v1_one_step_rollouts.hdf5
     DEFAULT_DEMO_FILTER_KEY=train
     DEFAULT_SUCCESS_SOURCE_FILTER_KEY=success_train
     DEFAULT_FAILURE_SOURCE_FILTER_KEY=failure_train
-    DEFAULT_SUCCESS_FILTER_SIZE=23
-    DEFAULT_FAILURE_FILTER_SIZE=11
+    DEFAULT_SUCCESS_FILTER_SIZE=24
+    DEFAULT_FAILURE_FILTER_SIZE=8
     DEFAULT_FAILURE_FILTER_KEY=failure_train
     DEFAULT_EXPECTED_DEMO_FILTER_COUNT=45
-    DEFAULT_EXPECTED_SUCCESS_FILTER_COUNT=23
+    DEFAULT_EXPECTED_SUCCESS_FILTER_COUNT=24
     DEFAULT_ACTOR_BATCH_SIZE=64
     DEFAULT_ACTOR_LR=1e-5
+    DEFAULT_ACTOR_ONE_STEP_ROLLOUTS=1
     DEFAULT_ACTOR_OBS_ENCODER_FREEZE_STEPS=1000
-    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/self_imitation/45demo_23success_episode_layout_v1
-    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/mixed_imitation/45demo_23success_11failure_episode_layout_v1
-    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/mixed_imitation/45demo_23success_11failure_episode_layout_v1_conditioned
-    DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=pick_cup_rgb_dp_self_imitation_45demo_23success_episode_layout_v1
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/self_imitation/45demo_24success_episode_layout_v1_one_step
+    DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/mixed_imitation/45demo_24success_8failure_episode_layout_v1
+    DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/mixed_imitation/45demo_24success_8failure_episode_layout_v1_conditioned
+    DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=pick_cup_rgb_dp_self_imitation_45demo_24success_episode_layout_v1_one_step
     DEFAULT_EVAL_OUTPUT=rollouts/real_robot/pick_cup/imitation_eval
-    DEFAULT_HORIZON=400
+    DEFAULT_HORIZON=600
     ;;
   stack_cup)
     TASK_REAL_ROBOT=1
     TASK_RGB_PREFIX=stack_cup_rgb_dp
     DEFAULT_DP_CHECKPOINT=trained_models/real_robot/stack_cup_rgb_dp/stack_cup_rgb_dp_ddim_s1/20260902111545/models/model_epoch_200.pth
     DEFAULT_DEMO_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_episode_layout_v1_human.hdf5
-    DEFAULT_ROLLOUT_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_episode_layout_v1_request_rollouts.hdf5
+    DEFAULT_ROLLOUT_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_episode_layout_v1_one_step_rollouts.hdf5
     DEFAULT_DEMO_FILTER_KEY=train
     DEFAULT_SUCCESS_SOURCE_FILTER_KEY=success_train
     DEFAULT_FAILURE_SOURCE_FILTER_KEY=failure_train
@@ -154,11 +156,12 @@ case "$TASK" in
     DEFAULT_EXPECTED_SUCCESS_FILTER_COUNT=20
     DEFAULT_ACTOR_BATCH_SIZE=64
     DEFAULT_ACTOR_LR=1e-5
+    DEFAULT_ACTOR_ONE_STEP_ROLLOUTS=1
     DEFAULT_ACTOR_OBS_ENCODER_FREEZE_STEPS=1000
-    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/self_imitation/45demo_20success_episode_layout_v1
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/self_imitation/45demo_20success_episode_layout_v1_one_step
     DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/mixed_imitation/45demo_20success_10failure_episode_layout_v1
     DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/mixed_imitation/45demo_20success_10failure_episode_layout_v1_conditioned
-    DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=stack_cup_rgb_dp_self_imitation_45demo_20success_episode_layout_v1
+    DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=stack_cup_rgb_dp_self_imitation_45demo_20success_episode_layout_v1_one_step
     DEFAULT_EVAL_OUTPUT=rollouts/real_robot/stack_cup/imitation_eval
     DEFAULT_HORIZON=600
     ;;
@@ -167,7 +170,7 @@ case "$TASK" in
     TASK_RGB_PREFIX=move_spoon_rgb_dp
     DEFAULT_DP_CHECKPOINT=trained_models/real_robot/move_spoon_rgb_dp/move_spoon_rgb_dp_ddim_s1/20260903104112/models/model_epoch_200.pth
     DEFAULT_DEMO_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_episode_layout_v1_human.hdf5
-    DEFAULT_ROLLOUT_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_episode_layout_v1_request_rollouts.hdf5
+    DEFAULT_ROLLOUT_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_episode_layout_v1_one_step_rollouts.hdf5
     DEFAULT_DEMO_FILTER_KEY=train
     DEFAULT_SUCCESS_SOURCE_FILTER_KEY=success_train
     DEFAULT_FAILURE_SOURCE_FILTER_KEY=failure_train
@@ -178,11 +181,12 @@ case "$TASK" in
     DEFAULT_EXPECTED_SUCCESS_FILTER_COUNT=20
     DEFAULT_ACTOR_BATCH_SIZE=64
     DEFAULT_ACTOR_LR=1e-5
+    DEFAULT_ACTOR_ONE_STEP_ROLLOUTS=1
     DEFAULT_ACTOR_OBS_ENCODER_FREEZE_STEPS=1000
-    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/self_imitation/45demo_20success_episode_layout_v1
+    DEFAULT_SELF_IMITATION_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/self_imitation/45demo_20success_episode_layout_v1_one_step
     DEFAULT_MIXED_IMITATION_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/mixed_imitation/45demo_20success_11failure_episode_layout_v1
     DEFAULT_CONDITIONED_IMITATION_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/mixed_imitation/45demo_20success_11failure_episode_layout_v1_conditioned
-    DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=move_spoon_rgb_dp_self_imitation_45demo_20success_episode_layout_v1
+    DEFAULT_SELF_IMITATION_EXPERIMENT_NAME=move_spoon_rgb_dp_self_imitation_45demo_20success_episode_layout_v1_one_step
     DEFAULT_EVAL_OUTPUT=rollouts/real_robot/move_spoon/imitation_eval
     DEFAULT_HORIZON=600
     ;;
@@ -290,6 +294,7 @@ HORIZON=${HORIZON:-$DEFAULT_HORIZON}
 
 ACTOR_BATCH_SIZE=${ACTOR_BATCH_SIZE:-$DEFAULT_ACTOR_BATCH_SIZE}
 ACTOR_LR=${ACTOR_LR:-$DEFAULT_ACTOR_LR}
+ACTOR_ONE_STEP_ROLLOUTS=${ACTOR_ONE_STEP_ROLLOUTS:-$DEFAULT_ACTOR_ONE_STEP_ROLLOUTS}
 ACTOR_OBS_ENCODER_FREEZE_STEPS=${ACTOR_OBS_ENCODER_FREEZE_STEPS:-$DEFAULT_ACTOR_OBS_ENCODER_FREEZE_STEPS}
 ACTOR_HDF5_CACHE_MODE=${ACTOR_HDF5_CACHE_MODE:-}
 ACTOR_NUM_WORKERS=${ACTOR_NUM_WORKERS:-4}
@@ -426,6 +431,15 @@ ACTOR_SAMPLE_POOL_ARGS=(--no-actor-uniform-sample-pool)
 if [[ "$ACTOR_UNIFORM_SAMPLE_POOL" == "1" ]]; then
   ACTOR_SAMPLE_POOL_ARGS=(--actor-uniform-sample-pool)
 fi
+ACTOR_ONE_STEP_ROLLOUT_ARGS=(--no-actor-one-step-rollouts)
+case "$ACTOR_ONE_STEP_ROLLOUTS" in
+  0) ;;
+  1) ACTOR_ONE_STEP_ROLLOUT_ARGS=(--actor-one-step-rollouts) ;;
+  *)
+    echo "ACTOR_ONE_STEP_ROLLOUTS must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
 
 ACTOR_LR_SCHEDULER_ARGS=(--no-actor-disable-lr-scheduler)
 if [[ "${ACTOR_DISABLE_LR_SCHEDULER:-0}" == "1" ]]; then
@@ -544,6 +558,7 @@ check_datasets() {
     "$ACTOR_NORMALIZE_WEIGHTS_BY_DS_SIZE" \
     "$SUCCESS_SELECTION_MANIFEST" \
     "$FAILURE_SELECTION_MANIFEST" \
+    "$ACTOR_ONE_STEP_ROLLOUTS" \
     "$ACTOR_OBS_ENCODER_FREEZE_STEPS" \
     "$ACTOR_BATCH_SIZE" \
     "$ACTOR_LR" \
@@ -567,6 +582,7 @@ import sys
 from pathlib import Path
 
 import h5py
+import numpy as np
 import torch
 
 (
@@ -583,6 +599,7 @@ import torch
     normalize_by_ds_size,
     success_selection_manifest,
     failure_selection_manifest,
+    actor_one_step_rollouts,
     actor_obs_encoder_freeze_steps,
     actor_batch_size,
     actor_lr,
@@ -601,7 +618,7 @@ import torch
     task_real_robot,
     expected_demo_filter_count,
     expected_success_filter_count,
-) = sys.argv[1:32]
+) = sys.argv[1:33]
 
 checkpoint_dict = torch.load(checkpoint, map_location="cpu", weights_only=False)
 checkpoint_config = json.loads(checkpoint_dict["config"])
@@ -737,6 +754,42 @@ def validate_real_robot_source(path, filter_key, expected_count, source_kind):
                         f"{path} data/{demo_key}/obs/{obs_key} is not aligned "
                         f"to num_samples={num_samples}"
                     )
+            if source_kind == "rollout_one_step_action_state":
+                if not bool(demo.attrs.get("one_step_aligned", 0)):
+                    raise ValueError(
+                        f"{path} data/{demo_key} is not marked one_step_aligned"
+                    )
+                if "one_step_critic_valid" not in demo:
+                    raise ValueError(
+                        f"{path} data/{demo_key} is missing one_step_critic_valid"
+                    )
+                validity = np.asarray(
+                    demo["one_step_critic_valid"][:], dtype=np.uint8
+                ).reshape(-1)
+                if (
+                    validity.shape != (num_samples,)
+                    or np.any(~np.isin(validity, (0, 1)))
+                    or int(validity.sum()) < 1
+                ):
+                    raise ValueError(
+                        f"{path} data/{demo_key}/one_step_critic_valid is invalid"
+                    )
+                if "one_step_obs" not in demo:
+                    raise ValueError(
+                        f"{path} data/{demo_key} is missing one_step_obs"
+                    )
+                one_step_obs = demo["one_step_obs"]
+                if set(one_step_obs.keys()) != expected_obs_keys:
+                    raise ValueError(
+                        f"{path} data/{demo_key}/one_step_obs keys differ"
+                    )
+                for obs_key in expected_obs_keys:
+                    if one_step_obs[obs_key].shape[:2] != (num_samples, 2):
+                        raise ValueError(
+                            f"{path} data/{demo_key}/one_step_obs/{obs_key} "
+                            f"has leading shape {one_step_obs[obs_key].shape[:2]}; "
+                            f"expected ({num_samples}, 2)"
+                        )
 
 if task_real_robot == "1":
     expected_obs_keys = {
@@ -775,14 +828,24 @@ if task_real_robot == "1":
         expected_demo_filter_count,
         "human",
     )
+    expected_rollout_source_kind = (
+        "rollout_one_step_action_state"
+        if actor_one_step_rollouts == "1"
+        else "rollout"
+    )
     validate_real_robot_source(
         rollout_dataset,
         success_filter,
         expected_success_filter_count,
-        "rollout",
+        expected_rollout_source_kind,
     )
 
-def selected_num_sequences(path, key, demo_start_only=False):
+def selected_num_sequences(
+    path,
+    key,
+    demo_start_only=False,
+    validity_key=None,
+):
     with h5py.File(path, "r") as f:
         if key:
             demos = decode(f[f"mask/{key}"][:])
@@ -790,15 +853,28 @@ def selected_num_sequences(path, key, demo_start_only=False):
             demos = list(f["data"].keys())
         if demo_start_only:
             return len(demos)
+        if validity_key is not None:
+            return sum(
+                int(np.asarray(f[f"data/{demo}/{validity_key}"][:]).sum())
+                for demo in demos
+            )
         return sum(int(f[f"data/{demo}"].attrs["num_samples"]) for demo in demos)
 
+one_step_validity_key = (
+    "one_step_critic_valid" if actor_one_step_rollouts == "1" else None
+)
 source_num_sequences = {
     "human_demo": selected_num_sequences(demo_dataset, demo_filter),
-    "success_rollout": selected_num_sequences(rollout_dataset, success_filter),
+    "success_rollout": selected_num_sequences(
+        rollout_dataset,
+        success_filter,
+        validity_key=one_step_validity_key,
+    ),
     "failure_rollout": selected_num_sequences(
         failure_dataset,
         failure_filter,
         demo_start_only=failure_demo_start_only == "1",
+        validity_key=one_step_validity_key,
     ),
 }
 pooled_num_sequences = sum(
@@ -841,6 +917,7 @@ report = {
             checkpoint_policy_optim["learning_rate"]["warmup_steps"]
         ),
         "actor_obs_encoder_freeze_steps": int(actor_obs_encoder_freeze_steps),
+        "actor_one_step_rollouts": actor_one_step_rollouts == "1",
         "scheduler_num_cycles": float(
             checkpoint_policy_optim["learning_rate"]["num_cycles"]
         ),
@@ -1014,6 +1091,7 @@ run_train() {
     --actor-demo-weight "$IMITATION_DEMO_WEIGHT_VALUE" \
     --actor-success-weight "$IMITATION_SUCCESS_WEIGHT_VALUE" \
     --actor-failure-weight "$IMITATION_FAILURE_WEIGHT_VALUE" \
+    "${ACTOR_ONE_STEP_ROLLOUT_ARGS[@]}" \
     "${FAILURE_CHUNK_ARGS[@]}" \
     "${CONDITION_ARGS[@]}" \
     --mode-name "$IMITATION_MODE_NAME_VALUE" \

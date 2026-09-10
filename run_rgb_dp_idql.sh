@@ -100,20 +100,20 @@ case "$TASK" in
     TASK_TERMINAL_SUCCESS_DATASET=datasets/tool_hang/idql/tool_hang_rgb_dp_idql_200demo_132success_168failure_terminal_success.hdf5
     ;;
   pick_cup)
-    TASK_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260816144749/models/model_epoch_200.pth
+    TASK_DP_CHECKPOINT=trained_models/real_robot/pick_cup_rgb_dp/pick_cup_rgb_dp_ddim_s1/20260908111825/models/model_epoch_50.pth
     TASK_EXPERT_DATASET=datasets/real_robot/pick_cup/pick_cup_rgb.hdf5
     TASK_ROLLOUT_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_episode_layout_v1_one_step_rollouts.hdf5
-    TASK_IDQL_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_idql_episode_layout_v1_45demo_23success_11failure_terminal_success.hdf5
-    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/idql/45demo_23success_11failure_terminal_success_rise_temporal_v2_episode_layout_v1
-    TASK_EVAL_OUTPUT=rollouts/real_robot/pick_cup/idql/45demo_23success_11failure_terminal_success_rise_temporal_v2_episode_layout_v1
+    TASK_IDQL_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_idql_episode_layout_v1_45demo_24success_8failure_terminal_success.hdf5
+    TASK_IDQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/idql/45demo_24success_8failure_terminal_success_rise_temporal_v2_episode_layout_v1
+    TASK_EVAL_OUTPUT=rollouts/real_robot/pick_cup/idql/45demo_24success_8failure_terminal_success_rise_temporal_v2_episode_layout_v1
     TASK_EXPERT_MASK=train
     TASK_EXPERT_COUNT=45
     TASK_SUCCESS_MASK=success_train
-    TASK_SUCCESS_COUNT=23
+    TASK_SUCCESS_COUNT=24
     TASK_FAILURE_MASK=failure_train
-    TASK_FAILURE_COUNT=11
+    TASK_FAILURE_COUNT=8
     TASK_CRITIC_GROUP_NORM=0
-    TASK_EVAL_HORIZON=400
+    TASK_EVAL_HORIZON=600
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
     TASK_DEFAULT_IDQL_REWARD_MODE=terminal_success
     TASK_REAL_ROBOT=1
@@ -123,7 +123,7 @@ case "$TASK" in
     TASK_REAL_ROBOT_ROLLOUT_SOURCE_ROOT=/home/ryan/datasets_new/pick_cup/rollout
     TASK_REAL_ROBOT_ROLLOUT_BUILDER=scripts/real_robot/build_episode_layout_one_step_sources.py
     TASK_REAL_ROBOT_MIXED_BUILDER=scripts/real_robot/build_pick_cup_idql_dataset.py
-    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_idql_episode_layout_v1_validation_5demo_6success_3failure_terminal_success.hdf5
+    TASK_REAL_ROBOT_VALIDATION_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_idql_episode_layout_v1_validation_5demo_6success_2failure_terminal_success.hdf5
     TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=1612
     ;;
   stack_cup)

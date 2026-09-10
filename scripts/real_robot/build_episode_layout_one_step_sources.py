@@ -37,7 +37,7 @@ if str(ROOT) not in sys.path:
 from scripts.real_robot import build_episode_layout_idql_sources as core
 
 
-CONVERSION_VERSION = "real_robot_episode_layout_one_step_hdf5_v1"
+CONVERSION_VERSION = "real_robot_episode_layout_one_step_hdf5_v2_variable_requests"
 
 
 @dataclass(frozen=True)
@@ -98,10 +98,16 @@ def _one_step_payload(
         [step.get("substep", -1) for step in steps], dtype=np.int64
     )
     expected_indices = np.arange(record.actions, dtype=np.int64)
+    expected_chunk_indices = np.asarray(
+        proposal["provenance"]["policy_chunk_index"], dtype=np.int64
+    )
+    expected_chunk_offsets = np.asarray(
+        proposal["provenance"]["policy_chunk_offset"], dtype=np.int64
+    )
     if (
         not np.array_equal(action_indices, expected_indices)
-        or not np.array_equal(chunk_indices, expected_indices // core.ACTION_HORIZON)
-        or not np.array_equal(chunk_offsets, expected_indices % core.ACTION_HORIZON)
+        or not np.array_equal(chunk_indices, expected_chunk_indices)
+        or not np.array_equal(chunk_offsets, expected_chunk_offsets)
     ):
         raise core.ProposalConversionError(
             f"{episode_dir}: action-state chunk indices differ"
@@ -134,8 +140,11 @@ def _one_step_payload(
         )
 
     request_obs = proposal["request_obs"]
+    request_action_counts = np.asarray(
+        proposal["provenance"]["request_action_count"], dtype=np.int64
+    )
     one_step_obs = {
-        key: np.repeat(values, core.ACTION_HORIZON, axis=0)
+        key: np.repeat(values, request_action_counts, axis=0)
         for key, values in request_obs.items()
     }
     pos = action_pose[:, :3].astype(np.float32)
@@ -172,11 +181,12 @@ def _one_step_payload(
     boundary = np.asarray(
         [sample.get("timing_boundary") for sample in samples], dtype=np.uint8
     )
-    expected_boundary = np.zeros(record.actions, dtype=np.uint8)
-    expected_boundary[core.ACTION_HORIZON - 1 :: core.ACTION_HORIZON] = 1
+    expected_boundary = np.asarray(
+        proposal["provenance"]["timing_boundary"], dtype=np.uint8
+    )
     if not np.array_equal(boundary, expected_boundary):
         raise core.ProposalConversionError(
-            f"{episode_dir}: expected one timing boundary per H8 proposal"
+            f"{episode_dir}: timing boundaries differ from request ranges"
         )
     one_step_valid = (boundary == 0).astype(np.uint8)
     # Keep the final transition so successful rollouts retain their positive
@@ -184,9 +194,7 @@ def _one_step_payload(
     # bootstrap is masked by done=1, so no cross-episode state is introduced.
     one_step_valid[-1] = 1
     expected_valid = (
-        profile.expected_rollout_actions
-        - profile.expected_requests_per_rollout
-        + 1
+        record.actions - int(np.sum(request_action_counts > 0)) + 1
     )
     if int(one_step_valid.sum()) != expected_valid:
         raise core.ProposalConversionError(
@@ -262,6 +270,8 @@ def _write_rollouts(
         for index, record in enumerate(records, 1)
     }
     outcomes: dict[str, str] = {}
+    written_counts: dict[str, int] = {}
+    written_valid_counts: dict[str, int] = {}
     total = 0
     valid_total = 0
     try:
@@ -330,7 +340,10 @@ def _write_rollouts(
                 )
                 outcomes[record.package_name] = str(payload["outcome"])
                 total += count
-                valid_total += int(payload["one_step_critic_valid"].sum())
+                episode_valid = int(payload["one_step_critic_valid"].sum())
+                valid_total += episode_valid
+                written_counts[record.package_name] = count
+                written_valid_counts[record.package_name] = episode_valid
             data.attrs["total"] = total
             masks = target.create_group("mask")
             mask_values = _mask_values(records, key_by_name, outcomes)
@@ -353,8 +366,8 @@ def _write_rollouts(
                         "exact per-action pre-command low-dimensional state"
                     ),
                     "excluded_transition": (
-                        "substep7 to next proposal due variable inference pause; "
-                        "final terminal substep7 retained"
+                        "last executed action to next proposal due variable "
+                        "inference pause; final terminal action retained"
                     ),
                     "warning": (
                         "substeps1-7 are composite training states, not new "
@@ -370,12 +383,10 @@ def _write_rollouts(
                         "source_group": record.source_group,
                         "split": record.split,
                         "outcome": outcomes[record.package_name],
-                        "num_samples": record.actions,
-                        "one_step_valid_count": (
-                            profile.expected_rollout_actions
-                            - profile.expected_requests_per_rollout
-                            + 1
-                        ),
+                        "num_samples": written_counts[record.package_name],
+                        "one_step_valid_count": written_valid_counts[
+                            record.package_name
+                        ],
                     }
                     for record in records
                 ],
@@ -433,7 +444,13 @@ def validate_output(
         for key, demo in data.items():
             count = int(demo.attrs.get("num_samples", -1))
             total += count
-            if count != profile.expected_rollout_actions:
+            if (
+                count < 1
+                or (
+                    profile.expected_rollout_actions is not None
+                    and count != profile.expected_rollout_actions
+                )
+            ):
                 errors.append(f"{key} action count differs")
                 continue
             if bool(demo.attrs.get("request_aligned", 0)):
@@ -460,8 +477,17 @@ def validate_output(
             boundary = np.asarray(
                 demo["provenance/timing_boundary"][:], dtype=np.uint8
             )
+            request_starts = np.asarray(
+                demo["provenance/request_action_start"][:], dtype=np.int64
+            )
+            request_counts = np.asarray(
+                demo["provenance/request_action_count"][:], dtype=np.uint8
+            )
             expected_boundary = np.zeros(count, dtype=np.uint8)
-            expected_boundary[core.ACTION_HORIZON - 1 :: core.ACTION_HORIZON] = 1
+            nonempty = request_counts > 0
+            expected_boundary[
+                request_starts[nonempty] + request_counts[nonempty] - 1
+            ] = 1
             valid = np.asarray(
                 demo["one_step_critic_valid"][:], dtype=np.uint8
             )
@@ -529,20 +555,15 @@ def validate_output(
         for outcome, count in profile.expected_outcomes.items():
             if len(expected_sets[outcome]) != count:
                 errors.append(f"{outcome} outcome count differs")
-        expected_total = (
-            profile.expected_rollouts * profile.expected_rollout_actions
-        )
+        expected_total = profile.expected_rollout_transition_total
         if total != expected_total or int(data.attrs.get("total", -1)) != total:
             errors.append(
                 f"transition total={total}, expected={expected_total}"
             )
-        expected_valid_per_rollout = (
-            profile.expected_rollout_actions
-            - profile.expected_requests_per_rollout
-            + 1
-        )
         expected_valid_total = (
-            profile.expected_rollouts * expected_valid_per_rollout
+            profile.expected_rollout_transition_total
+            - profile.expected_action_valid_request_total
+            + profile.expected_rollouts
         )
         if valid_total != expected_valid_total:
             errors.append(
@@ -652,7 +673,11 @@ def build_dataset(options: BuildOptions) -> dict[str, Any]:
             output=options.output,
             compression=options.compression,
         )
-    if options.human_output.exists() and not options.overwrite:
+    # ``--overwrite`` is intended to refresh the derived rollout alignment.
+    # The canonical human source is shared by one-step and chunk training and
+    # does not depend on rollout request metadata, so never rewrite a valid
+    # copy as a side effect of refreshing rollout data.
+    if options.human_output.exists():
         human_report = _validate_human(options.human_output, profile)
     else:
         human_report = core._write_source(

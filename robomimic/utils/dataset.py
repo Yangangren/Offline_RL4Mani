@@ -766,6 +766,7 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
         self._demo_one_step_aligned = {}
         self._demo_policy_chunk_indices = {}
         self._demo_request_bootstrap_valid = {}
+        self._demo_request_action_counts = {}
         if (
             self.chunk_horizon < 1
             or self.observation_horizon < 1
@@ -926,21 +927,37 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                         request_group = episode.get("request_obs")
                         chunk_index_path = "provenance/policy_chunk_index"
                         bootstrap_path = "provenance/request_bootstrap_valid"
+                        request_start_path = "provenance/request_action_start"
+                        request_count_path = "provenance/request_action_count"
                         if not isinstance(request_group, h5py.Group):
                             raise ValueError(
                                 f"data/{demo_id} is request-aligned but has no "
                                 "request_obs group"
                             )
-                        if chunk_index_path not in episode or bootstrap_path not in episode:
+                        if any(
+                            path not in episode
+                            for path in (
+                                chunk_index_path,
+                                bootstrap_path,
+                                request_start_path,
+                                request_count_path,
+                            )
+                        ):
                             raise ValueError(
-                                f"data/{demo_id} is missing request index or "
-                                "bootstrap metadata"
+                                f"data/{demo_id} is missing request range, index, "
+                                "or bootstrap metadata"
                             )
                         chunk_indices = np.asarray(
                             episode[chunk_index_path][:], dtype=np.int64
                         ).reshape(-1)
                         bootstrap_valid = np.asarray(
                             episode[bootstrap_path][:], dtype=np.uint8
+                        ).reshape(-1)
+                        request_starts = np.asarray(
+                            episode[request_start_path][:], dtype=np.int64
+                        ).reshape(-1)
+                        request_counts = np.asarray(
+                            episode[request_count_path][:], dtype=np.int64
                         ).reshape(-1)
                         if chunk_indices.shape != (expected,):
                             raise ValueError(
@@ -954,13 +971,37 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                             raise ValueError(
                                 f"data/{demo_id}/{bootstrap_path} is invalid"
                             )
+                        expected_starts = np.concatenate(
+                            (
+                                np.zeros(1, dtype=np.int64),
+                                np.cumsum(request_counts[:-1], dtype=np.int64),
+                            )
+                        )
+                        expected_indices = np.repeat(
+                            np.arange(request_count, dtype=np.int64),
+                            request_counts,
+                        )
+                        expected_offsets = np.concatenate(
+                            [
+                                np.arange(count, dtype=np.uint8)
+                                for count in request_counts
+                            ]
+                        )
+                        expected_chunk_valid = np.zeros(expected, dtype=np.uint8)
+                        expected_chunk_valid[request_starts[request_counts > 0]] = 1
                         if (
-                            np.any(chunk_indices < 0)
-                            or np.any(chunk_indices >= request_count)
-                            or np.any((chunk_valid == 1) & (offsets != 0))
+                            request_starts.shape != (request_count,)
+                            or request_counts.shape != (request_count,)
+                            or np.any(request_counts < 0)
+                            or np.any(request_counts > self.chunk_horizon)
+                            or int(request_counts.sum()) != expected
+                            or not np.array_equal(request_starts, expected_starts)
+                            or not np.array_equal(chunk_indices, expected_indices)
+                            or not np.array_equal(offsets, expected_offsets)
+                            or not np.array_equal(chunk_valid, expected_chunk_valid)
                         ):
                             raise ValueError(
-                                f"data/{demo_id} has inconsistent request indices"
+                                f"data/{demo_id} has inconsistent request ranges"
                             )
                         for obs_key in base.obs_keys:
                             if obs_key not in request_group:
@@ -979,6 +1020,7 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                                 )
                         self._demo_policy_chunk_indices[demo_id] = chunk_indices
                         self._demo_request_bootstrap_valid[demo_id] = bootstrap_valid
+                        self._demo_request_action_counts[demo_id] = request_counts
 
             request_aligned_rollouts = [
                 demo_id
@@ -1127,6 +1169,16 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                 seq_length=1,
                 prefix="obs",
             )
+        if request_aligned:
+            meta["request_action_count"] = np.float32(
+                self._demo_request_action_counts[demo_id][request_index]
+            )
+            meta["request_action_count_known"] = np.float32(1.0)
+        else:
+            # Keep the collated batch schema identical for human stride-one
+            # rows and explicitly mark the placeholder as unknown.
+            meta["request_action_count"] = np.float32(self.chunk_horizon)
+            meta["request_action_count_known"] = np.float32(0.0)
 
         current_index = self.observation_horizon - 1
         chunk_dones = np.asarray(

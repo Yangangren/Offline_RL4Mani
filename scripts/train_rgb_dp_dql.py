@@ -34,9 +34,12 @@ from train_rgb_dp_idql import (
     REWARD_DEFINITIONS,
     TEMPORAL_CRITIC_ARCHITECTURE,
     TEMPORAL_ONE_STEP_MARKER,
+    WeightedScalarMetricAccumulator,
     action_normalization_stats_match,
+    actor_validation_step,
     actor_trainability,
     align_shared_batch_actions,
+    audit_validation_dataset_split,
     atomic_torch_save,
     batch_scaled_step_count,
     build_single_loader,
@@ -44,6 +47,7 @@ from train_rgb_dp_idql import (
     configure_actor_optimizer,
     copy_deployed_encoder_state,
     dataset_audit,
+    fork_rng_with_seed,
     initialize_actor_from_deployed_ema,
     jsonable,
     make_temporal_one_step_value_networks,
@@ -55,6 +59,8 @@ from train_rgb_dp_idql import (
     restore_rng_state,
     rng_state,
     scalar_metrics,
+    set_actor_obs_encoder_trainable,
+    set_critic_encoders_trainable,
     write_json,
 )
 from rgb_dp_distributed import (
@@ -105,6 +111,16 @@ def configure_dql_batch_semantics(
     )
     args.resolved_dql_critic_warmup_steps = batch_scaled_step_count(
         args.dql_critic_warmup_steps,
+        reference_batch_size,
+        effective_batch_size,
+    )
+    args.resolved_actor_obs_encoder_freeze_steps = batch_scaled_step_count(
+        args.actor_obs_encoder_freeze_steps,
+        reference_batch_size,
+        effective_batch_size,
+    )
+    args.resolved_encoder_freeze_steps = batch_scaled_step_count(
+        args.encoder_freeze_steps,
         reference_batch_size,
         effective_batch_size,
     )
@@ -948,6 +964,95 @@ def materialize_local_scalar_metrics(
     return {key: float(value) for key, value in zip(keys, values)}
 
 
+@torch.no_grad()
+def evaluate_dql_validation_epoch(
+    *,
+    args: argparse.Namespace,
+    epoch: int,
+    loader,
+    actor_algo,
+    critics: nn.ModuleList,
+    critic_targets: nn.ModuleList,
+    obs_normalization_stats,
+    device: torch.device,
+) -> dict[str, float]:
+    """Run deterministic, full-coverage held-out DQL validation on rank zero."""
+    accumulator = WeightedScalarMetricAccumulator(device)
+    batch_count = 0
+    window_count = 0
+    actor_was_training = bool(actor_algo.nets.training)
+    critic_modes = [bool(module.training) for module in critics]
+    actor_algo.set_eval()
+    critics.eval()
+    critic_targets.eval()
+    try:
+        with fork_rng_with_seed(int(args.validation_seed), device):
+            for raw_batch in loader:
+                raw_batch = align_shared_batch_actions(
+                    raw_batch,
+                    validate=batch_count == 0,
+                )
+                rows = int(raw_batch["actions"].shape[0])
+                metrics = actor_validation_step(
+                    actor_algo,
+                    raw_batch,
+                    epoch,
+                    obs_normalization_stats,
+                )
+                critic_batch = process_dql_critic_batch(
+                    raw_batch,
+                    actor_algo,
+                    obs_normalization_stats,
+                    critic_observation_horizon=int(
+                        args.critic_observation_horizon
+                    ),
+                    validate_actions=batch_count == 0,
+                )
+                next_actor_observations = prepare_next_actor_observations(
+                    actor_algo,
+                    raw_batch,
+                    obs_normalization_stats,
+                )
+                _, critic_info = compute_critic_loss(
+                    actor_algo=actor_algo,
+                    critics=critics,
+                    critic_targets=critic_targets,
+                    critic_batch=critic_batch,
+                    next_actor_observations=next_actor_observations,
+                    discount=float(args.discount),
+                    use_huber=bool(args.use_huber),
+                    num_inference_steps=int(args.dql_num_inference_steps),
+                    num_target_candidates=int(
+                        args.dql_target_num_candidates
+                    ),
+                    clip_actions=bool(args.dql_clip_actions),
+                )
+                metrics.update(critic_info)
+                accumulator.update(
+                    {
+                        f"validation/{key}": value
+                        for key, value in metrics.items()
+                    },
+                    rows,
+                )
+                batch_count += 1
+                window_count += rows
+    finally:
+        if actor_was_training:
+            actor_algo.set_train()
+        else:
+            actor_algo.set_eval()
+        for module, was_training in zip(critics, critic_modes):
+            module.train(was_training)
+        configure_critic_targets(critic_targets)
+    if batch_count == 0 or window_count == 0:
+        raise ValueError("validation loader produced no held-out DQL windows")
+    result = accumulator.means()
+    result["validation/batches"] = float(batch_count)
+    result["validation/windows"] = float(window_count)
+    return result
+
+
 def dql_reference_alignment(args: argparse.Namespace) -> dict[str, Any]:
     reward_mode = str(getattr(args, "dataset_reward_mode", "rise"))
     return {
@@ -1083,7 +1188,12 @@ def checkpoint_payload(
         "dql_q_normalization": "official_cross_head_generated_action_q",
         "dql_reference_alignment": dql_reference_alignment(args),
         "actor_initialized_from_deployed_ema": True,
-        "actor_encoder_trainable": True,
+        "actor_encoder_trainable": int(global_step) >= int(
+            args.resolved_actor_obs_encoder_freeze_steps
+        ),
+        "critic_encoders_trainable": int(global_step) >= int(
+            args.resolved_encoder_freeze_steps
+        ),
         "actor_ema_optimization_step": int(
             actor_algo.ema.optimization_step if actor_algo.ema is not None else 0
         ),
@@ -1124,6 +1234,8 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "dataset",
         "checkpoint",
         "task",
+        "validation_dataset",
+        "validation_seed",
         "reward_mode",
         "seed",
         "batch_size",
@@ -1148,8 +1260,12 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "discount",
         "target_tau",
         "actor_lr",
+        "actor_obs_encoder_freeze_steps",
+        "resolved_actor_obs_encoder_freeze_steps",
         "critic_lr",
         "encoder_lr",
+        "encoder_freeze_steps",
+        "resolved_encoder_freeze_steps",
         "lr_scheduler",
         "lr_warmup_steps",
         "resolved_lr_warmup_steps",
@@ -1191,6 +1307,11 @@ def train(args: argparse.Namespace) -> dict:
         raise FileNotFoundError(
             f"{args.dataset} does not exist; build it with run_rgb_dp_idql.sh first"
         )
+    if (
+        args.validation_dataset is not None
+        and not args.validation_dataset.is_file()
+    ):
+        raise FileNotFoundError(args.validation_dataset)
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
     if int(args.num_critics) < 2:
@@ -1207,6 +1328,10 @@ def train(args: argparse.Namespace) -> dict:
         raise ValueError("dql_q_denominator_floor must be positive")
     if int(args.dql_critic_warmup_steps) < 0:
         raise ValueError("dql_critic_warmup_steps must be non-negative")
+    if int(args.actor_obs_encoder_freeze_steps) < 0:
+        raise ValueError("actor_obs_encoder_freeze_steps must be non-negative")
+    if int(args.encoder_freeze_steps) < 0:
+        raise ValueError("encoder_freeze_steps must be non-negative")
     if int(args.dql_actor_ema_update_every) <= 0:
         raise ValueError("dql_actor_ema_update_every must be positive")
     if distributed.is_main_process:
@@ -1272,7 +1397,37 @@ def train(args: argparse.Namespace) -> dict:
         len(dataset),
         expected_task=args.task,
         expected_reward_mode=args.reward_mode,
+        validity_key=getattr(dataset, "validity_key", None),
     )
+    args.dataset_validity_key = audit["validity_key"]
+    validation_dataset = None
+    validation_loader = None
+    validation_audit = None
+    validation_split_audit = None
+    if args.validation_dataset is not None and distributed.is_main_process:
+        validation_args = copy.copy(args)
+        validation_args.dataset = args.validation_dataset
+        validation_args.seed = int(args.validation_seed)
+        validation_args.distributed_world_size = 1
+        validation_args.distributed_rank = 0
+        validation_dataset, validation_loader, _, _ = build_single_loader(
+            validation_args,
+            actor_policy,
+            dp_checkpoint,
+            shuffle=False,
+            drop_last=False,
+        )
+        validation_audit = dataset_audit(
+            args.validation_dataset,
+            len(validation_dataset),
+            expected_task=args.task,
+            expected_reward_mode=args.reward_mode,
+            validity_key=getattr(validation_dataset, "validity_key", None),
+        )
+        validation_split_audit = audit_validation_dataset_split(
+            args.dataset,
+            args.validation_dataset,
+        )
     args.dataset_reward_mode = str(audit["reward_mode"])
     action_stats = dp_checkpoint.get("action_normalization_stats")
     if action_stats is None:
@@ -1436,6 +1591,21 @@ def train(args: argparse.Namespace) -> dict:
                 flush=True,
             )
 
+    best_validation_loss = None
+    best_validation_epoch = None
+    for completed_epoch in history:
+        candidate = completed_epoch.get("metrics", {}).get(
+            "validation/actor/Loss"
+        )
+        if candidate is None or not np.isfinite(float(candidate)):
+            continue
+        if (
+            best_validation_loss is None
+            or float(candidate) < best_validation_loss
+        ):
+            best_validation_loss = float(candidate)
+            best_validation_epoch = int(completed_epoch.get("epoch", -1))
+
     actor_algo.set_train()
     critics.train()
     configure_critic_targets(critic_targets)
@@ -1472,15 +1642,44 @@ def train(args: argparse.Namespace) -> dict:
         "critic_architecture": TEMPORAL_CRITIC_ARCHITECTURE,
         "task": str(args.task),
         "dataset": audit,
+        "validation": {
+            "enabled": validation_loader is not None,
+            "dataset": validation_audit,
+            "split_audit": validation_split_audit,
+            "seed": int(args.validation_seed),
+            "rank_zero_only": True,
+            "full_coverage": True,
+            "actor_weights": "ema",
+            "selection_metric": "validation/actor/Loss",
+        },
         "data_routing": {
             "shared_loader": True,
-            "actor_rows": "all_human_success_failure",
-            "critic_rows": "all_human_success_failure",
-            "source_masking": False,
+            "actor_rows": (
+                f"{audit['validity_key']}_admitted_shared_rows"
+                if audit["validity_key"] is not None
+                else "all_human_success_failure_no_mask"
+            ),
+            "critic_rows": (
+                f"{audit['validity_key']}_admitted_shared_rows"
+                if audit["validity_key"] is not None
+                else "all_human_success_failure"
+            ),
+            "source_masking": audit["validity_key"] is not None,
+            "filtered_rows": int(
+                audit["hdf5_total_transitions"]
+                - audit["sequence_dataset_size"]
+            ),
         },
         "loader": {
             "class": dataset.__class__.__name__,
             "sparse_dql_loader": bool(args.sparse_dql_loader),
+            "validity_key": audit["validity_key"],
+            "unfiltered_sequence_dataset_size": int(
+                audit["hdf5_total_transitions"]
+            ),
+            "admitted_sequence_dataset_size": int(
+                audit["sequence_dataset_size"]
+            ),
             "observation_loading": (
                 "current_and_next_observation_stacks_only"
                 if args.sparse_dql_loader
@@ -1518,6 +1717,18 @@ def train(args: argparse.Namespace) -> dict:
             ),
             "resolved_dql_critic_warmup_steps": int(
                 args.resolved_dql_critic_warmup_steps
+            ),
+            "reference_actor_obs_encoder_freeze_steps": int(
+                args.actor_obs_encoder_freeze_steps
+            ),
+            "resolved_actor_obs_encoder_freeze_steps": int(
+                args.resolved_actor_obs_encoder_freeze_steps
+            ),
+            "reference_critic_encoder_freeze_steps": int(
+                args.encoder_freeze_steps
+            ),
+            "resolved_critic_encoder_freeze_steps": int(
+                args.resolved_encoder_freeze_steps
             ),
             "target_tau_step_unit": "optimizer_update",
             "actor_ema_update_every_step_unit": "optimizer_update",
@@ -1561,8 +1772,18 @@ def train(args: argparse.Namespace) -> dict:
             "discount": float(args.discount),
             "target_tau": float(args.target_tau),
             "actor_lr": float(args.actor_lr),
+            "actor_obs_encoder_freeze_steps": int(
+                args.actor_obs_encoder_freeze_steps
+            ),
+            "resolved_actor_obs_encoder_freeze_steps": int(
+                args.resolved_actor_obs_encoder_freeze_steps
+            ),
             "critic_lr": float(args.critic_lr),
             "encoder_lr": float(args.encoder_lr),
+            "encoder_freeze_steps": int(args.encoder_freeze_steps),
+            "resolved_encoder_freeze_steps": int(
+                args.resolved_encoder_freeze_steps
+            ),
             "dql_eta": float(args.dql_eta),
             "dql_bc_weight": float(args.dql_bc_weight),
             "dql_q_batch_size": int(args.dql_q_batch_size),
@@ -1630,6 +1851,20 @@ def train(args: argparse.Namespace) -> dict:
                 validate=not shared_action_range_validated,
             )
             shared_action_range_validated = True
+            actor_obs_encoder_trainable = global_step >= int(
+                args.resolved_actor_obs_encoder_freeze_steps
+            )
+            critic_encoders_trainable = global_step >= int(
+                args.resolved_encoder_freeze_steps
+            )
+            set_actor_obs_encoder_trainable(
+                actor_algo,
+                actor_obs_encoder_trainable,
+            )
+            set_critic_encoders_trainable(
+                critics,
+                critic_encoders_trainable,
+            )
             if synchronize_training_buffers:
                 broadcast_module_buffers(
                     synchronized_modules,
@@ -1709,6 +1944,12 @@ def train(args: argparse.Namespace) -> dict:
             }
             metrics.update(actor_info)
             metrics.update(learning_rates)
+            metrics["actor/obs_encoder_trainable"] = float(
+                actor_obs_encoder_trainable
+            )
+            metrics["critic/encoder_trainable"] = float(
+                critic_encoders_trainable
+            )
             metrics["distributed/world_size"] = float(distributed.world_size)
             metrics["data/effective_global_batch_rows"] = float(
                 raw_batch["actions"].shape[0] * distributed.world_size
@@ -1744,6 +1985,44 @@ def train(args: argparse.Namespace) -> dict:
             if distributed.is_main_process
             else {}
         )
+        new_best_validation = False
+        if validation_loader is not None:
+            validation_metrics = evaluate_dql_validation_epoch(
+                args=args,
+                epoch=epoch,
+                loader=validation_loader,
+                actor_algo=actor_algo,
+                critics=critics,
+                critic_targets=critic_targets,
+                obs_normalization_stats=obs_normalization_stats,
+                device=device,
+            )
+            epoch_metrics.update(validation_metrics)
+            if writer is not None:
+                for key, value in validation_metrics.items():
+                    writer.add_scalar(key, value, global_step)
+            selection_loss = validation_metrics.get("validation/actor/Loss")
+            if selection_loss is None or not np.isfinite(float(selection_loss)):
+                raise ValueError(
+                    "held-out DQL validation did not produce a finite EMA "
+                    "actor loss"
+                )
+            if (
+                best_validation_loss is None
+                or float(selection_loss) < best_validation_loss
+            ):
+                best_validation_loss = float(selection_loss)
+                best_validation_epoch = int(epoch)
+                new_best_validation = True
+        if distributed.enabled and args.validation_dataset is not None:
+            best_flag = torch.tensor(
+                [int(new_best_validation)],
+                device=device,
+                dtype=torch.int64,
+            )
+            dist.broadcast(best_flag, src=0)
+            new_best_validation = bool(best_flag.item())
+
         epoch_summary = {
             "epoch": int(epoch),
             "global_step": int(global_step),
@@ -1757,10 +2036,25 @@ def train(args: argparse.Namespace) -> dict:
             "global_step": int(global_step),
             "global_samples_seen": int(global_samples_seen),
             "last_epoch_metrics": epoch_summary["metrics"],
+            "best_validation": {
+                "metric": "validation/actor/Loss",
+                "loss": best_validation_loss,
+                "epoch": best_validation_epoch,
+                "checkpoint": (
+                    str(args.output_dir / "best_validation.pt")
+                    if args.validation_dataset is not None
+                    else None
+                ),
+            },
             "history": history,
             "checkpoints": {
                 "latest": str(args.output_dir / "latest.pt"),
                 "last": str(args.output_dir / "last.pt"),
+                "best_validation": (
+                    str(args.output_dir / "best_validation.pt")
+                    if args.validation_dataset is not None
+                    else None
+                ),
             },
         }
         if distributed.is_main_process:
@@ -1772,6 +2066,7 @@ def train(args: argparse.Namespace) -> dict:
         should_save = (
             epoch % int(args.save_every_epochs) == 0
             or epoch == int(args.epochs)
+            or new_best_validation
         )
         if should_save:
             rank_runtime_states = (
@@ -1798,6 +2093,11 @@ def train(args: argparse.Namespace) -> dict:
                 )
                 latest_path = args.output_dir / "latest.pt"
                 atomic_torch_save(payload, latest_path)
+                if new_best_validation:
+                    replace_with_hardlink(
+                        latest_path,
+                        args.output_dir / "best_validation.pt",
+                    )
                 if (
                     int(args.snapshot_every_epochs) > 0
                     and epoch % int(args.snapshot_every_epochs) == 0
@@ -1846,13 +2146,30 @@ def train(args: argparse.Namespace) -> dict:
     close_dataset = getattr(dataset, "close", None)
     if callable(close_dataset):
         close_dataset()
+    close_validation_dataset = getattr(validation_dataset, "close", None)
+    if callable(close_validation_dataset):
+        close_validation_dataset()
     return final_summary
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", choices=("square", "can", "transport", "tool_hang"), default="square")
+    parser.add_argument(
+        "--task",
+        choices=(
+            "square",
+            "can",
+            "transport",
+            "tool_hang",
+            "pick_cup",
+            "stack_cup",
+            "move_spoon",
+        ),
+        default="square",
+    )
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument("--validation-dataset", type=Path, default=None)
+    parser.add_argument("--validation-seed", type=int, default=10000)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
@@ -1920,8 +2237,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--target-tau", type=float, default=0.005)
     parser.add_argument("--actor-lr", type=float, default=1e-4)
+    parser.add_argument("--actor-obs-encoder-freeze-steps", type=int, default=0)
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--encoder-lr", type=float, default=1e-5)
+    parser.add_argument("--encoder-freeze-steps", type=int, default=0)
     parser.add_argument("--lr-scheduler", choices=("constant", "cosine"), default="cosine")
     parser.add_argument("--lr-warmup-steps", type=int, default=500)
     parser.add_argument("--lr-num-cycles", type=float, default=0.5)
@@ -1965,7 +2284,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--snapshot-every-epochs", type=int, default=10)
     args = parser.parse_args()
-    for key in ("dataset", "checkpoint", "output_dir", "resume_checkpoint"):
+    for key in (
+        "dataset",
+        "validation_dataset",
+        "checkpoint",
+        "output_dir",
+        "resume_checkpoint",
+    ):
         value = getattr(args, key)
         if value is not None:
             setattr(args, key, value.expanduser().resolve())
@@ -1975,6 +2300,10 @@ def parse_args() -> argparse.Namespace:
         args.critic_late_fusion_key = None
     if args.lr_warmup_steps < 0:
         parser.error("lr-warmup-steps must be non-negative")
+    if args.actor_obs_encoder_freeze_steps < 0:
+        parser.error("actor-obs-encoder-freeze-steps must be non-negative")
+    if args.encoder_freeze_steps < 0:
+        parser.error("encoder-freeze-steps must be non-negative")
     if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
         parser.error("steps-per-epoch must be positive when specified")
     if args.batch_size <= 0:

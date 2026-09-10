@@ -44,7 +44,7 @@ DEFAULT_ROLLOUT_DATASET = (
 DEFAULT_OUTPUT = (
     ROOT
     / "datasets/real_robot/pick_cup/idql/"
-    "pick_cup_chunk_idql_episode_layout_v1_45demo_23success_11failure_"
+    "pick_cup_chunk_idql_episode_layout_v1_45demo_24success_8failure_"
     "terminal_success_human_success_condition.hdf5"
 )
 
@@ -72,7 +72,7 @@ MANIFEST_ATTRS = (
     "conversion_manifest",
 )
 SOURCE_IDENTITY_VERSION = 1
-BUILDER_VERSION = "pick_cup_chunk_idql_mixed_v2_episode_layout_stride_one_human"
+BUILDER_VERSION = "pick_cup_chunk_idql_mixed_v3_operator_ended_stride_one_human"
 REQUIRE_CRITIC_VALIDITY = True
 EXPERT_CHUNK_VALIDITY_MODE = "stride_one"
 EXPERT_CHUNK_VALIDITY_MODES = ("source", "stride_one")
@@ -83,8 +83,8 @@ CRITIC_VALIDITY_KEYS = (
 CRITIC_CHUNK_HORIZON = 8
 DEFAULT_HUMAN_COUNT = 45
 DEFAULT_EXPECTED_HUMAN_TRANSITIONS = 17_127
-DEFAULT_SUCCESS_COUNT = 23
-DEFAULT_FAILURE_COUNT = 11
+DEFAULT_SUCCESS_COUNT = 24
+DEFAULT_FAILURE_COUNT = 8
 DEFAULT_ACTOR_CONDITION_MODE = "human_success"
 DEFAULT_HUMAN_DATASETS_HELP = (
     "PickCup human HDF5; every selected human row is an overlapping H8 start "

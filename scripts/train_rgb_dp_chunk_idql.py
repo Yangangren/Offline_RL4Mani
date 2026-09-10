@@ -3995,6 +3995,32 @@ def process_chunk_batch(
         dim=1,
     )
     valid_length = action_mask.sum(dim=1)
+    request_action_count = raw_batch.get("request_action_count")
+    request_action_count_known = raw_batch.get("request_action_count_known")
+    if (request_action_count is None) != (request_action_count_known is None):
+        raise KeyError(
+            "request_action_count and request_action_count_known must be "
+            "provided together"
+        )
+    if request_action_count is not None:
+        declared = request_action_count.reshape(-1).to(
+            device=valid_length.device, dtype=valid_length.dtype
+        )
+        known = request_action_count_known.reshape(-1).to(
+            device=valid_length.device
+        ) > 0.5
+        if declared.shape != valid_length.shape:
+            raise ValueError(
+                "request action-count metadata does not match the batch"
+            )
+        if torch.any(known & (declared != valid_length)):
+            mismatch = torch.nonzero(
+                known & (declared != valid_length), as_tuple=False
+            ).reshape(-1)
+            raise ValueError(
+                "terminal-derived chunk lengths disagree with recorded request "
+                f"action counts at batch rows {mismatch[:8].tolist()}"
+            )
     terminal = ((dones > 0.5).to(rewards.dtype) * action_mask).amax(dim=1)
     powers = torch.arange(
         int(chunk_horizon), device=rewards.device, dtype=rewards.dtype
@@ -9180,16 +9206,6 @@ def make_parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument(
-        "--sparse-chunk-validity-key",
-        choices=("chunk_critic_valid", "one_step_critic_valid"),
-        default="chunk_critic_valid",
-        help=(
-            "HDF5 row mask used by the sparse chunk loader. "
-            "one_step_critic_valid is an ablation for training H-step chunk "
-            "IDQL on the denser action-state dataset used by one-step IDQL."
-        ),
-    )
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
         "--pin-memory", action=argparse.BooleanOptionalAction, default=True
