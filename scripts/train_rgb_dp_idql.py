@@ -1102,6 +1102,32 @@ def build_single_loader(
     drop_last: bool | None = None,
 ):
     actor_algo = actor_policy.policy
+    # Successor validity is a semantic data key rather than an observation.
+    # Load it only when every episode defines it so legacy artifacts remain
+    # readable and a partially upgraded dataset fails loudly.
+    with h5py.File(args.dataset, "r") as dataset_file:
+        episode_group = dataset_file.get("data")
+        if not isinstance(episode_group, h5py.Group):
+            raise ValueError(f"dataset {args.dataset} has no data group")
+        successor_validity_presence = {
+            episode_key: "next_obs_valid" in episode
+            for episode_key, episode in episode_group.items()
+        }
+    if any(successor_validity_presence.values()) and not all(
+        successor_validity_presence.values()
+    ):
+        missing = [
+            key
+            for key, present in successor_validity_presence.items()
+            if not present
+        ]
+        raise ValueError(
+            "dataset only partially defines next_obs_valid; missing episodes "
+            f"{missing[:8]}"
+        )
+    load_next_obs_valid = bool(successor_validity_presence) and all(
+        successor_validity_presence.values()
+    )
     config, _ = FileUtils.config_from_checkpoint(
         ckpt_dict=dp_checkpoint,
         verbose=False,
@@ -1130,8 +1156,13 @@ def build_single_loader(
         config.train.num_data_workers = int(args.num_workers)
         config.train.dataset_keys = list(
             dict.fromkeys(
-                list(config.train.dataset_keys)
+                [
+                    key
+                    for key in config.train.dataset_keys
+                    if key != "next_obs_valid"
+                ]
                 + ["actions", "rewards", "dones"]
+                + (["next_obs_valid"] if load_next_obs_valid else [])
                 + (
                     ["task_rewards"]
                     if getattr(args, "reward_mode", None) == "task"
@@ -1904,6 +1935,17 @@ def dataset_audit(
                         f"task-reward dataset data/{episode_key} rewards do not "
                         "match the preserved source task_rewards"
                     )
+                if reward_mode == "task":
+                    if "dones" not in episode:
+                        raise ValueError(f"data/{episode_key} is missing dones")
+                    dones = np.asarray(episode["dones"][:], dtype=np.float32)
+                    expected_dones = np.zeros_like(rewards)
+                    expected_dones[-1] = 1.0
+                    if not np.array_equal(dones, expected_dones):
+                        raise ValueError(
+                            f"task data/{episode_key} must contain exactly one "
+                            "terminal flag on its final retained transition"
+                        )
                 if not np.isfinite(rewards).all() or not np.isfinite(task_rewards).all():
                     raise ValueError(
                         f"task-reward dataset data/{episode_key} contains "

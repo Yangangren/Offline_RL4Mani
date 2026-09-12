@@ -7,6 +7,7 @@ USER_ROLLOUT_DATASET_SET=${ROLLOUT_DATASET+x}
 USER_IDQL_DATASET_SET=${IDQL_DATASET+x}
 USER_CHUNK_IDQL_OUTPUT_DIR_SET=${CHUNK_IDQL_OUTPUT_DIR+x}
 USER_CHUNK_EVAL_OUTPUT_SET=${CHUNK_EVAL_OUTPUT+x}
+USER_COMPOSED_CHUNK_EVAL_OUTPUT_SET=${COMPOSED_CHUNK_EVAL_OUTPUT+x}
 USER_CHUNK_IDQL_CHECKPOINT_SET=${CHUNK_IDQL_CHECKPOINT+x}
 USER_SUCCESS_MASK_SET=${SUCCESS_MASK+x}
 USER_SUCCESS_COUNT_SET=${SUCCESS_COUNT+x}
@@ -14,6 +15,10 @@ USER_FAILURE_MASK_SET=${FAILURE_MASK+x}
 USER_FAILURE_COUNT_SET=${FAILURE_COUNT+x}
 USER_REAL_ROBOT_VALIDATION_DATASET_SET=${REAL_ROBOT_VALIDATION_DATASET+x}
 USER_REAL_ROBOT_ROLLOUT_SOURCE_ROOT_SET=${REAL_ROBOT_ROLLOUT_SOURCE_ROOT+x}
+USER_CHUNK_RISE_V2_DENSE_DYNAMICS_SET=${CHUNK_RISE_V2_DENSE_DYNAMICS+x}
+USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET=${CHUNK_DYNAMICS_PREDICTION_OFFSETS+x}
+USER_CHUNK_DYNAMICS_OFFSET_SAMPLING_SET=${CHUNK_DYNAMICS_OFFSET_SAMPLING+x}
+USER_DYNAMICS_WEIGHT_SET=${DYNAMICS_WEIGHT+x}
 
 first_arg=${1:-}
 first_arg=${first_arg,,}
@@ -422,6 +427,13 @@ if [[ "$TASK_REAL_ROBOT" == "1" && "$CHUNK_CRITIC_ARCHITECTURE" != "legacy" ]]; 
   DEFAULT_CHUNK_IDQL_OUTPUT_DIR=${DEFAULT_CHUNK_IDQL_OUTPUT_DIR}_${CHUNK_CRITIC_ARCHITECTURE}
   DEFAULT_CHUNK_EVAL_OUTPUT=${DEFAULT_CHUNK_EVAL_OUTPUT}_${CHUNK_CRITIC_ARCHITECTURE}
   DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT}_${CHUNK_CRITIC_ARCHITECTURE}
+elif [[ "$TASK_REAL_ROBOT" != "1" && "$CHUNK_CRITIC_ARCHITECTURE" != "rise_temporal_v2" ]]; then
+  # Simulation defaults now select RISE-v2. Keep WCM and legacy checkpoints
+  # out of the same automatic directory because their state dicts are not
+  # structurally compatible.
+  DEFAULT_CHUNK_IDQL_OUTPUT_DIR=${DEFAULT_CHUNK_IDQL_OUTPUT_DIR}_${CHUNK_CRITIC_ARCHITECTURE}
+  DEFAULT_CHUNK_EVAL_OUTPUT=${DEFAULT_CHUNK_EVAL_OUTPUT}_${CHUNK_CRITIC_ARCHITECTURE}
+  DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT}_${CHUNK_CRITIC_ARCHITECTURE}
 fi
 IDQL_DATASET=${IDQL_DATASET:-$DEFAULT_IDQL_DATASET}
 IDQL_OUTPUT_DIR=${IDQL_OUTPUT_DIR:-$DEFAULT_IDQL_OUTPUT_DIR}
@@ -433,8 +445,238 @@ CHUNK_INITIALIZATION=${CHUNK_INITIALIZATION:-$TASK_CHUNK_INITIALIZATION}
 CHUNK_CONDITIONED_ACTOR=${CHUNK_CONDITIONED_ACTOR:-1}
 TRAIN_ACTOR_ONLY=${TRAIN_ACTOR_ONLY:-0}
 CHUNK_RISE_V2_FUSION_MODE=${CHUNK_RISE_V2_FUSION_MODE:-film}
-CHUNK_RISE_V2_DENSE_DYNAMICS=${CHUNK_RISE_V2_DENSE_DYNAMICS:-$TASK_CHUNK_RISE_V2_DENSE_DYNAMICS}
-CHUNK_DYNAMICS_PREDICTION_OFFSETS=${CHUNK_DYNAMICS_PREDICTION_OFFSETS:-$TASK_CHUNK_DYNAMICS_PREDICTION_OFFSETS}
+CHUNK_HORIZON=${CHUNK_HORIZON:-8}
+if [[ ! "$CHUNK_HORIZON" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CHUNK_HORIZON must be a positive integer; got $CHUNK_HORIZON." >&2
+  exit 2
+fi
+if [[ "$CHUNK_HORIZON" != "8" ]]; then
+  echo "run_rgb_dp_chunk_idql.sh is an H=8 recipe; got CHUNK_HORIZON=$CHUNK_HORIZON. Use a separate horizon-specific recipe so model and evaluation paths stay compatible." >&2
+  exit 2
+fi
+
+# Multi-offset latent prediction presets for controlled H-step ablations:
+#   final -> H; midfinal -> 4,H; even -> 2,4,...,H; all -> 1,2,...,H;
+#   random -> sample one available offset per row from 1,...,H;
+#   off -> no RISE-v2 auxiliary.
+# Leave the preset as "configured" to use the task defaults or an explicit
+# CHUNK_DYNAMICS_PREDICTION_OFFSETS list. "custom" requires that list and may
+# be combined with CHUNK_DYNAMICS_OFFSET_SAMPLING=uniform_per_sample.
+CHUNK_DYNAMICS_OFFSETS_PRESET=${CHUNK_DYNAMICS_OFFSETS_PRESET:-configured}
+CHUNK_DYNAMICS_OFFSETS_PRESET=${CHUNK_DYNAMICS_OFFSETS_PRESET,,}
+CHUNK_DYNAMICS_OFFSETS_PRESET=${CHUNK_DYNAMICS_OFFSETS_PRESET//-/_}
+CHUNK_DYNAMICS_OFFSET_SAMPLING=${CHUNK_DYNAMICS_OFFSET_SAMPLING:-all}
+CHUNK_DYNAMICS_OFFSET_SAMPLING=${CHUNK_DYNAMICS_OFFSET_SAMPLING,,}
+CHUNK_DYNAMICS_OFFSET_SAMPLING=${CHUNK_DYNAMICS_OFFSET_SAMPLING//-/_}
+case "$CHUNK_DYNAMICS_OFFSETS_PRESET" in
+  configured)
+    if [[ -n "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" ]]; then
+      if [[ -z "${CHUNK_DYNAMICS_PREDICTION_OFFSETS//[[:space:]]/}" ]]; then
+        echo "An explicitly empty CHUNK_DYNAMICS_PREDICTION_OFFSETS is ambiguous; use CHUNK_DYNAMICS_OFFSETS_PRESET=off." >&2
+        exit 2
+      fi
+    else
+      CHUNK_DYNAMICS_PREDICTION_OFFSETS=$TASK_CHUNK_DYNAMICS_PREDICTION_OFFSETS
+    fi
+    ;;
+  custom)
+    if [[ -z "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" || -z "${CHUNK_DYNAMICS_PREDICTION_OFFSETS//[[:space:]]/}" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=custom requires non-empty CHUNK_DYNAMICS_PREDICTION_OFFSETS." >&2
+      exit 2
+    fi
+    ;;
+  final)
+    if [[ -n "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=final conflicts with CHUNK_DYNAMICS_PREDICTION_OFFSETS." >&2
+      exit 2
+    fi
+    CHUNK_DYNAMICS_PREDICTION_OFFSETS=$CHUNK_HORIZON
+    ;;
+  midfinal|mid_final|four_eight|4_8)
+    if [[ -n "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=$CHUNK_DYNAMICS_OFFSETS_PRESET conflicts with CHUNK_DYNAMICS_PREDICTION_OFFSETS." >&2
+      exit 2
+    fi
+    if [[ "$CHUNK_HORIZON" != "8" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=midfinal requires CHUNK_HORIZON=8; got $CHUNK_HORIZON." >&2
+      exit 2
+    fi
+    CHUNK_DYNAMICS_OFFSETS_PRESET=midfinal
+    CHUNK_DYNAMICS_PREDICTION_OFFSETS="4 8"
+    ;;
+  even|stride2)
+    if [[ -n "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=$CHUNK_DYNAMICS_OFFSETS_PRESET conflicts with CHUNK_DYNAMICS_PREDICTION_OFFSETS." >&2
+      exit 2
+    fi
+    chunk_dynamics_offset_values=()
+    for ((chunk_offset = 2; chunk_offset <= CHUNK_HORIZON; chunk_offset += 2)); do
+      chunk_dynamics_offset_values+=("$chunk_offset")
+    done
+    if (( CHUNK_HORIZON % 2 != 0 )); then
+      chunk_dynamics_offset_values+=("$CHUNK_HORIZON")
+    fi
+    CHUNK_DYNAMICS_PREDICTION_OFFSETS="${chunk_dynamics_offset_values[*]}"
+    ;;
+  all)
+    if [[ -n "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=all conflicts with CHUNK_DYNAMICS_PREDICTION_OFFSETS." >&2
+      exit 2
+    fi
+    chunk_dynamics_offset_values=()
+    for ((chunk_offset = 1; chunk_offset <= CHUNK_HORIZON; chunk_offset += 1)); do
+      chunk_dynamics_offset_values+=("$chunk_offset")
+    done
+    CHUNK_DYNAMICS_PREDICTION_OFFSETS="${chunk_dynamics_offset_values[*]}"
+    ;;
+  random|random_uniform|uniform_per_sample)
+    if [[ -n "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=$CHUNK_DYNAMICS_OFFSETS_PRESET conflicts with CHUNK_DYNAMICS_PREDICTION_OFFSETS." >&2
+      exit 2
+    fi
+    if [[ -n "$USER_CHUNK_DYNAMICS_OFFSET_SAMPLING_SET" && "$CHUNK_DYNAMICS_OFFSET_SAMPLING" != "uniform_per_sample" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=random requires CHUNK_DYNAMICS_OFFSET_SAMPLING=uniform_per_sample." >&2
+      exit 2
+    fi
+    CHUNK_DYNAMICS_OFFSETS_PRESET=random
+    CHUNK_DYNAMICS_OFFSET_SAMPLING=uniform_per_sample
+    chunk_dynamics_offset_values=()
+    for ((chunk_offset = 1; chunk_offset <= CHUNK_HORIZON; chunk_offset += 1)); do
+      chunk_dynamics_offset_values+=("$chunk_offset")
+    done
+    CHUNK_DYNAMICS_PREDICTION_OFFSETS="${chunk_dynamics_offset_values[*]}"
+    ;;
+  off)
+    if [[ -n "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=off conflicts with CHUNK_DYNAMICS_PREDICTION_OFFSETS." >&2
+      exit 2
+    fi
+    if [[ "$CHUNK_CRITIC_ARCHITECTURE" != "rise_temporal_v2" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=off is only supported by rise_temporal_v2." >&2
+      exit 2
+    fi
+    if [[ "$CHUNK_DYNAMICS_OFFSET_SAMPLING" != "all" ]]; then
+      echo "CHUNK_DYNAMICS_OFFSETS_PRESET=off conflicts with CHUNK_DYNAMICS_OFFSET_SAMPLING=$CHUNK_DYNAMICS_OFFSET_SAMPLING." >&2
+      exit 2
+    fi
+    CHUNK_DYNAMICS_PREDICTION_OFFSETS=
+    ;;
+  *)
+    echo "Unsupported CHUNK_DYNAMICS_OFFSETS_PRESET=$CHUNK_DYNAMICS_OFFSETS_PRESET; use configured, custom, final, midfinal, even, all, random, or off." >&2
+    exit 2
+    ;;
+esac
+
+case "$CHUNK_DYNAMICS_OFFSET_SAMPLING" in
+  all|uniform_per_sample)
+    ;;
+  *)
+    echo "CHUNK_DYNAMICS_OFFSET_SAMPLING must be all or uniform_per_sample; got '$CHUNK_DYNAMICS_OFFSET_SAMPLING'." >&2
+    exit 2
+    ;;
+esac
+case "$CHUNK_DYNAMICS_OFFSETS_PRESET" in
+  final|midfinal|even|stride2|all)
+    if [[ "$CHUNK_DYNAMICS_OFFSET_SAMPLING" != "all" ]]; then
+      echo "Fixed dynamics preset '$CHUNK_DYNAMICS_OFFSETS_PRESET' requires CHUNK_DYNAMICS_OFFSET_SAMPLING=all." >&2
+      exit 2
+    fi
+    ;;
+esac
+
+# The task recipe enables the optional RISE-v2 auxiliary by default, but that
+# default must not leak into the legacy or WCM architecture selectors.
+if [[ -z "$USER_CHUNK_RISE_V2_DENSE_DYNAMICS_SET" ]]; then
+  if [[ "$CHUNK_CRITIC_ARCHITECTURE" == "rise_temporal_v2" && "$CHUNK_DYNAMICS_OFFSETS_PRESET" != "off" ]]; then
+    CHUNK_RISE_V2_DENSE_DYNAMICS=$TASK_CHUNK_RISE_V2_DENSE_DYNAMICS
+  else
+    CHUNK_RISE_V2_DENSE_DYNAMICS=0
+  fi
+fi
+if [[ "$CHUNK_RISE_V2_DENSE_DYNAMICS" != "0" && "$CHUNK_RISE_V2_DENSE_DYNAMICS" != "1" ]]; then
+  echo "CHUNK_RISE_V2_DENSE_DYNAMICS must be 0 or 1; got $CHUNK_RISE_V2_DENSE_DYNAMICS." >&2
+  exit 2
+fi
+if [[ "$CHUNK_CRITIC_ARCHITECTURE" != "rise_temporal_v2" && "$CHUNK_RISE_V2_DENSE_DYNAMICS" != "0" ]]; then
+  echo "CHUNK_RISE_V2_DENSE_DYNAMICS applies only to rise_temporal_v2." >&2
+  exit 2
+fi
+if [[ "$CHUNK_DYNAMICS_OFFSETS_PRESET" == "off" ]]; then
+  if [[ "$CHUNK_RISE_V2_DENSE_DYNAMICS" == "1" ]]; then
+    echo "CHUNK_DYNAMICS_OFFSETS_PRESET=off conflicts with CHUNK_RISE_V2_DENSE_DYNAMICS=1." >&2
+    exit 2
+  fi
+  CHUNK_RISE_V2_DENSE_DYNAMICS=0
+elif [[ "$CHUNK_CRITIC_ARCHITECTURE" == "rise_temporal_v2" && "$CHUNK_RISE_V2_DENSE_DYNAMICS" != "1" ]]; then
+  if [[ "$CHUNK_DYNAMICS_OFFSETS_PRESET" == "configured" && -z "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" ]]; then
+    # Backward-compatible spelling: explicitly disabling dense dynamics with
+    # no offset override is exactly the named off preset.
+    CHUNK_DYNAMICS_OFFSETS_PRESET=off
+    CHUNK_DYNAMICS_PREDICTION_OFFSETS=
+  else
+    echo "RISE-v2 offset preset '$CHUNK_DYNAMICS_OFFSETS_PRESET' requires CHUNK_RISE_V2_DENSE_DYNAMICS=1; use CHUNK_DYNAMICS_OFFSETS_PRESET=off to disable it." >&2
+    exit 2
+  fi
+fi
+
+if [[ "$CHUNK_CRITIC_ARCHITECTURE" == "legacy" ]]; then
+  if [[ "$CHUNK_DYNAMICS_OFFSETS_PRESET" != "configured" || -n "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" || "$CHUNK_DYNAMICS_OFFSET_SAMPLING" != "all" ]]; then
+    echo "The legacy critic predicts only its single final/bootstrap latent and does not support multi-offset presets." >&2
+    exit 2
+  fi
+  CHUNK_DYNAMICS_PREDICTION_OFFSETS=
+fi
+if [[ "$CHUNK_CRITIC_ARCHITECTURE" == "wcm_shared_temporal_v1" && "$CHUNK_DYNAMICS_OFFSET_SAMPLING" != "all" ]]; then
+  echo "WCM requires CHUNK_DYNAMICS_OFFSET_SAMPLING=all; uniform per-sample offset selection is a RISE-v2 mode." >&2
+  exit 2
+fi
+if [[ "$CHUNK_CRITIC_ARCHITECTURE" == "rise_temporal_v2" && "$CHUNK_RISE_V2_DENSE_DYNAMICS" != "1" && "$CHUNK_DYNAMICS_OFFSET_SAMPLING" != "all" ]]; then
+  echo "RISE-v2 dynamics-off requires CHUNK_DYNAMICS_OFFSET_SAMPLING=all." >&2
+  exit 2
+fi
+
+# Parse once, accepting arbitrary shell whitespace (including newlines), then
+# reuse this canonical array for validation, argv construction, and path tags.
+chunk_dynamics_offsets_one_line=${CHUNK_DYNAMICS_PREDICTION_OFFSETS//$'\n'/ }
+read -r -a CHUNK_DYNAMICS_PREDICTION_OFFSET_VALUES <<< "$chunk_dynamics_offsets_one_line"
+CHUNK_DYNAMICS_PREDICTION_OFFSETS="${CHUNK_DYNAMICS_PREDICTION_OFFSET_VALUES[*]}"
+if [[ "$CHUNK_CRITIC_ARCHITECTURE" == "wcm_shared_temporal_v1" || "$CHUNK_RISE_V2_DENSE_DYNAMICS" == "1" ]]; then
+  previous_chunk_dynamics_offset=0
+  for chunk_dynamics_offset in "${CHUNK_DYNAMICS_PREDICTION_OFFSET_VALUES[@]}"; do
+    if [[ ! "$chunk_dynamics_offset" =~ ^[1-9][0-9]*$ ]] || (( chunk_dynamics_offset > CHUNK_HORIZON )); then
+      echo "Dynamics offsets must be positive integers <= CHUNK_HORIZON=$CHUNK_HORIZON; got '$chunk_dynamics_offset'." >&2
+      exit 2
+    fi
+    if (( chunk_dynamics_offset <= previous_chunk_dynamics_offset )); then
+      echo "Dynamics offsets must be sorted and unique; got '$CHUNK_DYNAMICS_PREDICTION_OFFSETS'." >&2
+      exit 2
+    fi
+    previous_chunk_dynamics_offset=$chunk_dynamics_offset
+  done
+  if (( previous_chunk_dynamics_offset == 0 )); then
+    echo "$CHUNK_CRITIC_ARCHITECTURE latent dynamics requires at least one prediction offset." >&2
+    exit 2
+  fi
+fi
+
+# Named ablations and raw offset overrides must not silently reuse a completed
+# directory produced by a different auxiliary target set.
+chunk_dynamics_output_tag=
+if [[ "$CHUNK_DYNAMICS_OFFSETS_PRESET" == "custom" ]]; then
+  chunk_dynamics_output_tag=offsets${CHUNK_DYNAMICS_PREDICTION_OFFSETS// /_}
+elif [[ "$CHUNK_DYNAMICS_OFFSETS_PRESET" == "random" ]]; then
+  chunk_dynamics_output_tag=random
+elif [[ "$CHUNK_DYNAMICS_OFFSETS_PRESET" != "configured" ]]; then
+  chunk_dynamics_output_tag=${CHUNK_DYNAMICS_OFFSETS_PRESET/stride2/even}
+elif [[ -n "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" ]]; then
+  chunk_dynamics_output_tag=offsets${CHUNK_DYNAMICS_PREDICTION_OFFSETS// /_}
+fi
+if [[ "$CHUNK_DYNAMICS_OFFSET_SAMPLING" == "uniform_per_sample" && "$CHUNK_DYNAMICS_OFFSETS_PRESET" != "random" ]]; then
+  if [[ -z "$chunk_dynamics_output_tag" ]]; then
+    chunk_dynamics_output_tag=offsets${CHUNK_DYNAMICS_PREDICTION_OFFSETS// /_}
+  fi
+  chunk_dynamics_output_tag=${chunk_dynamics_output_tag}_random
+fi
 
 # critic choice
 case "$CHUNK_CRITIC_ARCHITECTURE" in
@@ -461,6 +703,45 @@ case "$CHUNK_CRITIC_ARCHITECTURE" in
     DEFAULT_DYNAMICS_TARGET_SYNC_INTERVAL=1000
     ;;
 esac
+DYNAMICS_WEIGHT=${DYNAMICS_WEIGHT:-$DEFAULT_CHUNK_DYNAMICS_WEIGHT}
+DYNAMICS_COSINE_WEIGHT=${DYNAMICS_COSINE_WEIGHT:-$DEFAULT_CHUNK_DYNAMICS_COSINE_WEIGHT}
+nonnegative_float_pattern='^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$'
+zero_float_pattern='^(0+([.]0*)?|[.]0+)([eE][+-]?[0-9]+)?$'
+if [[ ! "$DYNAMICS_WEIGHT" =~ $nonnegative_float_pattern ]]; then
+  echo "DYNAMICS_WEIGHT must be a nonnegative number; got '$DYNAMICS_WEIGHT'." >&2
+  exit 2
+fi
+if [[ ! "$DYNAMICS_COSINE_WEIGHT" =~ $nonnegative_float_pattern ]]; then
+  echo "DYNAMICS_COSINE_WEIGHT must be a nonnegative number; got '$DYNAMICS_COSINE_WEIGHT'." >&2
+  exit 2
+fi
+if [[ "$CHUNK_CRITIC_ARCHITECTURE" == "rise_temporal_v2" ]]; then
+  if [[ "$CHUNK_RISE_V2_DENSE_DYNAMICS" == "1" && "$DYNAMICS_WEIGHT" =~ $zero_float_pattern ]]; then
+    echo "RISE-v2 dense dynamics requires DYNAMICS_WEIGHT > 0." >&2
+    exit 2
+  fi
+  if [[ "$CHUNK_RISE_V2_DENSE_DYNAMICS" == "0" && ! "$DYNAMICS_WEIGHT" =~ $zero_float_pattern ]]; then
+    echo "RISE-v2 dynamics-off requires DYNAMICS_WEIGHT=0." >&2
+    exit 2
+  fi
+  if [[ ! "$DYNAMICS_COSINE_WEIGHT" =~ $zero_float_pattern ]]; then
+    echo "RISE-v2 uses Smooth-L1 only and requires DYNAMICS_COSINE_WEIGHT=0." >&2
+    exit 2
+  fi
+elif [[ "$CHUNK_CRITIC_ARCHITECTURE" == "wcm_shared_temporal_v1" && ! "$DYNAMICS_COSINE_WEIGHT" =~ $zero_float_pattern ]]; then
+  echo "WCM uses raw latent MSE and requires DYNAMICS_COSINE_WEIGHT=0." >&2
+  exit 2
+fi
+if [[ -n "$USER_DYNAMICS_WEIGHT_SET" ]]; then
+  dynamics_weight_tag=${DYNAMICS_WEIGHT//./p}
+  dynamics_weight_tag=${dynamics_weight_tag//+/plus}
+  dynamics_weight_tag=${dynamics_weight_tag//-/minus}
+  if [[ -n "$chunk_dynamics_output_tag" ]]; then
+    chunk_dynamics_output_tag=${chunk_dynamics_output_tag}_weight${dynamics_weight_tag}
+  else
+    chunk_dynamics_output_tag=weight${dynamics_weight_tag}
+  fi
+fi
 CHUNK_CRITIC_Q_USE_PREDICTED_NEXT_LATENT=${CHUNK_CRITIC_Q_USE_PREDICTED_NEXT_LATENT:-0}
 if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
   if [[ "$CHUNK_INITIALIZATION" != "source_chunk_idql_joint" ]]; then
@@ -601,6 +882,26 @@ if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
   fi
   if [[ -z "$USER_CHUNK_EVAL_OUTPUT_SET" ]]; then
     CHUNK_EVAL_OUTPUT=$round2_eval_default
+  fi
+  if [[ "$CHUNK_CRITIC_ARCHITECTURE" != "rise_temporal_v2" ]]; then
+    if [[ -z "$USER_CHUNK_IDQL_OUTPUT_DIR_SET" ]]; then
+      CHUNK_IDQL_OUTPUT_DIR=${CHUNK_IDQL_OUTPUT_DIR}_${CHUNK_CRITIC_ARCHITECTURE}
+    fi
+    if [[ -z "$USER_CHUNK_EVAL_OUTPUT_SET" ]]; then
+      CHUNK_EVAL_OUTPUT=${CHUNK_EVAL_OUTPUT}_${CHUNK_CRITIC_ARCHITECTURE}
+    fi
+  fi
+fi
+
+if [[ -n "$chunk_dynamics_output_tag" ]]; then
+  if [[ -z "$USER_CHUNK_IDQL_OUTPUT_DIR_SET" ]]; then
+    CHUNK_IDQL_OUTPUT_DIR=${CHUNK_IDQL_OUTPUT_DIR}_dyn_${chunk_dynamics_output_tag}
+  fi
+  if [[ -z "$USER_CHUNK_EVAL_OUTPUT_SET" ]]; then
+    CHUNK_EVAL_OUTPUT=${CHUNK_EVAL_OUTPUT}_dyn_${chunk_dynamics_output_tag}
+  fi
+  if [[ -z "$USER_COMPOSED_CHUNK_EVAL_OUTPUT_SET" ]]; then
+    COMPOSED_CHUNK_EVAL_OUTPUT=${COMPOSED_CHUNK_EVAL_OUTPUT}_dyn_${chunk_dynamics_output_tag}
   fi
 fi
 
@@ -749,10 +1050,19 @@ SPARSE_CHUNK_LOADER_ARG=--sparse-chunk-loader
 if [[ "${CHUNK_SPARSE_LOADER:-1}" == "0" ]]; then
   SPARSE_CHUNK_LOADER_ARG=--no-sparse-chunk-loader
 fi
-read -r -a CHUNK_DYNAMICS_PREDICTION_OFFSET_VALUES <<< "$CHUNK_DYNAMICS_PREDICTION_OFFSETS"
-CHUNK_DYNAMICS_PREDICTION_OFFSET_ARGS=(
-  --dynamics-prediction-offsets
-  "${CHUNK_DYNAMICS_PREDICTION_OFFSET_VALUES[@]}"
+CHUNK_DYNAMICS_PREDICTION_OFFSET_ARGS=()
+if (( ${#CHUNK_DYNAMICS_PREDICTION_OFFSET_VALUES[@]} > 0 )); then
+  CHUNK_DYNAMICS_PREDICTION_OFFSET_ARGS=(
+    --dynamics-prediction-offsets
+    "${CHUNK_DYNAMICS_PREDICTION_OFFSET_VALUES[@]}"
+  )
+elif [[ "$CHUNK_CRITIC_ARCHITECTURE" == "wcm_shared_temporal_v1" || "$CHUNK_RISE_V2_DENSE_DYNAMICS" == "1" ]]; then
+  echo "$CHUNK_CRITIC_ARCHITECTURE latent dynamics requires at least one prediction offset." >&2
+  exit 2
+fi
+CHUNK_DYNAMICS_OFFSET_SAMPLING_ARGS=(
+  --dynamics-offset-sampling
+  "$CHUNK_DYNAMICS_OFFSET_SAMPLING"
 )
 CRITIC_GROUP_NORM=${CRITIC_GROUP_NORM:-$TASK_CRITIC_GROUP_NORM}
 CRITIC_GROUP_NORM_ARG=--no-critic-group-norm
@@ -1253,7 +1563,8 @@ run_chunk_train() {
     export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
     echo "[rgb_dp_chunk_idql] distributed training: GPUs=$CHUNK_NUM_GPUS per-rank-batch=${CHUNK_BATCH_SIZE:-${BATCH_SIZE:-100}}" >&2
   fi
-  echo "[rgb_dp_chunk_idql task=$TASK] dataset layout=request_aligned validity_key=chunk_critic_valid" >&2
+  echo "[rgb_dp_chunk_idql task=$TASK] sparse loader uses chunk_critic_valid when present; legacy simulation data uses all action-time windows" >&2
+  echo "[rgb_dp_chunk_idql task=$TASK] critic=$CHUNK_CRITIC_ARCHITECTURE H=$CHUNK_HORIZON dynamics_preset=$CHUNK_DYNAMICS_OFFSETS_PRESET dynamics_sampling=$CHUNK_DYNAMICS_OFFSET_SAMPLING offsets=${CHUNK_DYNAMICS_PREDICTION_OFFSETS:-none}" >&2
   "${train_launcher[@]}" scripts/train_rgb_dp_chunk_idql.py \
     --task "$TASK" \
     "${distributed_args[@]}" \
@@ -1278,7 +1589,7 @@ run_chunk_train() {
     --reward-mode "$IDQL_REWARD_MODE" \
     --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
     "$ALLOW_SINGLE_CONDITION_CLASS_ARG" \
-    --chunk-horizon "${CHUNK_HORIZON:-8}" \
+    --chunk-horizon "$CHUNK_HORIZON" \
     --critic-architecture "$CHUNK_CRITIC_ARCHITECTURE" \
     --critic-observation-horizon "$CHUNK_CRITIC_OBSERVATION_HORIZON" \
     --discount "${DISCOUNT:-$DEFAULT_IDQL_DISCOUNT}" \
@@ -1320,9 +1631,10 @@ run_chunk_train() {
     "$CRITIC_GROUP_NORM_ARG" \
     --critic-late-fusion-key "$CRITIC_LATE_FUSION_KEY" \
     "$CRITIC_Q_PREDICTED_NEXT_ARG" \
-    --dynamics-weight "${DYNAMICS_WEIGHT:-$DEFAULT_CHUNK_DYNAMICS_WEIGHT}" \
-    --dynamics-cosine-weight "${DYNAMICS_COSINE_WEIGHT:-$DEFAULT_CHUNK_DYNAMICS_COSINE_WEIGHT}" \
+    --dynamics-weight "$DYNAMICS_WEIGHT" \
+    --dynamics-cosine-weight "$DYNAMICS_COSINE_WEIGHT" \
     "${CHUNK_DYNAMICS_PREDICTION_OFFSET_ARGS[@]}" \
+    "${CHUNK_DYNAMICS_OFFSET_SAMPLING_ARGS[@]}" \
     --sigreg-weight "${CHUNK_SIGREG_WEIGHT:-0.0}" \
     --sigreg-knots "${CHUNK_SIGREG_KNOTS:-17}" \
     --sigreg-num-projections "${CHUNK_SIGREG_NUM_PROJECTIONS:-1024}" \

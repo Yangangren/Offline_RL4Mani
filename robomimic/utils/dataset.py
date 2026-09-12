@@ -767,6 +767,7 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
         self._demo_policy_chunk_indices = {}
         self._demo_request_bootstrap_valid = {}
         self._demo_request_action_counts = {}
+        self._demo_next_obs_valid = {}
         if (
             self.chunk_horizon < 1
             or self.observation_horizon < 1
@@ -815,6 +816,125 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"dataset has no samples enabled by {self.validity_key}"
             )
+        self._demo_next_obs_valid = self._load_next_obs_validity()
+
+    def _load_next_obs_validity(self):
+        """Load or conservatively infer action-aligned successor validity.
+
+        New mixed datasets store an explicit ``next_obs_valid`` bit for every
+        action. Older datasets produced by the same builder can be recovered
+        from their truncation attributes: their final shifted successor is real
+        only when the retained episode is shorter than its source episode. If no
+        explicit key or usable provenance is available, terminal rows (and the
+        final row in particular) are conservatively treated as placeholders.
+        """
+
+        base = self.dataset
+        validity = {}
+        with base.hdf5_file_opened():
+            for demo_id in base.demos:
+                episode = base.hdf5_file[f"data/{demo_id}"]
+                expected = int(base._demo_id_to_demo_length[demo_id])
+                if expected < 1:
+                    raise ValueError(
+                        f"data/{demo_id} must contain at least one transition"
+                    )
+
+                if "next_obs_valid" in episode:
+                    try:
+                        raw_values = np.asarray(episode["next_obs_valid"][:])
+                    except (
+                        KeyError,
+                        OSError,
+                        RuntimeError,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        raise ValueError(
+                            f"data/{demo_id}/next_obs_valid is inaccessible: {exc}"
+                        ) from exc
+                    values = raw_values.reshape(-1)
+                    if (
+                        values.shape != (expected,)
+                        or not (
+                            np.issubdtype(values.dtype, np.number)
+                            or np.issubdtype(values.dtype, np.bool_)
+                        )
+                        or not np.all(np.isfinite(values))
+                        or np.any(~np.isin(values, (0, 1)))
+                    ):
+                        raise ValueError(
+                            f"data/{demo_id}/next_obs_valid must be a binary "
+                            f"vector of length {expected}, got "
+                            f"shape={raw_values.shape}"
+                        )
+                    validity[demo_id] = values.astype(np.uint8, copy=False)
+                    continue
+
+                values = np.ones(expected, dtype=np.uint8)
+                source_count_raw = episode.attrs.get("source_num_samples")
+                truncated_raw = episode.attrs.get("truncated_transition_count")
+                source_count = None
+                truncated_count = None
+                try:
+                    if source_count_raw is not None:
+                        source_count = int(source_count_raw)
+                    if truncated_raw is not None:
+                        truncated_count = int(truncated_raw)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        f"data/{demo_id} has invalid source/truncation metadata"
+                    ) from exc
+
+                if source_count is not None and source_count < expected:
+                    raise ValueError(
+                        f"data/{demo_id} source_num_samples={source_count} is "
+                        f"shorter than num_samples={expected}"
+                    )
+                if truncated_count is not None and truncated_count < 0:
+                    raise ValueError(
+                        f"data/{demo_id} truncated_transition_count must be "
+                        f"nonnegative, got {truncated_count}"
+                    )
+                if (
+                    source_count is not None
+                    and truncated_count is not None
+                    and source_count - expected != truncated_count
+                ):
+                    raise ValueError(
+                        f"data/{demo_id} has inconsistent source/truncation "
+                        "metadata"
+                    )
+
+                terminal_available = False
+                if source_count is not None:
+                    terminal_available = source_count > expected
+                elif truncated_count is not None:
+                    terminal_available = truncated_count > 0
+                else:
+                    # Unknown legacy layouts get the same safe fallback as the
+                    # dense loader: do not assume a terminal action has a real
+                    # recorded successor merely because its row is in range.
+                    if "dones" in episode:
+                        raw_dones = np.asarray(episode["dones"][:]).reshape(-1)
+                        if raw_dones.shape != (expected,) or not np.all(
+                            np.isfinite(raw_dones)
+                        ):
+                            raise ValueError(
+                                f"data/{demo_id}/dones must be a finite vector "
+                                f"of length {expected}"
+                            )
+                        values[raw_dones > 0.5] = 0
+                values[-1] = np.uint8(terminal_available)
+                validity[demo_id] = values
+        return validity
+
+    def _next_obs_available(self, demo_id, action_index):
+        values = self._demo_next_obs_valid[demo_id]
+        action_index = int(action_index)
+        if action_index < 0 or action_index >= int(values.shape[0]):
+            return 0.0
+        return float(values[action_index])
 
     def _load_valid_indices(self):
         """Return base SequenceDataset indices admitted by an HDF5 row mask.
@@ -1192,6 +1312,10 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
             )
         )
         valid_length = int(action_mask.sum())
+        chunk_next_obs_available = self._next_obs_available(
+            demo_id,
+            index_in_demo + valid_length - 1,
+        )
         if one_step_aligned:
             # ``one_step_obs[t]`` is the observation before action ``t``.
             # A chunk transition therefore bootstraps from ``t + L`` after
@@ -1203,6 +1327,9 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
             )
             meta["next_obs"] = self._get_one_step_observations(
                 demo_id, next_index
+            )
+            chunk_next_obs_available = float(
+                index_in_demo + valid_length < demo_length
             )
             if self.dynamics_prediction_offsets:
                 dynamics_values = {key: [] for key in base.obs_keys}
@@ -1229,6 +1356,7 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
             bootstrap_valid = bool(
                 self._demo_request_bootstrap_valid[demo_id][request_index]
             )
+            chunk_next_obs_available = float(bootstrap_valid)
             if bootstrap_valid:
                 next_request = self._get_request_observations(
                     demo_id, request_index + 1
@@ -1291,7 +1419,9 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                 target_positions.append(
                     self.next_observation_horizon + int(offset) - 2
                 )
-                target_available.append(float(requested_index < demo_length))
+                target_available.append(
+                    self._next_obs_available(demo_id, requested_index)
+                )
             meta["chunk_dynamics_next_obs"] = {
                 key: np.stack(
                     [
@@ -1313,6 +1443,9 @@ class SparseChunkSequenceDataset(torch.utils.data.Dataset):
                 demo_length=demo_length,
                 valid_length=valid_length,
             )
+        meta["chunk_next_obs_available"] = np.float32(
+            chunk_next_obs_available
+        )
         meta["chunk_sparse_next_obs"] = np.float32(1.0)
 
         if base.goal_mode == "last":

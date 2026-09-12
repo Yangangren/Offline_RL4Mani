@@ -736,6 +736,18 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
                 h5py.Dataset,
                 location,
             )
+            # ``next_obs_valid`` was added after the first mixed datasets were
+            # released. Keep validation compatible with those files, but when
+            # the explicit contract is present require it to match the shifted
+            # observation layout exactly.
+            target_next_obs_valid = None
+            if "next_obs_valid" in episode:
+                target_next_obs_valid = required_child(
+                    episode,
+                    "next_obs_valid",
+                    h5py.Dataset,
+                    location,
+                )
             check_dataset_length(
                 target_actions,
                 expected_count,
@@ -760,6 +772,11 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
                 target_dones,
                 expected_count,
                 f"{location}/dones",
+            )
+            check_dataset_length(
+                target_next_obs_valid,
+                expected_count,
+                f"{location}/next_obs_valid",
             )
             check_external_link(
                 episode,
@@ -829,6 +846,23 @@ def validate_existing(args: argparse.Namespace) -> dict[str, Any]:
 
                     errors.append(
                         f"{location}/dones must be zero except at the end"
+                    )
+            if target_next_obs_valid is not None:
+                actual_next_obs_valid = np.asarray(target_next_obs_valid[:])
+                expected_next_obs_valid = shifted_next_obs_validity(
+                    expected_count,
+                    source_count,
+                )
+                if (
+                    actual_next_obs_valid.shape != (expected_count,)
+                    or not np.array_equal(
+                        actual_next_obs_valid,
+                        expected_next_obs_valid,
+                    )
+                ):
+                    errors.append(
+                        f"{location}/next_obs_valid must mark only source-backed "
+                        "shifted successors"
                     )
             expected_expert = source == "expert"
             expected_condition = actor_condition_value(
@@ -975,6 +1009,30 @@ def create_shifted_next_obs(
         next_obs.create_virtual_dataset(key, layout)
 
 
+def shifted_next_obs_validity(count: int, source_count: int) -> np.ndarray:
+    """Return whether each shifted successor is backed by a later source row.
+
+    Source demonstrations store one observation per action. For every retained
+    non-final action, the next source observation is therefore available at the
+    following row. The final retained action has a real successor only when the
+    mixed episode was truncated before the source episode ended; otherwise
+    :func:`create_shifted_next_obs` repeats the final observation as a
+    shape-compatible placeholder.
+    """
+
+    count = int(count)
+    source_count = int(source_count)
+    if count < 1 or source_count < count:
+        raise ValueError(
+            "shifted next-observation validity requires "
+            f"1 <= count <= source_count, got count={count}, "
+            f"source_count={source_count}"
+        )
+    valid = np.ones(count, dtype=np.uint8)
+    valid[-1] = np.uint8(count < source_count)
+    return valid
+
+
 def add_episode(
     output_data: h5py.Group,
     output_key: str,
@@ -1026,7 +1084,13 @@ def add_episode(
         target.attrs["rise_source_file"] = str(source_path)
 
         for key in source_group.keys():
-            if key in {"obs", "next_obs", "rewards", "dones"}:
+            if key in {
+                "obs",
+                "next_obs",
+                "next_obs_valid",
+                "rewards",
+                "dones",
+            }:
                 continue
             child = source_group[key]
             if reward_mode in CANONICAL_TERMINAL_REWARD_MODES:
@@ -1111,6 +1175,10 @@ def add_episode(
         dones[-1] = 1.0
         target.create_dataset("dones", data=dones)
         create_shifted_next_obs(target, source_path, source_group["obs"], count)
+        target.create_dataset(
+            "next_obs_valid",
+            data=shifted_next_obs_validity(count, source_count),
+        )
 
     if reward_mode == "task":
         critic_positive_count = source_positive_count

@@ -105,6 +105,7 @@ CRITIC_ARCHITECTURES = (
 DEFAULT_RISE_V2_DYNAMICS_TARGET_SYNC_INTERVAL = 500
 DEFAULT_WCM_DYNAMICS_TARGET_SYNC_INTERVAL = 500
 DEFAULT_LEGACY_DYNAMICS_TARGET_SYNC_INTERVAL = 1000
+DYNAMICS_OFFSET_SAMPLING_MODES = ("all", "uniform_per_sample")
 ACTOR_OPTIMIZER_TYPE = "adamw"
 ACTOR_WEIGHT_DECAY = 1e-6
 JOINT_ACTOR_INITIALIZATIONS = frozenset(
@@ -265,6 +266,7 @@ def configure_critic_architecture_args(args: argparse.Namespace) -> None:
         "sigreg_global_batch": True,
         "rise_v2_fusion_mode": "film",
         "rise_v2_dense_dynamics": False,
+        "dynamics_offset_sampling": "all",
     }
     for field, default in defaults.items():
         if not hasattr(args, field):
@@ -272,6 +274,13 @@ def configure_critic_architecture_args(args: argparse.Namespace) -> None:
     architecture = str(args.critic_architecture)
     if architecture not in CRITIC_ARCHITECTURES:
         raise ValueError(f"unsupported critic architecture: {architecture!r}")
+    dynamics_offset_sampling = str(args.dynamics_offset_sampling)
+    if dynamics_offset_sampling not in DYNAMICS_OFFSET_SAMPLING_MODES:
+        raise ValueError(
+            "dynamics_offset_sampling must be one of "
+            f"{DYNAMICS_OFFSET_SAMPLING_MODES}, got "
+            f"{dynamics_offset_sampling!r}"
+        )
     if getattr(args, "dynamics_target_sync_interval", None) is None:
         args.dynamics_target_sync_interval = int(
             DEFAULT_WCM_DYNAMICS_TARGET_SYNC_INTERVAL
@@ -282,6 +291,11 @@ def configure_critic_architecture_args(args: argparse.Namespace) -> None:
         )
     offsets = tuple(int(value) for value in args.dynamics_prediction_offsets)
     if architecture == LEGACY_CRITIC_ARCHITECTURE:
+        if dynamics_offset_sampling != "all":
+            raise ValueError(
+                "uniform per-sample dynamics offsets are supported only by "
+                "RISE-v2"
+            )
         # Do not make old training load four unused RGB targets.
         args.dynamics_prediction_offsets = ()
         return
@@ -310,6 +324,11 @@ def configure_critic_architecture_args(args: argparse.Namespace) -> None:
                 "--dynamics-cosine-weight 0"
             )
         if not bool(args.rise_v2_dense_dynamics):
+            if dynamics_offset_sampling != "all":
+                raise ValueError(
+                    "RISE-v2 uniform per-sample dynamics offsets require dense "
+                    "dynamics to be enabled"
+                )
             if float(getattr(args, "dynamics_weight", 0.0)) != 0.0:
                 raise ValueError(
                     "RISE-v2 dense dynamics is disabled, so set "
@@ -346,6 +365,10 @@ def configure_critic_architecture_args(args: argparse.Namespace) -> None:
         if not 0.0 <= float(args.temporal_dropout) < 1.0:
             raise ValueError("temporal_dropout must be in [0, 1)")
         return
+    if dynamics_offset_sampling != "all":
+        raise ValueError(
+            "WCM currently requires dynamics_offset_sampling='all'"
+        )
     if float(getattr(args, "dynamics_cosine_weight", 0.0)) != 0.0:
         raise ValueError(
             "WCM uses raw latent MSE; set --dynamics-cosine-weight 0"
@@ -383,6 +406,18 @@ def configure_critic_architecture_args(args: argparse.Namespace) -> None:
             "equal encoder_freeze_steps"
         )
     args.dynamics_prediction_offsets = offsets
+
+
+def rise_v2_dynamics_auxiliary_enabled(args: argparse.Namespace) -> bool:
+    """Whether RISE-v2 currently optimizes a nonzero dynamics objective."""
+    return bool(
+        not getattr(args, "actor_only", False)
+        and str(getattr(args, "critic_architecture", ""))
+        == RISE_V2_CRITIC_ARCHITECTURE
+        and getattr(args, "rise_v2_dense_dynamics", False)
+        and tuple(getattr(args, "dynamics_prediction_offsets", ()))
+        and float(getattr(args, "dynamics_weight", 0.0)) > 0.0
+    )
 
 
 def checkpoint_critic_observation_horizon(checkpoint: dict) -> int:
@@ -3318,16 +3353,37 @@ def validate_resume_semantics(
         initialization = str(
             resume_state.get("chunk_initialization", "pretrained_dp_frozen")
         )
-        expected_last_sync = (
-            global_step // interval * interval
-            if initialization in JOINT_ACTOR_INITIALIZATIONS and global_step >= 0
-            else 0
-        )
-        if last_sync_step != expected_last_sync:
+        joint_actor = initialization in JOINT_ACTOR_INITIALIZATIONS
+        if joint_actor and rise_v2_dynamics_auxiliary_enabled(args):
+            expected_last_sync = (
+                global_step // interval * interval if global_step >= 0 else -1
+            )
+            if last_sync_step != expected_last_sync:
+                raise ValueError(
+                    "resume RISE-v2 dynamics target sync state is "
+                    f"inconsistent: step={global_step}, "
+                    f"last_sync={last_sync_step}, "
+                    f"expected={expected_last_sync}"
+                )
+        elif joint_actor:
+            # Older aux-disabled checkpoints synchronized this unused teacher.
+            # Accept their last historical aligned sync as well as the new
+            # zero-sync state. Once resumed, no additional sync is performed.
+            plausible_historical_sync = (
+                global_step >= 0
+                and 0 <= last_sync_step <= global_step
+                and last_sync_step % interval == 0
+            )
+            if not plausible_historical_sync:
+                raise ValueError(
+                    "resume aux-disabled RISE-v2 dynamics target sync state "
+                    f"is inconsistent: step={global_step}, "
+                    f"last_sync={last_sync_step}, interval={interval}"
+                )
+        elif last_sync_step != 0:
             raise ValueError(
-                "resume RISE-v2 dynamics target sync state is inconsistent: "
-                f"step={global_step}, last_sync={last_sync_step}, "
-                f"expected={expected_last_sync}"
+                "resume frozen-actor RISE-v2 dynamics target sync state is "
+                f"inconsistent: last_sync={last_sync_step}, expected=0"
             )
     if str(resume_state.get("task", "")) != str(args.task):
         raise ValueError(
@@ -3427,6 +3483,9 @@ def validate_resume_semantics(
             {
                 "rise_v2_fusion_mode": str(args.rise_v2_fusion_mode),
                 "rise_v2_dense_dynamics": bool(args.rise_v2_dense_dynamics),
+                "dynamics_offset_sampling": str(
+                    args.dynamics_offset_sampling
+                ),
             }
         )
     if args.steps_per_epoch is not None:
@@ -3446,6 +3505,10 @@ def validate_resume_semantics(
                 saved = checkpoint_q_uses_predicted_next_latent(
                     resume_state
                 )
+            elif field == "dynamics_offset_sampling":
+                # Checkpoints before random-offset training always used every
+                # configured target and are therefore unambiguously "all".
+                saved = "all"
             else:
                 raise ValueError(
                     f"resume checkpoint has no immutable {field} configuration; "
@@ -3616,6 +3679,80 @@ def configure_chunk_actor_optimizer(
 def gather_time(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     rows = torch.arange(values.shape[0], device=values.device)
     return values[rows, indices]
+
+
+def binary_mask_tensor(
+    values: torch.Tensor,
+    *,
+    expected_shape: tuple[int, ...],
+    name: str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Validate a collated semantic-availability mask without broadcasting."""
+    while values.ndim > len(expected_shape) and values.shape[-1] == 1:
+        values = values.squeeze(-1)
+    if tuple(values.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"{name} must have shape {expected_shape}, got {tuple(values.shape)}"
+        )
+    if not torch.all((values == 0) | (values == 1)):
+        raise ValueError(f"{name} must contain only zero or one")
+    return values.to(dtype=dtype)
+
+
+def sample_uniform_valid_offset_indices(
+    valid_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select one uniformly random available dynamics offset per batch row.
+
+    Sampling happens in the main training process after DataLoader collation, so
+    the existing per-rank torch RNG checkpoint is sufficient for exact resume.
+    Rows without any real future target receive safe index zero and an all-zero
+    sampled mask; they therefore contribute no auxiliary loss.
+    """
+    if valid_mask.ndim != 2 or int(valid_mask.shape[1]) < 1:
+        raise ValueError(
+            "random dynamics-offset sampling requires a nonempty [B,O] mask, "
+            f"got {tuple(valid_mask.shape)}"
+        )
+    if not torch.all((valid_mask == 0) | (valid_mask == 1)):
+        raise ValueError("dynamics target validity must contain only zero or one")
+    available = valid_mask > 0.5
+    has_available = available.any(dim=1)
+    weights = available.to(dtype=torch.float32)
+    safe_weights = weights.clone()
+    safe_weights[~has_available, 0] = 1.0
+    selected_indices = torch.multinomial(
+        safe_weights,
+        num_samples=1,
+        replacement=True,
+    ).squeeze(1)
+    sampled_mask = torch.zeros_like(valid_mask)
+    sampled_mask.scatter_(
+        1,
+        selected_indices[:, None],
+        has_available.to(dtype=valid_mask.dtype)[:, None],
+    )
+    return selected_indices, sampled_mask
+
+
+def gather_offset_per_row(
+    values: torch.Tensor,
+    selected_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Gather one offset per row and retain a singleton offset dimension."""
+    if values.ndim < 2:
+        raise ValueError(f"offset values must be [B,O,...], got {tuple(values.shape)}")
+    indices = selected_indices.reshape(-1).to(
+        device=values.device,
+        dtype=torch.long,
+    )
+    if int(values.shape[0]) != int(indices.shape[0]):
+        raise ValueError("offset values and selected indices have different batches")
+    if torch.any(indices < 0) or torch.any(indices >= int(values.shape[1])):
+        raise ValueError("selected dynamics offset index is out of range")
+    rows = torch.arange(values.shape[0], device=values.device)
+    return values[rows, indices].unsqueeze(1)
 
 
 def gather_time_history(
@@ -3938,6 +4075,7 @@ def process_chunk_batch(
     reward_mode: str = "task",
     critic_observation_horizon: int = 1,
     dynamics_prediction_offsets: tuple[int, ...] = (),
+    dynamics_offset_sampling: str = "all",
 ) -> dict[str, Any]:
     """Extract a semi-MDP transition at the first executable DP action."""
     current_index = int(actor_algo.algo_config.horizon.observation_horizon) - 1
@@ -4028,14 +4166,49 @@ def process_chunk_batch(
     discounts = torch.pow(rewards.new_tensor(float(discount)), powers)
     chunk_return = (rewards * action_mask * discounts[None]).sum(dim=1)
     next_indices = current_index + valid_length.to(torch.long) - 1
-    # A terminal action still produces the real post-action observation. It is
-    # a valid dynamics target when it occurs exactly at the requested horizon;
-    # only actions after an earlier terminal are invalid.
+    # A full H-action macro-transition and the existence of its real successor
+    # are separate facts. Older mixed datasets sometimes repeat the last
+    # pre-action observation in next_obs because no post-terminal frame was
+    # recorded, so exact_next alone is not a safe dynamics mask.
     exact_next = (valid_length == float(chunk_horizon)).to(rewards.dtype)
+    if "chunk_next_obs_available" in raw_batch:
+        successor_available = binary_mask_tensor(
+            raw_batch["chunk_next_obs_available"],
+            expected_shape=(int(actions.shape[0]),),
+            name="chunk_next_obs_available",
+            dtype=rewards.dtype,
+        )
+    elif "next_obs_valid" in raw_batch:
+        successor_available = binary_mask_tensor(
+            gather_time(raw_batch["next_obs_valid"], next_indices),
+            expected_shape=(int(actions.shape[0]),),
+            name="selected next_obs_valid",
+            dtype=rewards.dtype,
+        )
+    else:
+        # Safe compatibility behavior for artifacts predating next_obs_valid:
+        # a terminal action's successor is treated as unavailable. This may
+        # discard a real recorded terminal successor, but never trains toward
+        # a fabricated repeated frame.
+        successor_done = gather_time(raw_batch["dones"], next_indices)
+        while successor_done.ndim > 1 and successor_done.shape[-1] == 1:
+            successor_done = successor_done.squeeze(-1)
+        successor_available = (successor_done <= 0.5).to(rewards.dtype)
+    dynamics_exact_next = exact_next * successor_available
 
     dynamics_prediction_offsets = tuple(
         int(value) for value in dynamics_prediction_offsets
     )
+    dynamics_offset_sampling = str(dynamics_offset_sampling)
+    if dynamics_offset_sampling not in DYNAMICS_OFFSET_SAMPLING_MODES:
+        raise ValueError(
+            "unsupported dynamics_offset_sampling="
+            f"{dynamics_offset_sampling!r}"
+        )
+    if dynamics_offset_sampling != "all" and not dynamics_prediction_offsets:
+        raise ValueError(
+            "uniform per-sample dynamics offsets require prediction candidates"
+        )
     if dynamics_prediction_offsets and (
         tuple(sorted(set(dynamics_prediction_offsets)))
         != dynamics_prediction_offsets
@@ -4070,7 +4243,13 @@ def process_chunk_batch(
             }
             availability = raw_batch[
                 "chunk_dynamics_target_available"
-            ].to(dtype=valid_mask.dtype, device=valid_mask.device)
+            ]
+            availability = binary_mask_tensor(
+                availability,
+                expected_shape=tuple(valid_mask.shape),
+                name="chunk_dynamics_target_available",
+                dtype=valid_mask.dtype,
+            ).to(device=valid_mask.device)
         else:
             target_obs = {
                 key: raw_batch["next_obs"][key].index_select(
@@ -4078,21 +4257,56 @@ def process_chunk_batch(
                 )
                 for key in actor_algo.obs_shapes
             }
-            if "pad_mask" in raw_batch:
-                availability = raw_batch["pad_mask"].index_select(
+            if "next_obs_valid" in raw_batch:
+                availability = raw_batch["next_obs_valid"].index_select(
                     1, offset_indices
                 )
-                if availability.ndim == 3:
-                    availability = availability.squeeze(-1)
-                availability = availability.to(dtype=valid_mask.dtype)
+                availability = binary_mask_tensor(
+                    availability,
+                    expected_shape=tuple(valid_mask.shape),
+                    name="selected next_obs_valid",
+                    dtype=valid_mask.dtype,
+                )
             else:
-                availability = torch.ones_like(valid_mask)
+                # Conservative legacy fallback; see dynamics_exact_next above.
+                availability = (
+                    dones.index_select(1, offset_action_indices) <= 0.5
+                ).to(dtype=valid_mask.dtype)
+            if "pad_mask" in raw_batch:
+                pad_availability = raw_batch["pad_mask"].index_select(
+                    1, offset_indices
+                )
+                pad_availability = binary_mask_tensor(
+                    pad_availability,
+                    expected_shape=tuple(valid_mask.shape),
+                    name="selected pad_mask",
+                    dtype=valid_mask.dtype,
+                )
+                availability = availability * pad_availability
         dynamics_targets = {
             # This nested key must remain exactly ``next_obs`` so robomimic's
             # postprocessor applies channel conversion and normalization.
             "next_obs": target_obs,
             "valid_mask": valid_mask * availability,
         }
+        if dynamics_offset_sampling == "uniform_per_sample":
+            candidate_valid_mask = dynamics_targets["valid_mask"]
+            selected_indices, sampled_candidate_mask = (
+                sample_uniform_valid_offset_indices(candidate_valid_mask)
+            )
+            dynamics_targets = {
+                "next_obs": {
+                    key: gather_offset_per_row(value, selected_indices)
+                    for key, value in target_obs.items()
+                },
+                "valid_mask": gather_offset_per_row(
+                    sampled_candidate_mask,
+                    selected_indices,
+                ),
+                "candidate_valid_mask": candidate_valid_mask,
+                "sampled_candidate_mask": sampled_candidate_mask,
+                "sampled_offset_indices": selected_indices,
+            }
 
     batch = {
         "obs": {
@@ -4138,6 +4352,7 @@ def process_chunk_batch(
         "terminal": terminal.reshape(-1, 1),
         "valid_length": valid_length.reshape(-1, 1),
         "exact_next": exact_next.reshape(-1, 1),
+        "dynamics_exact_next": dynamics_exact_next.reshape(-1, 1),
         "goal_obs": raw_batch.get("goal_obs"),
     }
     if dynamics_targets is not None:
@@ -4420,15 +4635,20 @@ def compute_chunk_losses(
         target_next_encoder_features = []
         for crop_seed in critic_crop_seeds:
             with fork_rng_with_seed(crop_seed, device):
+                target_encoder_inputs = {"obs": dynamics_next_obs}
+                if batch["goal_obs"] is not None:
+                    target_encoder_inputs["goal"] = batch["goal_obs"]
                 target_next_encoder_features.append(
-                    dynamics_target_encoder(
-                        obs=dynamics_next_obs,
-                    )
+                    dynamics_target_encoder(**target_encoder_inputs)
                 )
 
     regression = F.smooth_l1_loss if use_huber else F.mse_loss
+    dynamics_exact_next = batch.get(
+        "dynamics_exact_next",
+        batch["exact_next"],
+    )
     global_valid_row_count = (
-        batch["exact_next"].reshape(-1) > 0.5
+        dynamics_exact_next.reshape(-1) > 0.5
     ).sum().detach()
     if distributed_context is not None and distributed_context.enabled:
         dist.all_reduce(global_valid_row_count, op=dist.ReduceOp.SUM)
@@ -4443,7 +4663,7 @@ def compute_chunk_losses(
         dyn_l1, dyn_cos, dyn_rmse = masked_dynamics_losses(
             output["predicted_next_encoder"],
             target_features,
-            batch["exact_next"],
+            dynamics_exact_next,
             distributed_context=distributed_context,
             global_valid_row_count=global_valid_row_count,
         )
@@ -4497,7 +4717,7 @@ def compute_chunk_losses(
         "dynamics/effective_cosine_weight": q_predictions.new_tensor(
             float(dynamics_cosine_weight)
         ),
-        "dynamics/exact_next_fraction": batch["exact_next"].mean().detach(),
+        "dynamics/exact_next_fraction": dynamics_exact_next.mean().detach(),
         "dynamics/target_feature_std": torch.stack(
             [
                 F.normalize(features, dim=-1).std(dim=0).mean()
@@ -4516,6 +4736,7 @@ def compute_chunk_losses(
         "data/action_abs_mean": batch["actions"].abs().mean().detach(),
         "data/action_min": batch["actions"].min().detach(),
         "data/action_max": batch["actions"].max().detach(),
+        "objective/monte_carlo_return_weight": q_predictions.new_zeros(()),
     }
     return critic_losses, vf_loss, info
 
@@ -4531,6 +4752,7 @@ def compute_rise_v2_chunk_losses(
     expectile: float,
     use_huber: bool,
     dynamics_weight: float,
+    dynamics_offset_sampling: str = "all",
     distributed_context: DistributedContext | None = None,
     collect_reranking_diagnostics: bool = False,
 ) -> tuple[list[torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
@@ -4545,6 +4767,79 @@ def compute_rise_v2_chunk_losses(
     prediction_offsets = next(iter(offsets_by_critic))
     if prediction_offsets and "dynamics_targets" not in batch:
         raise KeyError("RISE-v2 batch is missing dense dynamics_targets")
+    dynamics_offset_sampling = str(dynamics_offset_sampling)
+    if dynamics_offset_sampling not in DYNAMICS_OFFSET_SAMPLING_MODES:
+        raise ValueError(
+            "unsupported RISE-v2 dynamics_offset_sampling="
+            f"{dynamics_offset_sampling!r}"
+        )
+    if dynamics_offset_sampling != "all" and not prediction_offsets:
+        raise ValueError(
+            "uniform per-sample dynamics offsets require prediction candidates"
+        )
+
+    dynamics_target_obs = None
+    dynamics_valid_mask = None
+    sampled_offset_indices = None
+    sampled_candidate_mask = None
+    candidate_valid_mask = None
+    target_encoding_offsets = prediction_offsets
+    if prediction_offsets:
+        dynamics_batch = batch["dynamics_targets"]
+        dynamics_target_obs = dynamics_batch["next_obs"]
+        dynamics_valid_mask = dynamics_batch["valid_mask"]
+        if dynamics_offset_sampling == "uniform_per_sample":
+            required = (
+                "sampled_offset_indices",
+                "sampled_candidate_mask",
+                "candidate_valid_mask",
+            )
+            missing = [key for key in required if key not in dynamics_batch]
+            if missing:
+                raise KeyError(
+                    "random RISE-v2 batch is missing sampling metadata: "
+                    f"{missing}"
+                )
+            sampled_offset_indices = dynamics_batch[
+                "sampled_offset_indices"
+            ].reshape(-1).to(dtype=torch.long)
+            sampled_candidate_mask = dynamics_batch["sampled_candidate_mask"]
+            candidate_valid_mask = dynamics_batch["candidate_valid_mask"]
+            expected_candidate_shape = (
+                int(batch["actions"].shape[0]),
+                len(prediction_offsets),
+            )
+            if tuple(sampled_candidate_mask.shape) != expected_candidate_shape:
+                raise ValueError(
+                    "sampled dynamics mask must match [B,O], got "
+                    f"{tuple(sampled_candidate_mask.shape)}"
+                )
+            if tuple(candidate_valid_mask.shape) != expected_candidate_shape:
+                raise ValueError(
+                    "candidate dynamics mask must match [B,O], got "
+                    f"{tuple(candidate_valid_mask.shape)}"
+                )
+            if tuple(dynamics_valid_mask.shape) != (
+                expected_candidate_shape[0],
+                1,
+            ):
+                raise ValueError(
+                    "random dynamics valid mask must be [B,1], got "
+                    f"{tuple(dynamics_valid_mask.shape)}"
+                )
+            if int(sampled_offset_indices.shape[0]) != expected_candidate_shape[0]:
+                raise ValueError("sampled offset indices must contain one per row")
+            target_encoding_offsets = (prediction_offsets[0],)
+        else:
+            expected_shape = (
+                int(batch["actions"].shape[0]),
+                len(prediction_offsets),
+            )
+            if tuple(dynamics_valid_mask.shape) != expected_shape:
+                raise ValueError(
+                    "dense dynamics valid mask must match [B,O], got "
+                    f"{tuple(dynamics_valid_mask.shape)}"
+                )
 
     device = batch["actions"].device
     batch_size = int(batch["actions"].shape[0])
@@ -4619,8 +4914,8 @@ def compute_rise_v2_chunk_losses(
             [
                 encode_rise_v2_dynamics_targets(
                     dynamics_target_encoder,
-                    batch["dynamics_targets"]["next_obs"],
-                    prediction_offsets=prediction_offsets,
+                    dynamics_target_obs,
+                    prediction_offsets=target_encoding_offsets,
                     crop_plan=crop_plan,
                     goal_dict=batch["goal_obs"],
                 ).detach()
@@ -4636,21 +4931,31 @@ def compute_rise_v2_chunk_losses(
     dynamics_l1: list[torch.Tensor] = []
     dynamics_rmse: list[torch.Tensor] = []
     weighted_dynamics: list[torch.Tensor] = []
+    dynamics_predictions: list[torch.Tensor] = []
     if prediction_offsets:
-        valid_mask = batch["dynamics_targets"]["valid_mask"]
         for output, q_loss, target in zip(outputs, q_losses, target_features):
+            prediction = output["predicted_next_encoder"]
+            if dynamics_offset_sampling == "uniform_per_sample":
+                prediction = gather_offset_per_row(
+                    prediction,
+                    sampled_offset_indices,
+                )
             l1, _, rmse = masked_dynamics_losses(
-                output["predicted_next_encoder"],
+                prediction,
                 target,
-                valid_mask,
+                dynamics_valid_mask,
+                # RISE-v2 intentionally forms one valid-target mean per rank;
+                # the later gradient all-reduce averages those rank objectives.
+                # Do not pass distributed_context through this call.
             )
             weighted = float(dynamics_weight) * l1
             critic_losses.append(q_loss + weighted)
             dynamics_l1.append(l1)
             dynamics_rmse.append(rmse)
             weighted_dynamics.append(weighted)
+            dynamics_predictions.append(prediction)
     else:
-        valid_mask = batch["reward"].new_zeros((batch_size, 0))
+        dynamics_valid_mask = batch["reward"].new_zeros((batch_size, 0))
         for output, q_loss in zip(outputs, q_losses):
             zero = output["q"].sum() * 0.0
             critic_losses.append(q_loss + zero)
@@ -4700,7 +5005,7 @@ def compute_rise_v2_chunk_losses(
         )
 
     if prediction_offsets:
-        rows = valid_mask.reshape(-1) > 0.5
+        rows = dynamics_valid_mask.reshape(-1) > 0.5
         valid_targets = [
             target.reshape(-1, target.shape[-1])[rows]
             for target in target_features
@@ -4725,20 +5030,43 @@ def compute_rise_v2_chunk_losses(
 
     offset_mse_values: list[torch.Tensor] = []
     offset_valid_counts: list[torch.Tensor] = []
+    sampled_offset_mean = q_predictions.new_zeros(())
     if prediction_offsets:
-        valid_weights = valid_mask.to(dtype=q_predictions.dtype)
+        valid_weights = dynamics_valid_mask.to(dtype=q_predictions.dtype)
         offset_squared_error_sums = q_predictions.new_zeros(
             (len(prediction_offsets),)
         )
-        for output, target in zip(outputs, target_features):
+        for prediction, target in zip(dynamics_predictions, target_features):
             per_row_offset_mse = (
-                F.normalize(output["predicted_next_encoder"], dim=-1)
+                F.normalize(prediction, dim=-1)
                 - F.normalize(target, dim=-1)
             ).square().mean(dim=-1)
-            offset_squared_error_sums.add_(
-                (per_row_offset_mse * valid_weights).sum(dim=0).detach()
-            )
-        offset_counts = valid_weights.sum(dim=0).detach()
+            if dynamics_offset_sampling == "uniform_per_sample":
+                offset_squared_error_sums.add_(
+                    (
+                        per_row_offset_mse
+                        * sampled_candidate_mask.to(
+                            dtype=per_row_offset_mse.dtype
+                        )
+                    ).sum(dim=0).detach()
+                )
+            else:
+                offset_squared_error_sums.add_(
+                    (per_row_offset_mse * valid_weights).sum(dim=0).detach()
+                )
+        if dynamics_offset_sampling == "uniform_per_sample":
+            offset_counts = sampled_candidate_mask.to(
+                dtype=q_predictions.dtype
+            ).sum(dim=0).detach()
+            sampled_rows = dynamics_valid_mask.reshape(-1) > 0.5
+            if torch.any(sampled_rows):
+                offset_values = q_predictions.new_tensor(prediction_offsets)
+                sampled_offset_mean = offset_values.index_select(
+                    0,
+                    sampled_offset_indices[sampled_rows],
+                ).mean()
+        else:
+            offset_counts = valid_weights.sum(dim=0).detach()
         offset_mse_tensor = offset_squared_error_sums / (
             offset_counts * float(len(outputs))
         ).clamp_min(1.0)
@@ -4772,10 +5100,21 @@ def compute_rise_v2_chunk_losses(
         ),
         "dynamics/effective_cosine_weight": q_predictions.new_zeros(()),
         "dynamics/valid_fraction": (
-            valid_mask.mean().detach()
-            if valid_mask.numel() > 0
+            dynamics_valid_mask.mean().detach()
+            if dynamics_valid_mask.numel() > 0
             else q_predictions.new_zeros(())
         ),
+        "dynamics/candidate_valid_fraction": (
+            candidate_valid_mask.mean().detach()
+            if candidate_valid_mask is not None
+            else dynamics_valid_mask.mean().detach()
+            if dynamics_valid_mask.numel() > 0
+            else q_predictions.new_zeros(())
+        ),
+        "dynamics/uniform_per_sample": q_predictions.new_tensor(
+            float(dynamics_offset_sampling == "uniform_per_sample")
+        ),
+        "dynamics/sampled_offset_mean": sampled_offset_mean.detach(),
         "dynamics/target_feature_std": target_feature_std.detach(),
         "dynamics/target_feature_norm": target_feature_norm.detach(),
         "representation/temporal_feature_std": torch.stack(
@@ -4802,6 +5141,7 @@ def compute_rise_v2_chunk_losses(
         "data/action_abs_mean": batch["actions"].abs().mean().detach(),
         "data/action_min": batch["actions"].min().detach(),
         "data/action_max": batch["actions"].max().detach(),
+        "objective/monte_carlo_return_weight": q_predictions.new_zeros(()),
         "sigreg/effective_weight": q_predictions.new_zeros(()),
     }
     for offset_index, offset in enumerate(prediction_offsets):
@@ -4898,7 +5238,11 @@ def masked_wcm_dynamics_mse(
 
     metrics: dict[str, torch.Tensor] = {
         "dynamics/mse": global_mse.detach(),
-        "dynamics/rmse": torch.sqrt(global_mse.clamp_min(1e-12)).detach(),
+        "dynamics/rmse": torch.where(
+            global_count > 0,
+            torch.sqrt(global_mse.clamp_min(1e-12)),
+            torch.zeros_like(global_mse),
+        ).detach(),
         "dynamics/copy_current_mse": global_copy_mse.detach(),
         "dynamics/valid_pair_count": global_count.to(predicted.dtype),
         "dynamics/valid_fraction": (
@@ -5174,6 +5518,7 @@ def compute_wcm_chunk_losses(
         "data/action_abs_mean": batch["actions"].abs().mean().detach(),
         "data/action_min": batch["actions"].min().detach(),
         "data/action_max": batch["actions"].max().detach(),
+        "objective/monte_carlo_return_weight": q_tensor.new_zeros(()),
     }
     for offset_index, offset in enumerate(system.dynamics_prediction_offsets):
         for suffix in ("mse", "valid_count"):
@@ -5353,6 +5698,9 @@ def evaluate_validation_epoch(
                         dynamics_prediction_offsets=(
                             args.dynamics_prediction_offsets
                         ),
+                        dynamics_offset_sampling=(
+                            args.dynamics_offset_sampling
+                        ),
                     )
                     if is_wcm:
                         _, critic_info = compute_wcm_chunk_losses(
@@ -5382,6 +5730,9 @@ def evaluate_validation_epoch(
                             expectile=args.expectile,
                             use_huber=args.use_huber,
                             dynamics_weight=args.dynamics_weight,
+                            dynamics_offset_sampling=(
+                                args.dynamics_offset_sampling
+                            ),
                             distributed_context=None,
                             collect_reranking_diagnostics=(
                                 reranking_accumulator is not None
@@ -5929,6 +6280,9 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
             {
                 "rise_v2_fusion_mode": str(args.rise_v2_fusion_mode),
                 "rise_v2_dense_dynamics": bool(args.rise_v2_dense_dynamics),
+                "dynamics_offset_sampling": str(
+                    args.dynamics_offset_sampling
+                ),
             }
         )
     integer_fields = {
@@ -5961,6 +6315,12 @@ def validate_chunk_source(source: dict, args: argparse.Namespace) -> None:
             value = bool(value)
         elif field == "rise_v2_dense_dynamics":
             value = bool(value)
+        elif field == "dynamics_offset_sampling":
+            value = str(
+                source.get("args", {}).get(field, "all")
+                if value is None
+                else value
+            )
         if value != expected:
             raise ValueError(
                 f"{field}={expected!r} does not match source value {value!r}"
@@ -6093,6 +6453,7 @@ def checkpoint_payload(
     )
     is_wcm = args.critic_architecture == WCM_CRITIC_ARCHITECTURE
     is_rise_v2 = args.critic_architecture == RISE_V2_CRITIC_ARCHITECTURE
+    rise_v2_auxiliary_enabled = rise_v2_dynamics_auxiliary_enabled(args)
     actor_only = bool(getattr(args, "actor_only", False))
     if actor_only:
         if critics or targets or any(
@@ -6198,6 +6559,9 @@ def checkpoint_payload(
         "rise_v2_dense_dynamics": (
             bool(args.rise_v2_dense_dynamics) if is_rise_v2 else None
         ),
+        "dynamics_offset_sampling": (
+            str(args.dynamics_offset_sampling) if is_rise_v2 else "all"
+        ),
         "dynamics_prediction_output_dim": (
             None
             if actor_only
@@ -6219,6 +6583,8 @@ def checkpoint_payload(
         "dynamics_prediction_target": None if actor_only else (
             "stop_gradient_periodic_hard_copy_critic_frame_latent"
             if is_wcm
+            else "disabled_no_auxiliary_dynamics_loss"
+            if is_rise_v2 and not rise_v2_auxiliary_enabled
             else "stop_gradient_periodic_hard_copy_actor_visual_features"
             if is_rise_v2
             else "normalized_actor_encoder_features"
@@ -6448,6 +6814,8 @@ def checkpoint_payload(
             else
             "periodic_hard_copy_online_critic_frame_encoder_and_projection"
             if is_wcm
+            else "disabled_no_auxiliary_dynamics_loss"
+            if is_rise_v2 and not rise_v2_auxiliary_enabled
             else "periodic_deployed_actor_ema_obs_encoder"
             if trains_joint_actor(args)
             else "fixed_deployed_actor_ema_obs_encoder"
@@ -7275,6 +7643,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     is_wcm = args.critic_architecture == WCM_CRITIC_ARCHITECTURE
     is_rise_v2 = args.critic_architecture == RISE_V2_CRITIC_ARCHITECTURE
+    rise_v2_auxiliary_enabled = rise_v2_dynamics_auxiliary_enabled(args)
     wcm_system: WCMChunkValueSystem | None = None
     wcm_target_system: WCMChunkValueSystem | None = None
     wcm_dynamics_target_encoder: WCMFrameTargetEncoder | None = None
@@ -7478,8 +7847,17 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             }
             targets = copy.deepcopy(critics)
 
-        dynamics_target_encoder = RiseV2VisualDynamicsTargetEncoder(
-            deployed_actor_obs_encoder(actor_algo)
+        # Legacy chunk critics regress the complete actor observation-encoder
+        # vector, while RISE-v2 deliberately supervises only its visual slice.
+        # Keeping these teachers distinct is shape-critical: the legacy
+        # dynamics head exposes ``encoder_output_dim`` and has no
+        # ``dynamics_target_dim`` attribute.
+        dynamics_target_encoder = (
+            RiseV2VisualDynamicsTargetEncoder(
+                deployed_actor_obs_encoder(actor_algo)
+            )
+            if is_rise_v2
+            else copy.deepcopy(deployed_actor_obs_encoder(actor_algo))
         )
         critics = critics.float().to(device)
         targets = targets.float().to(device)
@@ -7489,11 +7867,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             dynamics_target_encoder.output_shape()[0]
         )
         critic_target_output_dims = {
-            int(critic.dynamics_target_dim) for critic in critics
+            int(
+                critic.dynamics_target_dim
+                if is_rise_v2
+                else critic.encoder_output_dim
+            )
+            for critic in critics
         }
         if critic_target_output_dims != {target_encoder_output_dim}:
             raise RuntimeError(
-                "actor visual target and critic dynamics output dimensions "
+                "actor target and critic dynamics output dimensions "
                 f"differ: target={target_encoder_output_dim}, "
                 f"critics={sorted(critic_target_output_dims)}"
             )
@@ -7949,8 +8332,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "rise_v2_dense_dynamics": (
             bool(args.rise_v2_dense_dynamics) if is_rise_v2 else None
         ),
-        "latent_dynamics": not actor_only,
-        "actor_encoder_feature_dynamics": not actor_only and not is_wcm,
+        "latent_dynamics": bool(
+            not actor_only
+            and (not is_rise_v2 or rise_v2_auxiliary_enabled)
+        ),
+        "actor_encoder_feature_dynamics": bool(
+            not actor_only
+            and not is_wcm
+            and (not is_rise_v2 or rise_v2_auxiliary_enabled)
+        ),
         "dynamics_prediction_mode": (
             None
             if actor_only
@@ -7976,6 +8366,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "dynamics_prediction_offsets": (
             [] if actor_only else list(args.dynamics_prediction_offsets)
         ),
+        "dynamics_offset_sampling": (
+            str(args.dynamics_offset_sampling) if is_rise_v2 else "all"
+        ),
         "dynamics_prediction_consumed_by_q": (
             False
             if actor_only or is_wcm or is_rise_v2
@@ -7984,18 +8377,30 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "dynamics_target_encoder": (
             "disabled_actor_only"
             if actor_only
-            else
-            "frozen_complete_frame_encoder_and_projection_hard_copy"
+            else "unused_auxiliary_dynamics_disabled"
+            if is_rise_v2 and not rise_v2_auxiliary_enabled
+            else "frozen_complete_frame_encoder_and_projection_hard_copy"
             if is_wcm
-            else "visual_features_from_frozen_copy_periodically_hard_synced_"
-            "from_deployed_actor_ema_obs_encoder"
-            if trains_joint_actor(args)
-            else "visual_features_from_frozen_copy_of_deployed_actor_ema_"
-            "obs_encoder"
+            else (
+                "visual_features_from_frozen_copy_periodically_hard_synced_"
+                "from_deployed_actor_ema_obs_encoder"
+                if trains_joint_actor(args)
+                else "visual_features_from_frozen_copy_of_deployed_actor_ema_"
+                "obs_encoder"
+            )
+            if is_rise_v2
+            else (
+                "complete_actor_obs_encoder_periodically_hard_synced_from_"
+                "deployed_actor_ema"
+                if trains_joint_actor(args)
+                else "frozen_complete_deployed_actor_obs_encoder"
+            )
         ),
         "dynamics_target_update": (
             "disabled_actor_only"
             if actor_only
+            else "disabled_no_auxiliary_dynamics_loss"
+            if is_rise_v2 and not rise_v2_auxiliary_enabled
             else
             "periodic_full_state_dict_hard_sync"
             if is_wcm
@@ -8584,6 +8989,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 dynamics_prediction_offsets=(
                     args.dynamics_prediction_offsets
                 ),
+                dynamics_offset_sampling=args.dynamics_offset_sampling,
             )
             encoder_trainable = global_step >= int(
                 args.resolved_encoder_freeze_steps
@@ -8647,6 +9053,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     expectile=args.expectile,
                     use_huber=args.use_huber,
                     dynamics_weight=effective_dynamics,
+                    dynamics_offset_sampling=args.dynamics_offset_sampling,
                     distributed_context=distributed,
                 )
                 update_networks(
@@ -8770,7 +9177,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                         distributed,
                     )
                     dynamics_target_synced = True
-                elif trains_joint_actor(args):
+                elif trains_joint_actor(args) and (
+                    not is_rise_v2 or rise_v2_auxiliary_enabled
+                ):
                     dynamics_sync_audit = (
                         sync_actor_dynamics_target_encoder(
                             dynamics_target_encoder,
@@ -9392,6 +9801,15 @@ def make_parser() -> argparse.ArgumentParser:
         help=(
             "WCM or RISE-v2 future-latent offsets measured in executed chunk "
             "actions. RISE-v2 ignores them unless dense dynamics is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--dynamics-offset-sampling",
+        choices=DYNAMICS_OFFSET_SAMPLING_MODES,
+        default="all",
+        help=(
+            "Use all configured dynamics offsets, or uniformly sample one "
+            "available configured offset independently for every training row."
         ),
     )
     parser.add_argument("--sigreg-weight", type=float, default=0.0)
