@@ -90,6 +90,9 @@ DEFAULT_OUTPUT = (
     / "trained_models/square_rgb_dp/dql/200demo_406success_94failure_terminal_success_reward"
 )
 
+SAMPLED_VALIDATION_SATURATION_THRESHOLD = 0.98
+SAMPLED_VALIDATION_RNG_OFFSET = 1
+
 
 def configure_dql_batch_semantics(
     args: argparse.Namespace,
@@ -964,6 +967,341 @@ def materialize_local_scalar_metrics(
     return {key: float(value) for key, value in zip(keys, values)}
 
 
+def deterministic_sampled_validation_indices(
+    dataset_size: int,
+    row_count: int,
+    seed: int,
+) -> list[int]:
+    """Choose a stable, non-contiguous held-out subset without global RNG use."""
+    dataset_size = int(dataset_size)
+    row_count = min(int(row_count), dataset_size)
+    if dataset_size <= 0:
+        raise ValueError("sampled validation requires a non-empty dataset")
+    if row_count <= 0:
+        raise ValueError("sampled validation row count must be positive")
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    return (
+        torch.randperm(dataset_size, generator=generator)[:row_count]
+        .sort()
+        .values.tolist()
+    )
+
+
+def sampled_validation_raw_batch(
+    dataset,
+    *,
+    row_count: int,
+    seed: int,
+) -> tuple[dict, list[int]]:
+    """Materialize only actor inputs for a fixed held-out validation subset."""
+    indices = deterministic_sampled_validation_indices(
+        len(dataset),
+        row_count,
+        seed,
+    )
+    samples = []
+    for index in indices:
+        item = dataset[index]
+        sample = {
+            "obs": item["obs"],
+            "actions": item["actions"],
+        }
+        goal_obs = item.get("goal_obs")
+        if goal_obs is not None:
+            sample["goal_obs"] = goal_obs
+        samples.append(sample)
+    return torch.utils.data.default_collate(samples), indices
+
+
+def sampled_action_safety_metrics(
+    *,
+    current_actions: torch.Tensor,
+    behavior_actions: torch.Tensor,
+    base_actions: torch.Tensor,
+    max_error_ratio: float,
+    max_saturation_excess: float,
+    saturation_threshold: float = SAMPLED_VALIDATION_SATURATION_THRESHOLD,
+) -> dict[str, torch.Tensor]:
+    """Measure sampled-policy support drift against the deployed base actor."""
+    if (
+        current_actions.ndim != 2
+        or behavior_actions.shape != current_actions.shape
+        or base_actions.shape != current_actions.shape
+    ):
+        raise ValueError(
+            "sampled validation actions must share shape [rows, action_dim]: "
+            f"current={tuple(current_actions.shape)}, "
+            f"behavior={tuple(behavior_actions.shape)}, "
+            f"base={tuple(base_actions.shape)}"
+        )
+    if current_actions.shape[0] <= 0 or current_actions.shape[1] <= 0:
+        raise ValueError("sampled validation actions must be non-empty")
+
+    current_behavior_l2 = torch.linalg.vector_norm(
+        current_actions - behavior_actions,
+        dim=1,
+    ).mean()
+    base_behavior_l2 = torch.linalg.vector_norm(
+        base_actions - behavior_actions,
+        dim=1,
+    ).mean()
+    current_base_l2 = torch.linalg.vector_norm(
+        current_actions - base_actions,
+        dim=1,
+    ).mean()
+    error_ratio = current_behavior_l2 / base_behavior_l2.clamp_min(1e-8)
+
+    current_saturation = (
+        current_actions.abs() >= float(saturation_threshold)
+    ).float().mean(dim=0)
+    base_saturation = (
+        base_actions.abs() >= float(saturation_threshold)
+    ).float().mean(dim=0)
+    behavior_saturation = (
+        behavior_actions.abs() >= float(saturation_threshold)
+    ).float().mean(dim=0)
+
+    # The final real-robot action dimension is the absolute gripper state and
+    # legitimately spends long periods at +/-1. Gate only motion dimensions.
+    motion_dimensions = max(int(current_actions.shape[1]) - 1, 0)
+    if motion_dimensions:
+        motion_saturation = current_saturation[:motion_dimensions]
+        saturation_excess_by_axis = (
+            motion_saturation - base_saturation[:motion_dimensions]
+        ).clamp_min(0.0)
+        max_motion_saturation = motion_saturation.max()
+        max_motion_saturation_excess = saturation_excess_by_axis.max()
+    else:
+        max_motion_saturation = current_behavior_l2.new_zeros(())
+        max_motion_saturation_excess = current_behavior_l2.new_zeros(())
+
+    finite = torch.stack(
+        [
+            torch.isfinite(current_actions).all(),
+            torch.isfinite(behavior_actions).all(),
+            torch.isfinite(base_actions).all(),
+            torch.isfinite(current_behavior_l2),
+            torch.isfinite(base_behavior_l2),
+            torch.isfinite(error_ratio),
+        ]
+    ).all()
+    error_pass = finite & (error_ratio <= float(max_error_ratio))
+    saturation_pass = finite & (
+        max_motion_saturation_excess <= float(max_saturation_excess)
+    )
+    eligible = error_pass & saturation_pass
+
+    metrics = {
+        "sampled/rows": current_behavior_l2.new_tensor(
+            float(current_actions.shape[0])
+        ),
+        "sampled/current_behavior_l2_mean": current_behavior_l2,
+        "sampled/base_behavior_l2_mean": base_behavior_l2,
+        "sampled/current_base_l2_mean": current_base_l2,
+        "sampled/behavior_l2_ratio": error_ratio,
+        "sampled/max_error_ratio": current_behavior_l2.new_tensor(
+            float(max_error_ratio)
+        ),
+        "sampled/saturation_threshold": current_behavior_l2.new_tensor(
+            float(saturation_threshold)
+        ),
+        "sampled/max_motion_axis_saturation_fraction": max_motion_saturation,
+        "sampled/max_motion_axis_saturation_excess": (
+            max_motion_saturation_excess
+        ),
+        "sampled/max_saturation_excess": current_behavior_l2.new_tensor(
+            float(max_saturation_excess)
+        ),
+        "sampled/finite": finite.float(),
+        "sampled/error_ratio_pass": error_pass.float(),
+        "sampled/saturation_pass": saturation_pass.float(),
+        "sampled/eligible": eligible.float(),
+    }
+    for index in range(int(current_actions.shape[1])):
+        prefix = f"sampled/action_{index}"
+        metrics.update(
+            {
+                f"{prefix}/current_mean": current_actions[:, index].mean(),
+                f"{prefix}/behavior_mean": behavior_actions[:, index].mean(),
+                f"{prefix}/base_mean": base_actions[:, index].mean(),
+                f"{prefix}/current_saturation_fraction": current_saturation[index],
+                f"{prefix}/behavior_saturation_fraction": behavior_saturation[index],
+                f"{prefix}/base_saturation_fraction": base_saturation[index],
+            }
+        )
+    return metrics
+
+
+@torch.no_grad()
+def build_sampled_validation_reference(
+    *,
+    args: argparse.Namespace,
+    dataset,
+    actor_algo,
+    obs_normalization_stats,
+) -> dict[str, Any]:
+    """Cache held-out behavior and deployed-base actions before DQL updates."""
+    raw_batch, indices = sampled_validation_raw_batch(
+        dataset,
+        row_count=int(args.dql_sampled_validation_rows),
+        seed=int(args.validation_seed),
+    )
+    actor_batch = prepare_actor_batch(
+        actor_algo,
+        raw_batch,
+        obs_normalization_stats,
+    )
+    if actor_algo.ema is None:
+        raise RuntimeError("sampled validation requires a deployed EMA actor")
+    ema_nets = actor_algo.ema.averaged_model
+    noise_seed = int(args.validation_seed) + SAMPLED_VALIDATION_RNG_OFFSET
+    with fork_rng_with_seed(noise_seed, actor_algo.device), evaluating(ema_nets):
+        base_actions = sample_action_chunks(
+            actor_algo=actor_algo,
+            observations=actor_batch["obs"],
+            nets=ema_nets,
+            num_inference_steps=int(args.dql_num_inference_steps),
+            clip_actions=bool(args.dql_clip_actions),
+        )[:, 0]
+    current_index = int(actor_algo.algo_config.horizon.observation_horizon) - 1
+    behavior_actions = actor_batch["actions"][:, current_index].clamp(-1.0, 1.0)
+    return {
+        "raw_batch": raw_batch,
+        "indices": indices,
+        "noise_seed": noise_seed,
+        "base_actions": base_actions.detach().cpu(),
+        "behavior_actions": behavior_actions.detach().cpu(),
+        "action_index": current_index,
+    }
+
+
+def _minimum_q_values(
+    critics: nn.ModuleList,
+    observations: dict[str, torch.Tensor],
+    actions: torch.Tensor,
+    goal_observations,
+) -> torch.Tensor:
+    predictions = [
+        critic(
+            obs_dict=observations,
+            acts=actions,
+            goal_dict=goal_observations,
+        )
+        for critic in critics
+    ]
+    return torch.cat(predictions, dim=1).min(dim=1).values
+
+
+@torch.no_grad()
+def evaluate_sampled_policy_validation(
+    *,
+    args: argparse.Namespace,
+    reference: dict[str, Any],
+    actor_algo,
+    critics: nn.ModuleList,
+    critic_targets: nn.ModuleList,
+    obs_normalization_stats,
+) -> dict[str, torch.Tensor]:
+    """Evaluate reverse-sampled EMA actions on the fixed held-out subset."""
+    actor_batch = prepare_actor_batch(
+        actor_algo,
+        reference["raw_batch"],
+        obs_normalization_stats,
+    )
+    current_index = int(actor_algo.algo_config.horizon.observation_horizon) - 1
+    if current_index != int(reference["action_index"]):
+        raise RuntimeError("sampled validation action alignment changed")
+    behavior_actions = actor_batch["actions"][:, current_index].clamp(-1.0, 1.0)
+    cached_behavior = reference["behavior_actions"].to(
+        device=behavior_actions.device,
+        dtype=behavior_actions.dtype,
+    )
+    if not torch.equal(behavior_actions, cached_behavior):
+        raise RuntimeError("sampled validation behavior actions changed")
+    base_actions = reference["base_actions"].to(
+        device=behavior_actions.device,
+        dtype=behavior_actions.dtype,
+    )
+    if actor_algo.ema is None:
+        raise RuntimeError("sampled validation requires a deployed EMA actor")
+    ema_nets = actor_algo.ema.averaged_model
+    with fork_rng_with_seed(
+        int(reference["noise_seed"]),
+        actor_algo.device,
+    ), evaluating(ema_nets):
+        current_actions = sample_action_chunks(
+            actor_algo=actor_algo,
+            observations=actor_batch["obs"],
+            nets=ema_nets,
+            num_inference_steps=int(args.dql_num_inference_steps),
+            clip_actions=bool(args.dql_clip_actions),
+        )[:, 0]
+
+    metrics = sampled_action_safety_metrics(
+        current_actions=current_actions,
+        behavior_actions=behavior_actions,
+        base_actions=base_actions,
+        max_error_ratio=float(args.dql_sampled_validation_max_error_ratio),
+        max_saturation_excess=float(
+            args.dql_sampled_validation_max_saturation_excess
+        ),
+    )
+    observations = actor_batch["obs"]
+    goal_observations = actor_batch["goal_obs"]
+    for label, modules in (
+        ("online", critics),
+        ("target", critic_targets),
+    ):
+        current_q = _minimum_q_values(
+            modules,
+            observations,
+            current_actions,
+            goal_observations,
+        ).mean()
+        behavior_q = _minimum_q_values(
+            modules,
+            observations,
+            behavior_actions,
+            goal_observations,
+        ).mean()
+        base_q = _minimum_q_values(
+            modules,
+            observations,
+            base_actions,
+            goal_observations,
+        ).mean()
+        metrics.update(
+            {
+                f"sampled/{label}_current_q_mean": current_q,
+                f"sampled/{label}_behavior_q_mean": behavior_q,
+                f"sampled/{label}_base_q_mean": base_q,
+                f"sampled/{label}_current_behavior_q_gap": (
+                    current_q - behavior_q
+                ),
+                f"sampled/{label}_current_base_q_gap": current_q - base_q,
+            }
+        )
+    return metrics
+
+
+def eligible_validation_loss(
+    metrics: dict[str, Any],
+    *,
+    sampled_safety_required: bool,
+) -> float | None:
+    candidate = metrics.get("validation/actor/Loss")
+    if candidate is None or not np.isfinite(float(candidate)):
+        return None
+    if sampled_safety_required:
+        eligible = metrics.get("validation/sampled/eligible")
+        if eligible is None or not np.isfinite(float(eligible)):
+            return None
+        if float(eligible) < 0.5:
+            return None
+    return float(candidate)
+
+
 @torch.no_grad()
 def evaluate_dql_validation_epoch(
     *,
@@ -975,6 +1313,7 @@ def evaluate_dql_validation_epoch(
     critic_targets: nn.ModuleList,
     obs_normalization_stats,
     device: torch.device,
+    sampled_validation_reference: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     """Run deterministic, full-coverage held-out DQL validation on rank zero."""
     accumulator = WeightedScalarMetricAccumulator(device)
@@ -985,6 +1324,7 @@ def evaluate_dql_validation_epoch(
     actor_algo.set_eval()
     critics.eval()
     critic_targets.eval()
+    sampled_metrics: dict[str, torch.Tensor] = {}
     try:
         with fork_rng_with_seed(int(args.validation_seed), device):
             for raw_batch in loader:
@@ -1037,6 +1377,15 @@ def evaluate_dql_validation_epoch(
                 )
                 batch_count += 1
                 window_count += rows
+        if sampled_validation_reference is not None:
+            sampled_metrics = evaluate_sampled_policy_validation(
+                args=args,
+                reference=sampled_validation_reference,
+                actor_algo=actor_algo,
+                critics=critics,
+                critic_targets=critic_targets,
+                obs_normalization_stats=obs_normalization_stats,
+            )
     finally:
         if actor_was_training:
             actor_algo.set_train()
@@ -1048,6 +1397,12 @@ def evaluate_dql_validation_epoch(
     if batch_count == 0 or window_count == 0:
         raise ValueError("validation loader produced no held-out DQL windows")
     result = accumulator.means()
+    result.update(
+        {
+            f"validation/{key}": float(value.detach().cpu())
+            for key, value in sampled_metrics.items()
+        }
+    )
     result["validation/batches"] = float(batch_count)
     result["validation/windows"] = float(window_count)
     return result
@@ -1186,6 +1541,33 @@ def checkpoint_payload(
         "dql_eta": float(args.dql_eta),
         "dql_bc_weight": float(args.dql_bc_weight),
         "dql_q_normalization": "official_cross_head_generated_action_q",
+        "dql_sampled_validation_safety": {
+            "enabled": int(args.dql_sampled_validation_rows) > 0,
+            "requested_rows": int(args.dql_sampled_validation_rows),
+            "indices": list(
+                getattr(args, "dql_sampled_validation_indices", [])
+            ),
+            "subset_seed": int(args.validation_seed),
+            "noise_seed": getattr(
+                args,
+                "dql_sampled_validation_noise_seed",
+                None,
+            ),
+            "saturation_threshold": float(
+                getattr(
+                    args,
+                    "dql_sampled_validation_saturation_threshold",
+                    SAMPLED_VALIDATION_SATURATION_THRESHOLD,
+                )
+            ),
+            "max_behavior_error_ratio": float(
+                args.dql_sampled_validation_max_error_ratio
+            ),
+            "max_motion_axis_saturation_excess": float(
+                args.dql_sampled_validation_max_saturation_excess
+            ),
+            "gripper_excluded_from_saturation_gate": True,
+        },
         "dql_reference_alignment": dql_reference_alignment(args),
         "actor_initialized_from_deployed_ema": True,
         "actor_encoder_trainable": int(global_step) >= int(
@@ -1282,6 +1664,9 @@ def validate_resume_args(args: argparse.Namespace, checkpoint: dict) -> None:
         "dql_critic_warmup_steps",
         "resolved_dql_critic_warmup_steps",
         "dql_actor_ema_update_every",
+        "dql_sampled_validation_rows",
+        "dql_sampled_validation_max_error_ratio",
+        "dql_sampled_validation_max_saturation_excess",
         "actor_max_gradient_norm",
         "critic_max_gradient_norm",
     )
@@ -1334,6 +1719,25 @@ def train(args: argparse.Namespace) -> dict:
         raise ValueError("encoder_freeze_steps must be non-negative")
     if int(args.dql_actor_ema_update_every) <= 0:
         raise ValueError("dql_actor_ema_update_every must be positive")
+    if int(args.dql_sampled_validation_rows) < 0:
+        raise ValueError("dql_sampled_validation_rows must be non-negative")
+    if (
+        int(args.dql_sampled_validation_rows) > 0
+        and args.validation_dataset is None
+    ):
+        raise ValueError(
+            "sampled validation rows require --validation-dataset"
+        )
+    if float(args.dql_sampled_validation_max_error_ratio) <= 0.0:
+        raise ValueError(
+            "dql_sampled_validation_max_error_ratio must be positive"
+        )
+    if not 0.0 <= float(
+        args.dql_sampled_validation_max_saturation_excess
+    ) <= 1.0:
+        raise ValueError(
+            "dql_sampled_validation_max_saturation_excess must be in [0, 1]"
+        )
     if distributed.is_main_process:
         args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1433,6 +1837,30 @@ def train(args: argparse.Namespace) -> dict:
     if action_stats is None:
         raise ValueError("pretrained DP checkpoint has no action normalization stats")
     obs_normalization_stats = copy.deepcopy(actor_policy.obs_normalization_stats)
+    sampled_validation_reference = None
+    args.dql_sampled_validation_indices = []
+    args.dql_sampled_validation_noise_seed = None
+    args.dql_sampled_validation_saturation_threshold = (
+        SAMPLED_VALIDATION_SATURATION_THRESHOLD
+    )
+    if (
+        int(args.dql_sampled_validation_rows) > 0
+        and distributed.is_main_process
+    ):
+        if validation_dataset is None:
+            raise RuntimeError("rank zero has no sampled validation dataset")
+        sampled_validation_reference = build_sampled_validation_reference(
+            args=args,
+            dataset=validation_dataset,
+            actor_algo=actor_algo,
+            obs_normalization_stats=obs_normalization_stats,
+        )
+        args.dql_sampled_validation_indices = list(
+            sampled_validation_reference["indices"]
+        )
+        args.dql_sampled_validation_noise_seed = int(
+            sampled_validation_reference["noise_seed"]
+        )
 
     critics, critic_targets, encoder_initialization = (
         make_dql_rise_v2_value_networks(
@@ -1593,17 +2021,19 @@ def train(args: argparse.Namespace) -> dict:
 
     best_validation_loss = None
     best_validation_epoch = None
+    sampled_safety_required = int(args.dql_sampled_validation_rows) > 0
     for completed_epoch in history:
-        candidate = completed_epoch.get("metrics", {}).get(
-            "validation/actor/Loss"
+        candidate = eligible_validation_loss(
+            completed_epoch.get("metrics", {}),
+            sampled_safety_required=sampled_safety_required,
         )
-        if candidate is None or not np.isfinite(float(candidate)):
+        if candidate is None:
             continue
         if (
             best_validation_loss is None
-            or float(candidate) < best_validation_loss
+            or candidate < best_validation_loss
         ):
-            best_validation_loss = float(candidate)
+            best_validation_loss = candidate
             best_validation_epoch = int(completed_epoch.get("epoch", -1))
 
     actor_algo.set_train()
@@ -1651,6 +2081,44 @@ def train(args: argparse.Namespace) -> dict:
             "full_coverage": True,
             "actor_weights": "ema",
             "selection_metric": "validation/actor/Loss",
+            "selection_gate": (
+                "validation/sampled/eligible"
+                if sampled_safety_required
+                else None
+            ),
+            "sampled_policy": {
+                "enabled": sampled_safety_required,
+                "requested_rows": int(args.dql_sampled_validation_rows),
+                "actual_rows": (
+                    len(sampled_validation_reference["indices"])
+                    if sampled_validation_reference is not None
+                    else 0
+                ),
+                "indices": (
+                    list(sampled_validation_reference["indices"])
+                    if sampled_validation_reference is not None
+                    else []
+                ),
+                "subset_seed": int(args.validation_seed),
+                "noise_seed": (
+                    int(sampled_validation_reference["noise_seed"])
+                    if sampled_validation_reference is not None
+                    else None
+                ),
+                "actor_weights": "ema",
+                "base_actor": "pretrained_deployed_ema",
+                "action": "first_executable_action",
+                "saturation_threshold": (
+                    SAMPLED_VALIDATION_SATURATION_THRESHOLD
+                ),
+                "max_behavior_error_ratio": float(
+                    args.dql_sampled_validation_max_error_ratio
+                ),
+                "max_motion_axis_saturation_excess": float(
+                    args.dql_sampled_validation_max_saturation_excess
+                ),
+                "gripper_excluded_from_saturation_gate": True,
+            },
         },
         "data_routing": {
             "shared_loader": True,
@@ -1798,6 +2266,15 @@ def train(args: argparse.Namespace) -> dict:
             ),
             "dql_actor_ema_update_every": int(
                 args.dql_actor_ema_update_every
+            ),
+            "dql_sampled_validation_rows": int(
+                args.dql_sampled_validation_rows
+            ),
+            "dql_sampled_validation_max_error_ratio": float(
+                args.dql_sampled_validation_max_error_ratio
+            ),
+            "dql_sampled_validation_max_saturation_excess": float(
+                args.dql_sampled_validation_max_saturation_excess
             ),
             "actor_max_gradient_norm": float(args.actor_max_gradient_norm),
             "critic_max_gradient_norm": float(args.critic_max_gradient_norm),
@@ -1996,22 +2473,34 @@ def train(args: argparse.Namespace) -> dict:
                 critic_targets=critic_targets,
                 obs_normalization_stats=obs_normalization_stats,
                 device=device,
+                sampled_validation_reference=sampled_validation_reference,
             )
             epoch_metrics.update(validation_metrics)
             if writer is not None:
                 for key, value in validation_metrics.items():
                     writer.add_scalar(key, value, global_step)
-            selection_loss = validation_metrics.get("validation/actor/Loss")
-            if selection_loss is None or not np.isfinite(float(selection_loss)):
+            raw_selection_loss = validation_metrics.get(
+                "validation/actor/Loss"
+            )
+            if raw_selection_loss is None or not np.isfinite(
+                float(raw_selection_loss)
+            ):
                 raise ValueError(
                     "held-out DQL validation did not produce a finite EMA "
                     "actor loss"
                 )
+            selection_loss = eligible_validation_loss(
+                validation_metrics,
+                sampled_safety_required=sampled_safety_required,
+            )
             if (
-                best_validation_loss is None
-                or float(selection_loss) < best_validation_loss
+                selection_loss is not None
+                and (
+                    best_validation_loss is None
+                    or selection_loss < best_validation_loss
+                )
             ):
-                best_validation_loss = float(selection_loss)
+                best_validation_loss = selection_loss
                 best_validation_epoch = int(epoch)
                 new_best_validation = True
         if distributed.enabled and args.validation_dataset is not None:
@@ -2038,11 +2527,16 @@ def train(args: argparse.Namespace) -> dict:
             "last_epoch_metrics": epoch_summary["metrics"],
             "best_validation": {
                 "metric": "validation/actor/Loss",
+                "gate": (
+                    "validation/sampled/eligible"
+                    if sampled_safety_required
+                    else None
+                ),
                 "loss": best_validation_loss,
                 "epoch": best_validation_epoch,
                 "checkpoint": (
                     str(args.output_dir / "best_validation.pt")
-                    if args.validation_dataset is not None
+                    if best_validation_epoch is not None
                     else None
                 ),
             },
@@ -2052,7 +2546,7 @@ def train(args: argparse.Namespace) -> dict:
                 "last": str(args.output_dir / "last.pt"),
                 "best_validation": (
                     str(args.output_dir / "best_validation.pt")
-                    if args.validation_dataset is not None
+                    if best_validation_epoch is not None
                     else None
                 ),
             },
@@ -2280,6 +2774,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dql-critic-warmup-steps", type=int, default=1000)
     parser.add_argument("--dql-actor-ema-update-every", type=int, default=5)
     parser.add_argument("--dql-clip-actions", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--dql-sampled-validation-rows",
+        type=int,
+        default=0,
+        help=(
+            "Number of fixed held-out rows used to reverse-sample the EMA "
+            "actor; zero disables the sampled-policy checkpoint gate."
+        ),
+    )
+    parser.add_argument(
+        "--dql-sampled-validation-max-error-ratio",
+        type=float,
+        default=2.0,
+        help=(
+            "Maximum current-to-behavior action error divided by the "
+            "deployed base actor's error."
+        ),
+    )
+    parser.add_argument(
+        "--dql-sampled-validation-max-saturation-excess",
+        type=float,
+        default=0.25,
+        help=(
+            "Maximum per-motion-axis saturation increase over the deployed "
+            "base actor. The final gripper dimension is excluded."
+        ),
+    )
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--save-every-epochs", type=int, default=1)
     parser.add_argument("--snapshot-every-epochs", type=int, default=10)
@@ -2318,6 +2839,23 @@ def parse_args() -> argparse.Namespace:
         parser.error("actor-max-gradient-norm must be positive")
     if args.critic_max_gradient_norm <= 0.0:
         parser.error("critic-max-gradient-norm must be positive")
+    if args.dql_sampled_validation_rows < 0:
+        parser.error("dql-sampled-validation-rows must be non-negative")
+    if args.dql_sampled_validation_max_error_ratio <= 0.0:
+        parser.error(
+            "dql-sampled-validation-max-error-ratio must be positive"
+        )
+    if not 0.0 <= args.dql_sampled_validation_max_saturation_excess <= 1.0:
+        parser.error(
+            "dql-sampled-validation-max-saturation-excess must be in [0, 1]"
+        )
+    if (
+        args.dql_sampled_validation_rows > 0
+        and args.validation_dataset is None
+    ):
+        parser.error(
+            "dql-sampled-validation-rows requires --validation-dataset"
+        )
     if args.log_every <= 0:
         parser.error("log-every must be positive")
     if args.save_every_epochs <= 0:

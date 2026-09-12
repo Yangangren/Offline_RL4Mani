@@ -30,7 +30,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 import numpy as np
 
 from visualize_chunk_candidate_selection import (
@@ -41,9 +40,11 @@ from visualize_chunk_candidate_selection import (
 )
 
 
-SELECTED_COLOR = "#C44E52"
+SELECTED_COLOR = "#E90A11"
 START_COLOR = "#2F2F2F"
-ARM_LINESTYLES = ("-", (0, (4.0, 2.2)))
+VIEW_LABEL_COLOR = "#0000FF"
+CANDIDATE_LINESTYLE = (0, (5.0, 3.0))
+SELECTED_LINESTYLE = "-"
 
 EXTERNAL_CAMERAS = {
     "square": ("agentview",),
@@ -64,6 +65,13 @@ CAMERA_LABELS = {
     "sideview": "Side view",
 }
 
+CAMERA_ARM_INDEX = {
+    "shouldercamera0": 0,
+    "shouldercamera1": 1,
+    "robot0_eye_in_hand": 0,
+    "robot1_eye_in_hand": 1,
+}
+
 
 def configure_plot_style() -> None:
     plt.rcParams.update(
@@ -72,7 +80,6 @@ def configure_plot_style() -> None:
             "font.sans-serif": ["Arial", "Liberation Sans", "DejaVu Sans"],
             "font.size": 13.0,
             "axes.titlesize": 13.5,
-            "legend.fontsize": 10.5,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
@@ -278,6 +285,188 @@ def draw_projected_path(
     return last_endpoint
 
 
+def dense_visible_samples(
+    pixels: np.ndarray,
+    valid: np.ndarray,
+    spacing: float = 4.0,
+) -> np.ndarray:
+    """Sample visible polyline segments densely enough for label collision tests."""
+    samples: list[np.ndarray] = []
+    for start, end in valid_runs(valid):
+        segment = pixels[start:end]
+        if len(segment) == 1:
+            samples.append(segment)
+            continue
+        for point_a, point_b in zip(segment[:-1], segment[1:]):
+            sample_count = max(
+                2,
+                int(np.ceil(np.linalg.norm(point_b - point_a) / spacing)) + 1,
+            )
+            samples.append(np.linspace(point_a, point_b, sample_count))
+    if not samples:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.concatenate(samples, axis=0)
+
+
+def choose_q_label_position(
+    frame_shape: tuple[int, ...],
+    projected_paths: list[tuple[np.ndarray, np.ndarray]],
+    selected: int,
+    endpoint: np.ndarray,
+) -> tuple[tuple[float, float], str, str]:
+    """Choose a clear callout location for the Q label, away from action curves."""
+    height, width = frame_shape[:2]
+    endpoint_normalized = endpoint / np.asarray((width, height), dtype=np.float64)
+
+    def text_rectangle(
+        anchor: tuple[float, float],
+        horizontal_alignment: str,
+        vertical_alignment: str,
+    ) -> tuple[float, float, float, float]:
+        text_width = 0.270
+        text_height = 0.105
+        x, y = anchor
+        if horizontal_alignment == "left":
+            left, right = x, x + text_width
+        elif horizontal_alignment == "right":
+            left, right = x - text_width, x
+        else:
+            left, right = x - text_width / 2.0, x + text_width / 2.0
+        if vertical_alignment == "top":
+            top, bottom = y, y + text_height
+        elif vertical_alignment == "bottom":
+            top, bottom = y - text_height, y
+        else:
+            top, bottom = y - text_height / 2.0, y + text_height / 2.0
+        return left, right, top, bottom
+
+    # Try short, local callouts first. Edge positions are retained as fallbacks
+    # for unusually dense projections.
+    endpoint_x, endpoint_y = endpoint_normalized
+    candidate_specs = (
+        ((endpoint_x + 0.055, endpoint_y), "left", "center"),
+        ((endpoint_x - 0.055, endpoint_y), "right", "center"),
+        ((endpoint_x, endpoint_y - 0.070), "center", "bottom"),
+        ((endpoint_x, endpoint_y + 0.070), "center", "top"),
+        ((endpoint_x + 0.045, endpoint_y - 0.055), "left", "bottom"),
+        ((endpoint_x - 0.045, endpoint_y - 0.055), "right", "bottom"),
+        ((endpoint_x + 0.045, endpoint_y + 0.055), "left", "top"),
+        ((endpoint_x - 0.045, endpoint_y + 0.055), "right", "top"),
+        ((0.965, 0.045), "right", "top"),
+        ((0.965, 0.955), "right", "bottom"),
+        ((0.035, 0.955), "left", "bottom"),
+        ((0.965, 0.520), "right", "center"),
+        ((0.035, 0.570), "left", "center"),
+        ((0.500, 0.955), "center", "bottom"),
+    )
+    reserved_view_label = (0.015, 0.520, 0.020, 0.125)
+
+    def rectangles_overlap(
+        first: tuple[float, ...], second: tuple[float, ...]
+    ) -> bool:
+        left_a, right_a, top_a, bottom_a = first
+        left_b, right_b, top_b, bottom_b = second
+        return not (
+            right_a < left_b
+            or right_b < left_a
+            or bottom_a < top_b
+            or bottom_b < top_a
+        )
+
+    candidates = []
+    for anchor, horizontal_alignment, vertical_alignment in candidate_specs:
+        rectangle = text_rectangle(
+            anchor, horizontal_alignment, vertical_alignment
+        )
+        if (
+            min(rectangle) < 0.015
+            or rectangle[1] > 0.985
+            or rectangle[3] > 0.985
+            or rectangles_overlap(rectangle, reserved_view_label)
+        ):
+            continue
+        candidates.append(
+            (anchor, horizontal_alignment, vertical_alignment, rectangle)
+        )
+
+    all_samples: list[np.ndarray] = []
+    selected_samples: list[np.ndarray] = []
+    for pixels, valid in projected_paths:
+        for candidate_index in range(len(pixels)):
+            samples = dense_visible_samples(
+                pixels[candidate_index], valid[candidate_index]
+            )
+            if len(samples):
+                normalized = samples / np.asarray((width, height), dtype=np.float64)
+                all_samples.append(normalized)
+                if candidate_index == selected:
+                    selected_samples.append(normalized)
+
+    all_points = (
+        np.concatenate(all_samples, axis=0)
+        if all_samples
+        else np.empty((0, 2), dtype=np.float64)
+    )
+    selected_points = (
+        np.concatenate(selected_samples, axis=0)
+        if selected_samples
+        else np.empty((0, 2), dtype=np.float64)
+    )
+    def rectangle_hits(points: np.ndarray, rectangle: tuple[float, ...]) -> int:
+        if not len(points):
+            return 0
+        left, right, top, bottom = rectangle
+        padding = 0.012
+        return int(
+            np.count_nonzero(
+                (points[:, 0] >= left - padding)
+                & (points[:, 0] <= right + padding)
+                & (points[:, 1] >= top - padding)
+                & (points[:, 1] <= bottom + padding)
+            )
+        )
+
+    def rectangle_clearance(
+        points: np.ndarray, rectangle: tuple[float, ...]
+    ) -> float:
+        if not len(points):
+            return float("inf")
+        left, right, top, bottom = rectangle
+        zeros = np.zeros(len(points))
+        dx = np.maximum.reduce(
+            (left - points[:, 0], zeros, points[:, 0] - right)
+        )
+        dy = np.maximum.reduce(
+            (top - points[:, 1], zeros, points[:, 1] - bottom)
+        )
+        return float(np.min(np.hypot(dx, dy)))
+
+    def candidate_score(candidate: tuple[Any, ...]) -> tuple[float, ...]:
+        anchor, _, _, rectangle = candidate
+        selected_hits = rectangle_hits(selected_points, rectangle)
+        all_hits = rectangle_hits(all_points, rectangle)
+        selected_clearance = rectangle_clearance(selected_points, rectangle)
+        all_clearance = rectangle_clearance(all_points, rectangle)
+        connector_length = float(
+            np.linalg.norm(endpoint_normalized - np.asarray(anchor))
+        )
+        # Lexicographic scoring first avoids the selected red curve, then all
+        # other chunks, then favors greater clearance and a shorter leader.
+        return (
+            float(selected_hits),
+            float(all_hits),
+            connector_length,
+            -selected_clearance,
+            -all_clearance,
+        )
+
+    anchor, horizontal_alignment, vertical_alignment, _ = min(
+        candidates, key=candidate_score
+    )
+    position = (anchor[0] * width, anchor[1] * height)
+    return position, horizontal_alignment, vertical_alignment
+
+
 def draw_camera_panel(
     ax: plt.Axes,
     frame: np.ndarray,
@@ -296,7 +485,7 @@ def draw_camera_panel(
     for candidate in np.argsort(q_values):
         if int(candidate) == selected:
             continue
-        for arm_index, (pixels, valid) in enumerate(projected_paths):
+        for pixels, valid in projected_paths:
             draw_projected_path(
                 ax=ax,
                 pixels=pixels[candidate],
@@ -304,13 +493,13 @@ def draw_camera_panel(
                 color=colors[candidate],
                 linewidth=2.0,
                 alpha=0.68,
-                linestyle=ARM_LINESTYLES[arm_index],
+                linestyle=CANDIDATE_LINESTYLE,
                 arrow_scale=12.0,
                 zorder=3.0 + float(candidate) * 0.001,
             )
 
     selected_endpoints = []
-    for arm_index, (pixels, valid) in enumerate(projected_paths):
+    for pixels, valid in projected_paths:
         endpoint = draw_projected_path(
             ax=ax,
             pixels=pixels[selected],
@@ -318,7 +507,7 @@ def draw_camera_panel(
             color=SELECTED_COLOR,
             linewidth=4.2,
             alpha=0.98,
-            linestyle=ARM_LINESTYLES[arm_index],
+            linestyle=SELECTED_LINESTYLE,
             arrow_scale=18.0,
             zorder=6.0,
         )
@@ -338,25 +527,29 @@ def draw_camera_panel(
 
     if show_q_label and selected_endpoints:
         endpoint = selected_endpoints[0]
-        label = (
-            rf"$a_{{{selected + 1}}}$: max "
-            rf"$Q_{{\min}}={q_values[selected]:.3f}$"
+        label = f"Q={q_values[selected]:.3f}"
+        label_position, horizontal_alignment, vertical_alignment = (
+            choose_q_label_position(
+                frame_shape=frame.shape,
+                projected_paths=projected_paths,
+                selected=selected,
+                endpoint=endpoint,
+            )
         )
-        put_left = float(endpoint[0]) > 0.62 * frame.shape[1]
-        put_above = float(endpoint[1]) > 0.82 * frame.shape[0]
         annotation = ax.annotate(
             label,
             xy=endpoint,
-            xytext=(-10 if put_left else 10, 18 if put_above else -21),
-            textcoords="offset points",
-            ha="right" if put_left else "left",
+            xytext=label_position,
+            textcoords="data",
+            ha=horizontal_alignment,
+            va=vertical_alignment,
             color=SELECTED_COLOR,
-            fontsize=13.0,
+            fontsize=19.0,
             fontweight="bold",
             arrowprops={
                 "arrowstyle": "-",
-                "color": SELECTED_COLOR,
-                "lw": 1.4,
+                "color": "#202020",
+                "lw": 1.8,
                 "shrinkA": 2,
                 "shrinkB": 3,
             },
@@ -367,67 +560,15 @@ def draw_camera_panel(
 
     ax.text(
         0.025,
-        0.915,
+        0.965,
         CAMERA_LABELS.get(camera_name, camera_name),
         transform=ax.transAxes,
         ha="left",
         va="top",
-        color="#202020",
-        fontsize=12.5,
+        color=VIEW_LABEL_COLOR,
+        fontsize=19.0,
         fontweight="bold",
         zorder=8.0,
-    )
-
-
-def figure_legend(figure: plt.Figure, arm_count: int) -> None:
-    handles = [
-        Line2D(
-            [0],
-            [0],
-            color=plt.get_cmap("Greens")(0.68),
-            lw=2.5,
-            label=r"Candidates ($Q_{\min}$ shade)",
-        ),
-        Line2D(
-            [0],
-            [0],
-            color=SELECTED_COLOR,
-            lw=4.0,
-            label=r"Selected (max $Q_{\min}$)",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            linestyle="none",
-            markerfacecolor=START_COLOR,
-            markeredgecolor="none",
-            markersize=6.5,
-            label="EEF start",
-        ),
-    ]
-    if arm_count > 1:
-        handles.extend(
-            [
-                Line2D([0], [0], color="#555555", lw=2.0, label="Robot 0"),
-                Line2D(
-                    [0],
-                    [0],
-                    color="#555555",
-                    lw=2.0,
-                    linestyle=ARM_LINESTYLES[1],
-                    label="Robot 1",
-                ),
-            ]
-        )
-    figure.legend(
-        handles=handles,
-        loc="upper center",
-        ncol=len(handles),
-        frameon=False,
-        bbox_to_anchor=(0.5, 0.992),
-        handlelength=2.7,
-        columnspacing=1.25,
     )
 
 
@@ -460,6 +601,10 @@ def plot_boundary(
     for camera_index, (camera, frame, transform) in enumerate(
         zip(cameras, frames, transforms)
     ):
+        if len(world_paths) > 1 and camera in CAMERA_ARM_INDEX:
+            camera_world_paths = [world_paths[CAMERA_ARM_INDEX[camera]]]
+        else:
+            camera_world_paths = world_paths
         projected = [
             project_world_points(
                 points=paths,
@@ -467,7 +612,7 @@ def plot_boundary(
                 height=frame.shape[0],
                 width=frame.shape[1],
             )
-            for paths in world_paths
+            for paths in camera_world_paths
         ]
         draw_camera_panel(
             ax=flat_axes[camera_index],
@@ -481,7 +626,6 @@ def plot_boundary(
     for unused in flat_axes[panel_count:]:
         unused.set_visible(False)
 
-    figure_legend(figure, arm_count=len(world_paths))
     figure.subplots_adjust(
         left=0.0,
         right=1.0,

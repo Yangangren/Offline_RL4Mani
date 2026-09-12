@@ -75,8 +75,8 @@ case "$TASK" in
     TASK_IDQL_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_idql_episode_layout_v1_45demo_24success_8failure_terminal_success.hdf5
     TASK_TERMINAL_SUCCESS_DATASET=$TASK_IDQL_DATASET
     TASK_VALIDATION_DATASET=datasets/real_robot/pick_cup/idql/pick_cup_idql_episode_layout_v1_validation_5demo_6success_2failure_terminal_success.hdf5
-    TASK_DQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/dql/45demo_24success_8failure_terminal_success_rise_temporal_v2_episode_layout_v1
-    TASK_EVAL_OUTPUT=rollouts/real_robot/pick_cup/dql/45demo_24success_8failure_terminal_success_rise_temporal_v2_episode_layout_v1
+    TASK_DQL_OUTPUT_DIR=trained_models/real_robot/pick_cup_rgb_dp/dql/45demo_24success_8failure_terminal_success_rise_temporal_v2_episode_layout_v1_ddim100_eta0p01_minq_sampled_safe_v1
+    TASK_EVAL_OUTPUT=rollouts/real_robot/pick_cup/dql/45demo_24success_8failure_terminal_success_rise_temporal_v2_episode_layout_v1_ddim100_eta0p01_minq_sampled_safe_v1
     TASK_CRITIC_GROUP_NORM=0
     TASK_EVAL_HORIZON=600
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
@@ -91,8 +91,8 @@ case "$TASK" in
     TASK_IDQL_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_idql_episode_layout_v1_45demo_20success_10failure_terminal_success.hdf5
     TASK_TERMINAL_SUCCESS_DATASET=$TASK_IDQL_DATASET
     TASK_VALIDATION_DATASET=datasets/real_robot/stack_cup/idql/stack_cup_idql_episode_layout_v1_validation_5demo_6success_4failure_terminal_success.hdf5
-    TASK_DQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/dql/45demo_20success_10failure_terminal_success_rise_temporal_v2_episode_layout_v1
-    TASK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/dql/45demo_20success_10failure_terminal_success_rise_temporal_v2_episode_layout_v1
+    TASK_DQL_OUTPUT_DIR=trained_models/real_robot/stack_cup_rgb_dp/dql/45demo_20success_10failure_terminal_success_rise_temporal_v2_episode_layout_v1_ddim100_eta0p01_minq_sampled_safe_v1
+    TASK_EVAL_OUTPUT=rollouts/real_robot/stack_cup/dql/45demo_20success_10failure_terminal_success_rise_temporal_v2_episode_layout_v1_ddim100_eta0p01_minq_sampled_safe_v1
     TASK_CRITIC_GROUP_NORM=0
     TASK_EVAL_HORIZON=600
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
@@ -107,8 +107,8 @@ case "$TASK" in
     TASK_IDQL_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_idql_episode_layout_v1_45demo_20success_11failure_terminal_success.hdf5
     TASK_TERMINAL_SUCCESS_DATASET=$TASK_IDQL_DATASET
     TASK_VALIDATION_DATASET=datasets/real_robot/move_spoon/idql/move_spoon_idql_episode_layout_v1_validation_5demo_5success_4failure_terminal_success.hdf5
-    TASK_DQL_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/dql/45demo_20success_11failure_terminal_success_rise_temporal_v2_episode_layout_v1
-    TASK_EVAL_OUTPUT=rollouts/real_robot/move_spoon/dql/45demo_20success_11failure_terminal_success_rise_temporal_v2_episode_layout_v1
+    TASK_DQL_OUTPUT_DIR=trained_models/real_robot/move_spoon_rgb_dp/dql/45demo_20success_11failure_terminal_success_rise_temporal_v2_episode_layout_v1_ddim100_eta0p01_minq_sampled_safe_v1
+    TASK_EVAL_OUTPUT=rollouts/real_robot/move_spoon/dql/45demo_20success_11failure_terminal_success_rise_temporal_v2_episode_layout_v1_ddim100_eta0p01_minq_sampled_safe_v1
     TASK_CRITIC_GROUP_NORM=0
     TASK_EVAL_HORIZON=600
     TASK_CRITIC_LATE_FUSION_KEY=robot0_gripper_state
@@ -203,10 +203,18 @@ CRITIC_LATE_FUSION_KEY=${CRITIC_LATE_FUSION_KEY:-$TASK_CRITIC_LATE_FUSION_KEY}
 DEFAULT_DQL_ACTOR_LR=1e-4
 DEFAULT_DQL_ACTOR_OBS_ENCODER_FREEZE_STEPS=0
 DEFAULT_DQL_CRITIC_ENCODER_FREEZE_STEPS=0
+DEFAULT_DQL_NUM_INFERENCE_STEPS=5
+DEFAULT_DQL_ETA=1.0
+DEFAULT_DQL_Q_HEAD=random
 if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
   DEFAULT_DQL_ACTOR_LR=1e-5
   DEFAULT_DQL_ACTOR_OBS_ENCODER_FREEZE_STEPS=1000
   DEFAULT_DQL_CRITIC_ENCODER_FREEZE_STEPS=1000
+  DEFAULT_DQL_NUM_INFERENCE_STEPS=100
+  # Keep Q guidance conservative on the small, sparse-reward real-robot
+  # datasets, and avoid selecting a single optimistic critic head.
+  DEFAULT_DQL_ETA=0.01
+  DEFAULT_DQL_Q_HEAD=min
 fi
 
 PIN_MEMORY_ARG=--pin-memory
@@ -445,6 +453,7 @@ run_train() {
   local -a steps_per_epoch_args=()
   local -a distributed_args=()
   local -a validation_args=()
+  local -a sampled_validation_args=()
   local -a train_launcher=("$PYTHON" -B)
   if [[ -n "$resume_path" ]]; then
     resume_args=(--resume-checkpoint "$resume_path")
@@ -456,6 +465,13 @@ run_train() {
     validation_args=(
       --validation-dataset "$DQL_VALIDATION_DATASET"
       --validation-seed "${DQL_VALIDATION_SEED:-10000}"
+    )
+  fi
+  if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
+    sampled_validation_args=(
+      --dql-sampled-validation-rows "${DQL_SAMPLED_VALIDATION_ROWS:-32}"
+      --dql-sampled-validation-max-error-ratio "${DQL_SAMPLED_VALIDATION_MAX_ERROR_RATIO:-2.0}"
+      --dql-sampled-validation-max-saturation-excess "${DQL_SAMPLED_VALIDATION_MAX_SATURATION_EXCESS:-0.25}"
     )
   fi
   if (( DQL_NUM_GPUS > 1 )); then
@@ -480,6 +496,7 @@ run_train() {
     --checkpoint "$DP_CHECKPOINT" \
     --output-dir "$DQL_OUTPUT_DIR" \
     "${validation_args[@]}" \
+    "${sampled_validation_args[@]}" \
     "${resume_args[@]}" \
     --device "${DEVICE:-cuda}" \
     --seed "${SEED:-0}" \
@@ -522,12 +539,12 @@ run_train() {
     "$USE_HUBER_ARG" \
     --actor-max-gradient-norm "${ACTOR_MAX_GRADIENT_NORM:-1.0}" \
     --critic-max-gradient-norm "${CRITIC_MAX_GRADIENT_NORM:-10.0}" \
-    --dql-eta "${DQL_ETA:-1.0}" \
+    --dql-eta "${DQL_ETA:-$DEFAULT_DQL_ETA}" \
     --dql-bc-weight "${DQL_BC_WEIGHT:-1.0}" \
     --dql-q-batch-size "${DQL_Q_BATCH_SIZE:-8}" \
-    --dql-num-inference-steps "${DQL_NUM_INFERENCE_STEPS:-5}" \
+    --dql-num-inference-steps "${DQL_NUM_INFERENCE_STEPS:-$DEFAULT_DQL_NUM_INFERENCE_STEPS}" \
     --dql-target-num-candidates "${DQL_TARGET_NUM_CANDIDATES:-1}" \
-    --dql-q-head "${DQL_Q_HEAD:-random}" \
+    --dql-q-head "${DQL_Q_HEAD:-$DEFAULT_DQL_Q_HEAD}" \
     --dql-q-denominator-floor "${DQL_Q_DENOMINATOR_FLOOR:-1.0}" \
     --dql-critic-warmup-steps "${DQL_CRITIC_WARMUP_STEPS:-1000}" \
     --dql-actor-ema-update-every "${DQL_ACTOR_EMA_UPDATE_EVERY:-5}" \
@@ -580,6 +597,10 @@ case "$STAGE" in
     ;;
 
   eval)
+    if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
+      echo "[rgb_dp_dql task=$TASK] eval is simulation-only; use the dedicated real-robot deployment profile." >&2
+      exit 2
+    fi
     "$PYTHON" -B scripts/eval_rgb_dp_idql.py \
       --idql-checkpoint "$DQL_CHECKPOINT" \
       --dp-checkpoint "$DP_CHECKPOINT" \
@@ -600,6 +621,10 @@ case "$STAGE" in
     ;;
 
   eval_grid_resilient)
+    if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
+      echo "[rgb_dp_dql task=$TASK] eval_grid_resilient is simulation-only; use the dedicated real-robot deployment profile." >&2
+      exit 2
+    fi
     read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-1 4 8 16 32 50}"
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
     "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \

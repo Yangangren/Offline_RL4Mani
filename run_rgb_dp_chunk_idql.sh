@@ -1253,6 +1253,7 @@ run_chunk_train() {
     export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
     echo "[rgb_dp_chunk_idql] distributed training: GPUs=$CHUNK_NUM_GPUS per-rank-batch=${CHUNK_BATCH_SIZE:-${BATCH_SIZE:-100}}" >&2
   fi
+  echo "[rgb_dp_chunk_idql task=$TASK] dataset layout=request_aligned validity_key=chunk_critic_valid" >&2
   "${train_launcher[@]}" scripts/train_rgb_dp_chunk_idql.py \
     --task "$TASK" \
     "${distributed_args[@]}" \

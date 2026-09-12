@@ -938,9 +938,7 @@ def plot_violin(
     tail_quantile: float,
     ylabel: str = r"Critic advantage  $\min(Q_1,Q_2)-V$",
     reference_value: float | None = 0.0,
-    quantile_lines: tuple[tuple[float, str], ...] | None = None,
     show_sample_counts: bool = True,
-    show_quantile_legend: bool = True,
 ) -> tuple[list[Path], tuple[float, float]]:
     configure_plot_style()
     fig, ax = plt.subplots(figsize=(4.8, 3.65), constrained_layout=True)
@@ -988,35 +986,6 @@ def plot_violin(
             linewidth=0.9,
             zorder=0,
         )
-    if quantile_lines:
-        line_colors = ("#009E73", "#CC79A7")
-        for (value, label), color in zip(quantile_lines, line_colors):
-            ax.axhline(
-                value,
-                color=color,
-                linestyle="--",
-                linewidth=1.2,
-                zorder=3,
-                label=label,
-            )
-            ax.text(
-                0.985,
-                value,
-                f"{value:.3f}",
-                transform=ax.get_yaxis_transform(),
-                ha="right",
-                va="bottom",
-                fontsize=13,
-                color=color,
-                zorder=5,
-            )
-        if show_quantile_legend:
-            ax.legend(
-                frameon=False,
-                loc="upper right",
-                fontsize=10.5,
-                handlelength=2.6,
-            )
     ax.set_ylabel(ylabel)
     if show_sample_counts:
         tick_labels = (
@@ -1173,10 +1142,6 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
         np.concatenate((success_q_min, failure_q_min)),
         [0.4, 0.6],
     )
-    q_quantile_lines = (
-        (float(pooled_q_min_quantiles[0]), "40th percentile"),
-        (float(pooled_q_min_quantiles[1]), "60th percentile"),
-    )
     q_violin_paths, q_min_range = plot_violin(
         success_q_min,
         failure_q_min,
@@ -1185,9 +1150,7 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
         tail_quantile=0.0,
         ylabel="Q-function",
         reference_value=None,
-        quantile_lines=q_quantile_lines,
         show_sample_counts=False,
-        show_quantile_legend=args.task.lower() == "transport",
     )
     paths.extend(q_violin_paths)
     q_histogram_paths, _ = plot_histogram(
@@ -1205,10 +1168,6 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
         np.concatenate((success_value, failure_value)),
         [0.4, 0.6],
     )
-    value_quantile_lines = (
-        (float(pooled_value_quantiles[0]), "40th percentile"),
-        (float(pooled_value_quantiles[1]), "60th percentile"),
-    )
     value_violin_paths, value_range = plot_violin(
         success_value,
         failure_value,
@@ -1217,9 +1176,7 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
         tail_quantile=0.0,
         ylabel="Value function",
         reference_value=None,
-        quantile_lines=value_quantile_lines,
         show_sample_counts=False,
-        show_quantile_legend=args.task.lower() == "transport",
     )
     paths.extend(value_violin_paths)
 

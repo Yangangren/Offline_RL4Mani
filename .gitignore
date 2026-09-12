@@ -131,18 +131,20 @@ figures/
 scripts/real_robot_deploy/*
 
 tests/*
-!tests/real_robot/
-tests/real_robot/*
-!tests/real_robot/test_build_stack_cup_dataset.py
-!tests/real_robot/test_validate_stack_cup_dataset.py
-!tests/real_robot/test_stack_cup_rgb_dp_baseline.py
-!tests/real_robot/test_eval_stack_cup_rgb_dp.py
-!tests/test_rgb_dp_idql_launcher.py
-!tests/test_rgb_dp_idql_temporal.py
-!tests/test_rgb_dp_dql_launcher.py
-!tests/test_rgb_dp_mixed_imitation_launcher.py
-!tests/test_rgb_dp_failure_filter_imitation_launcher.py
-!tests/test_stack_cup_idql_launchers.py
-!tests/test_rgb_dp_rise.py
-!tests/test_real_robot_episode_layout_profiles.py
+# !tests/real_robot/
+# tests/real_robot/*
+# !tests/real_robot/test_build_stack_cup_dataset.py
+# !tests/real_robot/test_validate_stack_cup_dataset.py
+# !tests/real_robot/test_stack_cup_rgb_dp_baseline.py
+# !tests/real_robot/test_eval_stack_cup_rgb_dp.py
+# !tests/test_rgb_dp_idql_launcher.py
+# !tests/test_rgb_dp_chunk_idql_launcher.py
+# !tests/test_rgb_dp_idql_temporal.py
+# !tests/test_rgb_dp_dql_launcher.py
+# !tests/test_rgb_dp_mixed_imitation_launcher.py
+# !tests/test_rgb_dp_failure_filter_imitation_launcher.py
+# !tests/test_stack_cup_idql_launchers.py
+# !tests/test_rgb_dp_rise.py
+# !tests/test_real_robot_episode_layout_profiles.py
+# !tests/test_real_robot_mixed_idql_balanced_view.py
 analysis/*
