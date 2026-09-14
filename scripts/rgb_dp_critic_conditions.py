@@ -11,6 +11,12 @@ Human demonstration rows are always positive.  A null condition is encoded as
 ``actor_condition=0`` and ``actor_condition_mask=0`` so it remains distinct
 from an explicit negative condition, which is encoded as ``(0, 1)``.
 
+The relative-Q mode is deliberately separate from the score-threshold modes.
+It ranks a logged action against ``M`` alternatives at the same state using
+the integer numerator ``1 + number_of_alternatives_not_better_than_logged``.
+Its low and high boundaries are inclusive, as required by the rank definition;
+the score-threshold modes above retain their historical strict boundaries.
+
 This module deliberately has no dataset or model dependencies.  Critic scoring,
 sidecar persistence, and training-time lookup belong to their respective
 callers.
@@ -18,14 +24,20 @@ callers.
 
 from __future__ import annotations
 
+from fractions import Fraction
 from typing import Any
 
 import numpy as np
 
 
-SUPPORTED_CRITIC_CONDITION_MODES = (
+SCORE_THRESHOLD_CRITIC_CONDITION_MODES = (
     "critic_advantage",
     "critic_q",
+)
+RELATIVE_Q_CONDITION_MODE = "relative_q"
+SUPPORTED_CRITIC_CONDITION_MODES = (
+    *SCORE_THRESHOLD_CRITIC_CONDITION_MODES,
+    RELATIVE_Q_CONDITION_MODE,
 )
 SUPPORTED_THRESHOLD_MODES = (
     "fixed",
@@ -43,6 +55,19 @@ def validate_critic_condition_mode(mode: str) -> str:
         raise ValueError(
             f"unsupported critic condition mode {mode!r}; expected one of: "
             f"{choices}"
+        )
+    return normalized
+
+
+def _validate_score_threshold_condition_mode(mode: str) -> str:
+    """Validate a mode handled by the strict global-score threshold path."""
+
+    normalized = validate_critic_condition_mode(mode)
+    if normalized not in SCORE_THRESHOLD_CRITIC_CONDITION_MODES:
+        choices = ", ".join(SCORE_THRESHOLD_CRITIC_CONDITION_MODES)
+        raise ValueError(
+            f"critic condition mode {mode!r} is not a score-threshold mode; "
+            f"expected one of: {choices}"
         )
     return normalized
 
@@ -69,6 +94,43 @@ def _finite_scores(scores: Any) -> np.ndarray:
         bad_count = int((~np.isfinite(result)).sum())
         raise ValueError(f"scores must be finite; found {bad_count} non-finite rows")
     return result
+
+
+def _numeric_matrix(value: Any, name: str) -> np.ndarray:
+    if hasattr(value, "detach") and hasattr(value, "cpu"):
+        value = value.detach().cpu().numpy()
+    try:
+        result = np.asarray(value).astype(np.float64, copy=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a numeric matrix") from exc
+    if result.ndim != 2:
+        raise ValueError(f"{name} must have shape [N,M], got {result.shape}")
+    if result.shape[0] == 0 or result.shape[1] == 0:
+        raise ValueError(f"{name} must have non-empty N and M dimensions")
+    if not np.isfinite(result).all():
+        bad_count = int((~np.isfinite(result)).sum())
+        raise ValueError(
+            f"{name} must be finite; found {bad_count} non-finite values"
+        )
+    return result
+
+
+def _integer_vector(value: Any, name: str) -> np.ndarray:
+    raw = _numpy_vector(value, name)
+    if np.issubdtype(raw.dtype, np.bool_):
+        raise ValueError(f"{name} must contain integers, not booleans")
+    try:
+        numeric = raw.astype(np.float64, copy=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain integers") from exc
+    if not np.isfinite(numeric).all() or not np.all(
+        numeric == np.trunc(numeric)
+    ):
+        raise ValueError(f"{name} must contain finite integers")
+    int64_info = np.iinfo(np.int64)
+    if np.any(numeric < int64_info.min) or np.any(numeric > int64_info.max):
+        raise ValueError(f"{name} values exceed the int64 range")
+    return numeric.astype(np.int64, copy=False)
 
 
 def _binary_mask(value: Any, name: str, expected_shape: tuple[int, ...]) -> np.ndarray:
@@ -342,7 +404,7 @@ def calibrate_critic_condition_thresholds(
     catches incomplete critic sidecars before they reach actor training.
     """
 
-    normalized_mode = validate_critic_condition_mode(mode)
+    normalized_mode = _validate_score_threshold_condition_mode(mode)
     score_array = _finite_scores(scores)
     human = _binary_mask(is_human, "is_human", score_array.shape)
     if eligible is None:
@@ -517,7 +579,7 @@ def construct_critic_conditions(
     band along with every score between the thresholds.
     """
 
-    normalized_mode = validate_critic_condition_mode(mode)
+    normalized_mode = _validate_score_threshold_condition_mode(mode)
     score_array = _finite_scores(scores)
     human = _binary_mask(is_human, "is_human", score_array.shape)
     low, high = _validate_thresholds(low_threshold, high_threshold)
@@ -592,6 +654,332 @@ def construct_critic_conditions(
     }
 
 
+def compute_relative_q_ranks(
+    logged_q: Any,
+    alternative_q: Any,
+) -> dict[str, Any]:
+    """Compute finite-sample relative-Q ranks from frozen critic outputs.
+
+    ``alternative_q`` must be ``[N, M]`` and already contain the conservative
+    value for each proposal (normally ``min(Q1, Q2)``).  Equality is counted
+    in favor of the logged action exactly as in
+
+    ``rho = (1 + sum(logged_q >= alternative_q)) / (M + 1)``.
+
+    Integer win counts and numerators are returned as the canonical result;
+    the floating-point rank is a derived convenience field.
+    """
+
+    logged = _finite_scores(logged_q)
+    alternatives = _numeric_matrix(alternative_q, "alternative_q")
+    if alternatives.shape[0] != logged.shape[0]:
+        raise ValueError(
+            "alternative_q row count must match logged_q: "
+            f"{alternatives.shape[0]} != {logged.shape[0]}"
+        )
+    num_alternatives = int(alternatives.shape[1])
+    rank_denominator = num_alternatives + 1
+    comparisons = logged[:, None] >= alternatives
+    win_count = comparisons.sum(axis=1, dtype=np.int64)
+    rank_numerator = win_count + 1
+    rank = rank_numerator.astype(np.float64) / float(rank_denominator)
+    tie_count = (logged[:, None] == alternatives).sum(
+        axis=1, dtype=np.int64
+    )
+    return {
+        "relative_q_win_count": win_count,
+        "relative_q_rank_numerator": rank_numerator,
+        "relative_q_rank_denominator": rank_denominator,
+        "relative_q_rank": rank,
+        "relative_q_tie_count": tie_count,
+        "num_alternatives": num_alternatives,
+        "audit": {
+            "num_rows": int(logged.size),
+            "num_alternatives": num_alternatives,
+            "rank_denominator": rank_denominator,
+            "comparison": "logged_q >= alternative_q (ties favor logged)",
+            "total_comparisons": int(logged.size * num_alternatives),
+            "total_ties": int(tie_count.sum()),
+            "rows_with_ties": int((tie_count > 0).sum()),
+            "logged_q_stats": _score_stats(logged),
+            "alternative_q_stats": _score_stats(alternatives.reshape(-1)),
+            "win_count_stats": _score_stats(win_count),
+            "rank_stats": _score_stats(rank),
+        },
+    }
+
+
+def _relative_q_threshold_cutoffs(
+    low_threshold: Any,
+    high_threshold: Any,
+    rank_denominator: int,
+) -> tuple[float, float, int, int]:
+    """Resolve inclusive rank thresholds to canonical integer cutoffs."""
+
+    low = _finite_scalar(low_threshold, "low_threshold")
+    high = _finite_scalar(high_threshold, "high_threshold")
+    if not 0.0 <= low < high <= 1.0:
+        raise ValueError(
+            "relative-Q thresholds must satisfy "
+            "0 <= low_threshold < high_threshold <= 1, got "
+            f"{low}, {high}"
+        )
+
+    # Fraction(str(...)) preserves the user's decimal threshold rather than
+    # letting binary floating-point rounding decide whether an attainable
+    # rank exactly on a boundary is included.
+    low_fraction = Fraction(str(low))
+    high_fraction = Fraction(str(high))
+    low_numerator_cutoff = (
+        low_fraction.numerator * rank_denominator
+    ) // low_fraction.denominator
+    scaled_high_numerator = high_fraction.numerator * rank_denominator
+    high_numerator_cutoff = -(
+        -scaled_high_numerator // high_fraction.denominator
+    )
+    return low, high, low_numerator_cutoff, high_numerator_cutoff
+
+
+def construct_relative_q_conditions(
+    win_counts: Any,
+    is_human: Any,
+    *,
+    num_alternatives: int,
+    low_threshold: float,
+    high_threshold: float,
+) -> dict[str, Any]:
+    """Construct inclusive positive, negative, and null relative-Q labels.
+
+    A rollout win count ``w`` has the canonical rank numerator ``1 + w`` and
+    denominator ``M + 1``.  Rollouts at either threshold are active because
+    the relative-Q definition uses ``rho <= low`` and ``rho >= high``.
+    Human rows are always positive.  A human row may use ``-1`` as a sentinel
+    when alternatives were intentionally not sampled for demonstrations; that
+    sentinel is forbidden for rollout rows.
+    """
+
+    wins = _integer_vector(win_counts, "win_counts")
+    if wins.size == 0:
+        raise ValueError("win_counts must contain at least one row")
+    human = _binary_mask(is_human, "is_human", wins.shape)
+    alternatives = _positive_integer(num_alternatives, "num_alternatives")
+    if np.any(wins < -1) or np.any(wins > alternatives):
+        invalid = wins[(wins < -1) | (wins > alternatives)][:8].tolist()
+        raise ValueError(
+            "win_counts must be between 0 and num_alternatives, with -1 "
+            f"allowed only as a human sentinel; invalid values={invalid}"
+        )
+    rollout = ~human
+    if np.any(wins[rollout] < 0):
+        raise ValueError("rollout win_counts cannot use the -1 human sentinel")
+
+    rank_denominator = alternatives + 1
+    low, high, low_cutoff, high_cutoff = _relative_q_threshold_cutoffs(
+        low_threshold,
+        high_threshold,
+        rank_denominator,
+    )
+    rank_numerator = wins + 1
+    rank_defined = rank_numerator > 0
+    rank = np.full(wins.shape, np.nan, dtype=np.float64)
+    rank[rank_defined] = (
+        rank_numerator[rank_defined].astype(np.float64)
+        / float(rank_denominator)
+    )
+
+    # Label from integer numerators, not their floating representation.  The
+    # floor / ceil cutoffs encode the requested inclusive inequalities.
+    rollout_positive = rollout & (rank_numerator >= high_cutoff)
+    rollout_negative = rollout & (rank_numerator <= low_cutoff)
+    rollout_null = rollout & ~(rollout_positive | rollout_negative)
+    positive = human | rollout_positive
+    negative = rollout_negative
+    null = rollout_null
+    actor_condition = positive.astype(np.uint8)
+    actor_condition_mask = (positive | negative).astype(np.uint8)
+
+    total_count = int(wins.size)
+    rollout_count = int(rollout.sum())
+    positive_count = int(positive.sum())
+    negative_count = int(negative.sum())
+    null_count = int(null.sum())
+    rollout_positive_count = int(rollout_positive.sum())
+    rollout_negative_count = int(rollout_negative.sum())
+    rollout_null_count = int(rollout_null.sum())
+
+    attainable_low = (
+        int(low_cutoff) if 1 <= low_cutoff <= rank_denominator else None
+    )
+    attainable_high = (
+        int(high_cutoff) if 1 <= high_cutoff <= rank_denominator else None
+    )
+    null_min = max(1, low_cutoff + 1)
+    null_max = min(rank_denominator, high_cutoff - 1)
+    audit = {
+        "mode": RELATIVE_Q_CONDITION_MODE,
+        "num_alternatives": alternatives,
+        "rank_denominator": rank_denominator,
+        "thresholds": {
+            "low": low,
+            "high": high,
+            "comparison": (
+                "rho <= low: 0; rho >= high: 1; otherwise: null"
+            ),
+            "low_max_rank_numerator": attainable_low,
+            "high_min_rank_numerator": attainable_high,
+            "effective_low_max": (
+                float(attainable_low / rank_denominator)
+                if attainable_low is not None
+                else None
+            ),
+            "effective_high_min": (
+                float(attainable_high / rank_denominator)
+                if attainable_high is not None
+                else None
+            ),
+            "null_min_rank_numerator": (
+                int(null_min) if null_min <= null_max else None
+            ),
+            "null_max_rank_numerator": (
+                int(null_max) if null_min <= null_max else None
+            ),
+            "negative_region_attainable": attainable_low is not None,
+            "null_region_attainable": null_min <= null_max,
+            "positive_region_attainable": attainable_high is not None,
+        },
+        "counts": {
+            "total": total_count,
+            "human": int(human.sum()),
+            "human_rank_unsampled": int((human & ~rank_defined).sum()),
+            "rollout": rollout_count,
+            "positive": positive_count,
+            "negative": negative_count,
+            "null": null_count,
+            "explicit": positive_count + negative_count,
+            "human_positive": int(human.sum()),
+            "rollout_positive": rollout_positive_count,
+            "rollout_negative": rollout_negative_count,
+            "rollout_null": rollout_null_count,
+        },
+        "fractions": {
+            "positive": _fraction(positive_count, total_count),
+            "negative": _fraction(negative_count, total_count),
+            "null": _fraction(null_count, total_count),
+            "rollout_positive": _fraction(
+                rollout_positive_count, rollout_count
+            ),
+            "rollout_negative": _fraction(
+                rollout_negative_count, rollout_count
+            ),
+            "rollout_null": _fraction(rollout_null_count, rollout_count),
+        },
+        "rank_stats": {
+            "defined": _score_stats(rank[rank_defined]),
+            "rollout": _score_stats(rank[rollout]),
+            "rollout_positive": _score_stats(rank[rollout_positive]),
+            "rollout_negative": _score_stats(rank[rollout_negative]),
+            "rollout_null": _score_stats(rank[rollout_null]),
+        },
+    }
+    return {
+        "actor_condition": actor_condition,
+        "actor_condition_mask": actor_condition_mask,
+        "mode": RELATIVE_Q_CONDITION_MODE,
+        "relative_q_win_count": wins,
+        "relative_q_rank_numerator": rank_numerator,
+        "relative_q_rank_denominator": rank_denominator,
+        "relative_q_rank": rank,
+        "num_alternatives": alternatives,
+        "low_threshold": low,
+        "high_threshold": high,
+        "audit": audit,
+    }
+
+
+def make_relative_q_conditions(
+    logged_q: Any,
+    alternative_q: Any,
+    is_human: Any,
+    *,
+    low_threshold: float,
+    high_threshold: float,
+) -> dict[str, Any]:
+    """Compute rollout ranks and construct relative-Q actor conditions.
+
+    Human Q entries may be non-finite because the caller need not sample DP
+    alternatives for demonstrations.  All rollout logged and alternative Q
+    values remain strictly finite-checked.
+    """
+
+    if hasattr(logged_q, "detach") and hasattr(logged_q, "cpu"):
+        logged_q = logged_q.detach().cpu().numpy()
+    if hasattr(alternative_q, "detach") and hasattr(alternative_q, "cpu"):
+        alternative_q = alternative_q.detach().cpu().numpy()
+    try:
+        logged = _numpy_vector(logged_q, "logged_q").astype(
+            np.float64, copy=False
+        )
+        alternatives = np.asarray(alternative_q).astype(
+            np.float64, copy=False
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("logged_q and alternative_q must be numeric") from exc
+    if alternatives.ndim != 2:
+        raise ValueError(
+            f"alternative_q must have shape [N,M], got {alternatives.shape}"
+        )
+    if alternatives.shape[0] != logged.shape[0]:
+        raise ValueError(
+            "alternative_q row count must match logged_q: "
+            f"{alternatives.shape[0]} != {logged.shape[0]}"
+        )
+    if logged.size == 0 or alternatives.shape[1] == 0:
+        raise ValueError("logged_q and alternative_q must have non-empty dimensions")
+    human = _binary_mask(is_human, "is_human", logged.shape)
+    rollout = ~human
+    if not np.isfinite(logged[rollout]).all():
+        raise ValueError("logged_q must be finite on every rollout row")
+    if not np.isfinite(alternatives[rollout]).all():
+        raise ValueError("alternative_q must be finite on every rollout row")
+
+    num_alternatives = int(alternatives.shape[1])
+    wins = np.full(logged.shape, -1, dtype=np.int64)
+    ties = np.full(logged.shape, -1, dtype=np.int64)
+    rank_audit = {
+        "num_rows": 0,
+        "num_alternatives": num_alternatives,
+        "rank_denominator": num_alternatives + 1,
+        "comparison": "logged_q >= alternative_q (ties favor logged)",
+        "total_comparisons": 0,
+        "total_ties": 0,
+        "rows_with_ties": 0,
+        "logged_q_stats": _score_stats(np.asarray([], dtype=np.float64)),
+        "alternative_q_stats": _score_stats(
+            np.asarray([], dtype=np.float64)
+        ),
+        "win_count_stats": _score_stats(np.asarray([], dtype=np.float64)),
+        "rank_stats": _score_stats(np.asarray([], dtype=np.float64)),
+    }
+    if np.any(rollout):
+        computed = compute_relative_q_ranks(
+            logged[rollout], alternatives[rollout]
+        )
+        wins[rollout] = computed["relative_q_win_count"]
+        ties[rollout] = computed["relative_q_tie_count"]
+        rank_audit = computed["audit"]
+
+    result = construct_relative_q_conditions(
+        wins,
+        human,
+        num_alternatives=num_alternatives,
+        low_threshold=low_threshold,
+        high_threshold=high_threshold,
+    )
+    result["relative_q_tie_count"] = ties
+    result["audit"]["sampling"] = rank_audit
+    return result
+
+
 def make_critic_conditions(
     scores: Any,
     is_human: Any,
@@ -636,10 +1024,15 @@ def make_critic_conditions(
 
 
 __all__ = [
+    "RELATIVE_Q_CONDITION_MODE",
+    "SCORE_THRESHOLD_CRITIC_CONDITION_MODES",
     "SUPPORTED_CRITIC_CONDITION_MODES",
     "SUPPORTED_THRESHOLD_MODES",
     "calibrate_critic_condition_thresholds",
+    "compute_relative_q_ranks",
     "construct_critic_conditions",
+    "construct_relative_q_conditions",
     "make_critic_conditions",
+    "make_relative_q_conditions",
     "validate_critic_condition_mode",
 ]

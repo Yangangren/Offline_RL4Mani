@@ -26,7 +26,10 @@ import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
-from robomimic.algo.diffusion_policy import replace_bn_with_gn
+from robomimic.algo.diffusion_policy import (
+    DETERMINISTIC_DP_PROPOSAL_RNG_SCHEME,
+    replace_bn_with_gn,
+)
 from robomimic.models.chunk_iql_nets import (
     CausalSequentialActionChunkEncoder,
     CausalTemporalStateTrunk,
@@ -42,6 +45,7 @@ from rgb_dp_distributed import (
     all_reduce_gradients as bounded_all_reduce_gradients,
     mean_distributed_scalars as reduce_distributed_scalars,
 )
+from rgb_dp_critic_conditions import construct_relative_q_conditions
 
 from train_rgb_dp_idql import (
     REWARD_DEFINITIONS,
@@ -90,8 +94,14 @@ ACTOR_CONDITION_DEFINITIONS = {
     "critic_q": (
         "human_demo=1; rollout_min_q>high=1; rollout_min_q<low=0; otherwise=null"
     ),
+    "relative_q": (
+        "human_demo=1; rollout_relative_q_rank>=high=1; "
+        "rollout_relative_q_rank<=low=0; otherwise=null"
+    ),
 }
-CRITIC_ACTOR_CONDITION_MODES = frozenset(("critic_advantage", "critic_q"))
+CRITIC_ACTOR_CONDITION_MODES = frozenset(
+    ("critic_advantage", "critic_q", "relative_q")
+)
 CRITIC_ACTOR_CONDITION_SIDECAR_KIND = "rgb_dp_chunk_critic_conditions_v1"
 DYNAMICS_PREDICTION_MODE = "actor_encoder_direct"
 RISE_V2_DYNAMICS_PREDICTION_MODE = (
@@ -1143,7 +1153,7 @@ def validate_training_mode(args: argparse.Namespace) -> None:
     elif condition_labels is not None or validation_condition_labels is not None:
         raise ValueError(
             "actor-condition label sidecars are only valid for "
-            "critic_advantage or critic_q modes"
+            "critic_advantage, critic_q, or relative_q modes"
         )
     if int(getattr(args, "reranking_min_post_warmup_steps", 0)) < 0:
         raise ValueError("reranking_min_post_warmup_steps must be non-negative")
@@ -1153,6 +1163,11 @@ def validate_training_mode(args: argparse.Namespace) -> None:
     if not np.isfinite(actor_loss_degradation) or actor_loss_degradation < 0.0:
         raise ValueError(
             "reranking_max_actor_loss_degradation must be finite and non-negative"
+        )
+    if condition_mode == "relative_q" and not actor_only:
+        raise ValueError(
+            "relative_q is an offline-label actor post-training mode and requires "
+            "--actor-only"
         )
     if actor_only:
         if not bool(args.conditioned_actor):
@@ -1164,6 +1179,12 @@ def validate_training_mode(args: argparse.Namespace) -> None:
             raise ValueError(
                 "actor-only training requires initialization="
                 "pretrained_dp_joint or source_idql_joint"
+            )
+        if condition_mode == "relative_q" and initialization != "pretrained_dp_joint":
+            raise ValueError(
+                "relative_q actor-only post-training must initialize from the "
+                "same pretrained DP used to sample its proposal actions; use "
+                "initialization=pretrained_dp_joint"
             )
     elif initialization == "source_idql_joint":
         raise ValueError("source_idql_joint is only supported with --actor-only")
@@ -3237,6 +3258,8 @@ def load_actor_condition_sidecar(
             f"critic condition sidecar mode={mode!r} does not match requested "
             f"mode={str(expected_mode)!r}"
         )
+    if mode not in CRITIC_ACTOR_CONDITION_MODES:
+        raise ValueError(f"unsupported critic condition sidecar mode={mode!r}")
     if sidecar.get("dataset_identity") != expected_dataset_identity:
         raise ValueError(
             "critic condition sidecar was prepared for a different or modified "
@@ -3264,6 +3287,16 @@ def load_actor_condition_sidecar(
         "twin_gap",
         "rollout_success",
     }
+    if mode == "relative_q":
+        required_fields.update(
+            {
+                "proposal_q_min",
+                "relative_q_win_count",
+                "relative_q_tie_count",
+                "relative_q_rank",
+                "relative_q_scored",
+            }
+        )
     missing_fields = sorted(required_fields.difference(fields))
     if missing_fields:
         raise ValueError(
@@ -3277,6 +3310,7 @@ def load_actor_condition_sidecar(
         "source_is_expert",
         "scored",
         "rollout_success",
+        *(('relative_q_scored',) if mode == "relative_q" else ()),
     ):
         normalized_fields[name] = _binary_sidecar_vector(
             fields[name], name=name, num_samples=num_samples
@@ -3294,6 +3328,7 @@ def load_actor_condition_sidecar(
             "source_is_expert",
             "scored",
             "rollout_success",
+            "relative_q_scored",
         }:
             normalized_fields[name] = tensor.contiguous()
 
@@ -3336,6 +3371,26 @@ def load_actor_condition_sidecar(
         "num_critics",
         "normalization",
     }
+    if mode == "relative_q":
+        required_config.update(
+            {
+                "num_alternatives",
+                "relative_q_low_rank",
+                "relative_q_high_rank",
+                "rank_formula",
+                "rank_comparison",
+                "rank_threshold_comparison",
+                "proposal_actor_source",
+                "proposal_scheduler",
+                "proposal_seed",
+                "proposal_rng_scheme",
+                "proposal_action_transform",
+                "candidate_batch_size",
+                "actor_observation_horizon",
+                "proposal_action_horizon",
+                "action_mask_policy",
+            }
+        )
     missing_config = sorted(required_config.difference(config))
     if missing_config:
         raise ValueError(
@@ -3355,7 +3410,11 @@ def load_actor_condition_sidecar(
             f"{str(config['critic_source'])!r} does not match requested "
             f"source={str(expected_critic_source)!r}; regenerate the sidecar"
         )
-    expected_score_key = "advantage" if mode == "critic_advantage" else "q_min"
+    expected_score_key = {
+        "critic_advantage": "advantage",
+        "critic_q": "q_min",
+        "relative_q": "relative_q_rank",
+    }[mode]
     if str(config["score_key"]) != expected_score_key:
         raise ValueError(
             f"critic condition sidecar mode={mode!r} requires "
@@ -3374,6 +3433,12 @@ def load_actor_condition_sidecar(
         raise ValueError(
             "critic condition sidecar requires finite low_threshold < "
             "high_threshold"
+        )
+    if mode == "relative_q" and not (
+        0.0 <= low_threshold < high_threshold <= 1.0
+    ):
+        raise ValueError(
+            "relative_q thresholds must satisfy 0 <= low < high <= 1"
         )
     scored_rows = normalized_fields["scored"].bool()
     scalar_scores: dict[str, torch.Tensor] = {}
@@ -3420,11 +3485,215 @@ def load_actor_condition_sidecar(
             "critic condition sidecar twin_gap must be nonnegative on scored "
             f"rows (tolerance={twin_gap_tolerance}); invalid indices={invalid}"
         )
-    scores = scalar_scores[expected_score_key]
     rollout_rows = scored_rows & ~humans
-    expected_positive = rollout_rows & (scores > high_threshold)
-    expected_negative = rollout_rows & (scores < low_threshold)
-    expected_null = rollout_rows & ~(expected_positive | expected_negative)
+    if mode == "relative_q":
+        if str(config["threshold_mode"]) != "fixed_rank":
+            raise ValueError(
+                "relative_q sidecars require threshold_mode='fixed_rank'"
+            )
+        if float(config["relative_q_low_rank"]) != low_threshold or float(
+            config["relative_q_high_rank"]
+        ) != high_threshold:
+            raise ValueError(
+                "relative_q rank thresholds disagree with generic threshold "
+                "provenance"
+            )
+        try:
+            num_alternatives = int(config["num_alternatives"])
+            candidate_batch_size = int(config["candidate_batch_size"])
+            actor_observation_horizon = int(config["actor_observation_horizon"])
+            proposal_action_horizon = int(config["proposal_action_horizon"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "relative_q integer provenance is invalid"
+            ) from exc
+        if num_alternatives < 1:
+            raise ValueError("relative_q num_alternatives must be positive")
+        if candidate_batch_size < 1:
+            raise ValueError("relative_q candidate_batch_size must be positive")
+        if actor_observation_horizon < 1:
+            raise ValueError(
+                "relative_q actor_observation_horizon must be positive"
+            )
+        if proposal_action_horizon < int(config["chunk_horizon"]):
+            raise ValueError(
+                "relative_q proposal action horizon is shorter than the critic "
+                "chunk horizon"
+            )
+        if int(config["num_critics"]) != 2:
+            raise ValueError("relative_q requires exactly two Q critics")
+        for name in (
+            "rank_formula",
+            "rank_comparison",
+            "rank_threshold_comparison",
+            "proposal_actor_source",
+            "proposal_rng_scheme",
+            "proposal_action_transform",
+            "action_mask_policy",
+        ):
+            if not isinstance(config[name], str) or not str(config[name]):
+                raise ValueError(
+                    f"relative_q provenance {name!r} must be a nonempty string"
+                )
+        expected_relative_provenance = {
+            "rank_formula": "(1+win_count)/(num_alternatives+1)",
+            "rank_comparison": "logged_q_min>=proposal_q_min",
+            "rank_threshold_comparison": (
+                "rank<=low:0;rank>=high:1;otherwise:null"
+            ),
+            "proposal_rng_scheme": DETERMINISTIC_DP_PROPOSAL_RNG_SCHEME,
+            "proposal_action_transform": (
+                "raw_normalized_dp_action_chunk_no_extra_clamp"
+            ),
+            "action_mask_policy": (
+                "logged_terminal_prefix_mask_for_logged;"
+                "all_ones_for_proposals"
+            ),
+        }
+        mismatched_relative_provenance = [
+            name
+            for name, expected_value in expected_relative_provenance.items()
+            if str(config[name]) != expected_value
+        ]
+        if mismatched_relative_provenance:
+            raise ValueError(
+                "relative_q semantic provenance is invalid: "
+                f"{mismatched_relative_provenance}"
+            )
+        if str(config["proposal_actor_source"]) not in {
+            "pretrained_dp_checkpoint.ema",
+            "pretrained_dp_checkpoint.nets",
+        }:
+            raise ValueError(
+                "relative_q proposal_actor_source must select the deployed "
+                "pretrained DP weights"
+            )
+        if isinstance(config["proposal_seed"], bool):
+            raise ValueError("relative_q proposal_seed must be an integer")
+        try:
+            int(config["proposal_seed"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("relative_q proposal_seed must be an integer") from exc
+        if not isinstance(config["proposal_scheduler"], dict) or not config[
+            "proposal_scheduler"
+        ]:
+            raise ValueError(
+                "relative_q proposal_scheduler provenance must be a nonempty mapping"
+            )
+
+        rank_scored = normalized_fields["relative_q_scored"].bool()
+        if not torch.equal(rank_scored, rollout_rows):
+            raise ValueError(
+                "relative_q_scored must select exactly the scored rollout rows"
+            )
+        proposal_q = torch.as_tensor(
+            normalized_fields["proposal_q_min"], dtype=torch.float64
+        )
+        if tuple(proposal_q.shape) != (num_samples, num_alternatives):
+            raise ValueError(
+                "relative_q proposal_q_min must have shape "
+                f"({num_samples}, {num_alternatives}), got "
+                f"{tuple(proposal_q.shape)}"
+            )
+        if not torch.isfinite(proposal_q[rank_scored]).all():
+            raise ValueError(
+                "relative_q proposal Q values must be finite on rollout rows"
+            )
+        if torch.any(~torch.isnan(proposal_q[~rank_scored])):
+            raise ValueError(
+                "relative_q proposal Q values must be NaN on human or unscored rows"
+            )
+
+        def relative_integer_field(name: str) -> torch.Tensor:
+            raw = torch.as_tensor(normalized_fields[name], dtype=torch.float64)
+            if raw.ndim != 1 or int(raw.shape[0]) != num_samples:
+                raise ValueError(
+                    f"relative_q field {name!r} must have shape ({num_samples},)"
+                )
+            if not torch.isfinite(raw).all() or not torch.equal(raw, raw.round()):
+                raise ValueError(
+                    f"relative_q field {name!r} must contain finite integers"
+                )
+            return raw.to(dtype=torch.int64)
+
+        win_count = relative_integer_field("relative_q_win_count")
+        tie_count = relative_integer_field("relative_q_tie_count")
+        for name, values in (
+            ("relative_q_win_count", win_count),
+            ("relative_q_tie_count", tie_count),
+        ):
+            if torch.any(
+                (values[rank_scored] < 0)
+                | (values[rank_scored] > num_alternatives)
+            ):
+                raise ValueError(
+                    f"{name} must lie in [0, num_alternatives] on rollout rows"
+                )
+            if torch.any(values[~rank_scored] != -1):
+                raise ValueError(
+                    f"{name} must use sentinel -1 on human or unscored rows"
+                )
+
+        ranks = torch.as_tensor(
+            normalized_fields["relative_q_rank"], dtype=torch.float64
+        )
+        if ranks.ndim != 1 or int(ranks.shape[0]) != num_samples:
+            raise ValueError(
+                f"relative_q_rank must have shape ({num_samples},)"
+            )
+        if not torch.isfinite(ranks[rank_scored]).all() or torch.any(
+            ~torch.isnan(ranks[~rank_scored])
+        ):
+            raise ValueError(
+                "relative_q_rank must be finite on rollout rows and NaN elsewhere"
+            )
+        recomputed_wins = (
+            scalar_scores["q_min"][rank_scored, None]
+            >= proposal_q[rank_scored]
+        ).sum(dim=1)
+        recomputed_ties = (
+            scalar_scores["q_min"][rank_scored, None]
+            == proposal_q[rank_scored]
+        ).sum(dim=1)
+        if not torch.equal(win_count[rank_scored], recomputed_wins):
+            raise ValueError(
+                "relative_q win counts do not match logged and proposal Q values"
+            )
+        if not torch.equal(tie_count[rank_scored], recomputed_ties):
+            raise ValueError(
+                "relative_q tie counts do not match logged and proposal Q values"
+            )
+        recomputed_ranks = (recomputed_wins.to(torch.float64) + 1.0) / float(
+            num_alternatives + 1
+        )
+        if not torch.allclose(
+            ranks[rank_scored], recomputed_ranks, atol=1e-15, rtol=0.0
+        ):
+            raise ValueError(
+                "relative_q ranks do not exactly match their integer win counts"
+            )
+        expected = construct_relative_q_conditions(
+            win_count[rank_scored].cpu().numpy(),
+            np.zeros(int(rank_scored.sum()), dtype=np.uint8),
+            num_alternatives=num_alternatives,
+            low_threshold=config["relative_q_low_rank"],
+            high_threshold=config["relative_q_high_rank"],
+        )
+        expected_positive = torch.zeros(num_samples, dtype=torch.bool)
+        expected_negative = torch.zeros(num_samples, dtype=torch.bool)
+        expected_null = torch.zeros(num_samples, dtype=torch.bool)
+        expected_labels = torch.as_tensor(expected["actor_condition"]).bool()
+        expected_masks = torch.as_tensor(expected["actor_condition_mask"]).bool()
+        expected_positive[rank_scored] = expected_labels & expected_masks
+        expected_negative[rank_scored] = ~expected_labels & expected_masks
+        expected_null[rank_scored] = ~expected_masks
+    else:
+        scores = scalar_scores[expected_score_key]
+        expected_positive = rollout_rows & (scores > high_threshold)
+        expected_negative = rollout_rows & (scores < low_threshold)
+        expected_null = rollout_rows & ~(
+            expected_positive | expected_negative
+        )
     if not torch.all((labels[expected_positive] == 1) & (masks[expected_positive] == 1)):
         raise ValueError(
             "critic condition sidecar high-score rollout labels are inconsistent "
@@ -3534,6 +3803,21 @@ def validate_actor_condition_sidecar_pair(
         "reward_mode",
         "num_critics",
         "normalization",
+        "num_alternatives",
+        "relative_q_low_rank",
+        "relative_q_high_rank",
+        "rank_formula",
+        "rank_comparison",
+        "rank_threshold_comparison",
+        "proposal_actor_source",
+        "proposal_scheduler",
+        "proposal_seed",
+        "proposal_rng_scheme",
+        "proposal_action_transform",
+        "candidate_batch_size",
+        "actor_observation_horizon",
+        "proposal_action_horizon",
+        "action_mask_policy",
     )
     mismatched = [
         field
@@ -8194,6 +8478,22 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         actor_algo.algo_config.horizon.prediction_horizon
     )
     args.actor_action_horizon = actor_horizon
+    if str(args.actor_condition_mode) == "relative_q":
+        sidecar_config = actor_condition_sidecar["config"]
+        if int(sidecar_config["actor_observation_horizon"]) != int(
+            args.observation_horizon
+        ):
+            raise ValueError(
+                "relative_q sidecar actor observation horizon does not match "
+                "the pretrained DP"
+            )
+        if int(sidecar_config["proposal_action_horizon"]) != int(
+            args.actor_action_horizon
+        ):
+            raise ValueError(
+                "relative_q sidecar proposal action horizon does not match "
+                "the pretrained DP"
+            )
     chunk_reference_state = (
         source_for_warm_start or resume_state
     )
@@ -10529,8 +10829,9 @@ def make_parser() -> argparse.ArgumentParser:
         help=(
             "human_only uses human=1 and all rollouts=0; human_success uses "
             "human and successful rollouts=1 and failure rollouts=0; "
-            "critic_advantage and critic_q gather thresholded labels and null "
-            "masks from --actor-condition-labels by stable dataset index"
+            "critic_advantage, critic_q, and relative_q gather thresholded "
+            "labels and null masks from --actor-condition-labels by stable "
+            "dataset index"
         ),
     )
     parser.add_argument(
@@ -10539,7 +10840,7 @@ def make_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Immutable rgb_dp_chunk_critic_conditions_v1 sidecar required by "
-            "critic_advantage and critic_q actor conditioning."
+            "critic_advantage, critic_q, and relative_q actor conditioning."
         ),
     )
     parser.add_argument(

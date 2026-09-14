@@ -5,6 +5,7 @@ from typing import Callable, Union
 from copy import deepcopy
 from collections import OrderedDict, deque
 import math
+import operator
 from packaging.version import parse as parse_version
 import torch
 import torch.nn as nn
@@ -14,6 +15,149 @@ import torch.nn.functional as F
 from robomimic.utils.safe_diffusers import load_diffusers_components
 
 DDPMScheduler, DDIMScheduler, EMAModel = load_diffusers_components()
+
+
+# Proposal RNG streams must not change when a caller changes DataLoader batching
+# or the number of action trajectories denoised at once. Keep this name stable
+# and persist it with any artifact whose proposals are produced by
+# ``sample_deterministic_action_trajectory_candidates``.
+DETERMINISTIC_DP_PROPOSAL_RNG_SCHEME = (
+    "splitmix64_per_row_candidate_torch_cpu_normal_v1"
+)
+_UINT64_MASK = (1 << 64) - 1
+_TORCH_SEED_MASK = (1 << 63) - 1
+
+
+def _splitmix64(value):
+    """Mix one integer into a stable unsigned 64-bit value."""
+
+    value = (int(value) + 0x9E3779B97F4A7C15) & _UINT64_MASK
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _UINT64_MASK
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _UINT64_MASK
+    return (value ^ (value >> 31)) & _UINT64_MASK
+
+
+def deterministic_dp_proposal_seed(seed, rng_namespace, row_id, candidate_index):
+    """Return the private torch seed for one stable row / candidate pair.
+
+    Python's randomized ``hash`` is deliberately avoided.  All inputs are
+    folded through SplitMix64, making the stream independent of row order and
+    candidate microbatching.  Noise within the stream is laid out as initial
+    diffusion noise followed by one transition-noise tensor per scheduler step.
+    """
+
+    values = (seed, rng_namespace, row_id, candidate_index)
+    if any(isinstance(value, bool) for value in values):
+        raise ValueError("deterministic proposal seed components must be integers")
+    try:
+        normalized = tuple(operator.index(value) for value in values)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "deterministic proposal seed components must be integers"
+        ) from exc
+    if normalized[2] < 0 or normalized[3] < 0:
+        raise ValueError("row_id and candidate_index must be nonnegative")
+
+    mixed = 0xD1B54A32D192ED03
+    for value in normalized:
+        mixed = _splitmix64(mixed ^ _splitmix64(value & _UINT64_MASK))
+    # ``torch.Generator.manual_seed`` accepts a signed 64-bit seed. Avoid the
+    # negative remapping path so the persisted seed has one unambiguous meaning.
+    return mixed & _TORCH_SEED_MASK
+
+
+def _ddpm_step_with_variance_noise(
+    scheduler,
+    *,
+    model_output,
+    timestep,
+    sample,
+    variance_noise,
+):
+    """Mirror diffusers 0.11.1 DDPM.step with caller-supplied variance noise.
+
+    That pinned scheduler exposes a ``generator`` but not ``variance_noise``.
+    Supplying the realized noise is necessary for samples to remain unchanged
+    when the denoising batch is partitioned differently. This function follows
+    the package implementation exactly, except that it returns only
+    ``prev_sample`` and never touches global RNG state.
+    """
+
+    if not isinstance(scheduler, DDPMScheduler):
+        raise TypeError("external DDPM variance noise requires DDPMScheduler")
+    t = int(timestep.item()) if isinstance(timestep, torch.Tensor) else int(timestep)
+    if model_output.shape[1] == sample.shape[1] * 2 and scheduler.variance_type in (
+        "learned",
+        "learned_range",
+    ):
+        model_output, predicted_variance = torch.split(
+            model_output, sample.shape[1], dim=1
+        )
+    else:
+        predicted_variance = None
+
+    def scalar(value):
+        return torch.as_tensor(value, device=sample.device, dtype=sample.dtype)
+
+    alpha_prod_t = scalar(scheduler.alphas_cumprod[t])
+    alpha_prod_t_prev = scalar(
+        scheduler.alphas_cumprod[t - 1] if t > 0 else scheduler.one
+    )
+    beta_prod_t = 1 - alpha_prod_t
+    beta_prod_t_prev = 1 - alpha_prod_t_prev
+
+    prediction_type = scheduler.config.prediction_type
+    if prediction_type == "epsilon":
+        pred_original_sample = (
+            sample - beta_prod_t.sqrt() * model_output
+        ) / alpha_prod_t.sqrt()
+    elif prediction_type == "sample":
+        pred_original_sample = model_output
+    elif prediction_type == "v_prediction":
+        pred_original_sample = (
+            alpha_prod_t.sqrt() * sample - beta_prod_t.sqrt() * model_output
+        )
+    else:
+        raise ValueError(
+            "unsupported DDPM prediction_type="
+            f"{prediction_type!r}; expected epsilon, sample, or v_prediction"
+        )
+
+    if scheduler.config.clip_sample:
+        pred_original_sample = pred_original_sample.clamp(-1, 1)
+
+    pred_original_sample_coeff = (
+        alpha_prod_t_prev.sqrt() * scalar(scheduler.betas[t]) / beta_prod_t
+    )
+    current_sample_coeff = (
+        scalar(scheduler.alphas[t]).sqrt() * beta_prod_t_prev / beta_prod_t
+    )
+    pred_prev_sample = (
+        pred_original_sample_coeff * pred_original_sample
+        + current_sample_coeff * sample
+    )
+
+    if t > 0:
+        if variance_noise is None or variance_noise.shape != pred_prev_sample.shape:
+            got = None if variance_noise is None else tuple(variance_noise.shape)
+            raise ValueError(
+                "DDPM variance_noise must match the denoising sample: "
+                f"{got} != {tuple(pred_prev_sample.shape)}"
+            )
+        variance = scheduler._get_variance(
+            t,
+            predicted_variance=predicted_variance,
+        )
+        variance = torch.as_tensor(
+            variance,
+            device=pred_prev_sample.device,
+            dtype=pred_prev_sample.dtype,
+        )
+        if scheduler.variance_type == "fixed_small_log":
+            pred_prev_sample = pred_prev_sample + variance * variance_noise
+        else:
+            pred_prev_sample = pred_prev_sample + variance.sqrt() * variance_noise
+    return pred_prev_sample
 
 import robomimic.models.obs_nets as ObsNets
 import robomimic.models.diffusion_policy_nets as DPNets
@@ -1628,6 +1772,266 @@ class DiffusionPolicyUNet(PolicyAlgo):
         # [1,Da]
         action = action.unsqueeze(0)
         return action
+
+    @torch.no_grad()
+    def sample_deterministic_action_trajectory_candidates(
+        self,
+        obs_dict,
+        *,
+        row_ids,
+        num_candidates,
+        candidate_batch_size,
+        seed,
+        goal_dict=None,
+        rng_namespace=0,
+    ):
+        """Sample reproducible frozen-DP action candidates for batched states.
+
+        Args:
+            obs_dict (dict): actor observation histories with leading shape
+                ``[B, observation_horizon, ...]`` (the time axis may be omitted
+                only when the configured observation horizon is one).
+            row_ids (sequence): stable nonnegative dataset index for every row.
+            num_candidates (int): number of independent samples per state.
+            candidate_batch_size (int): maximum flattened trajectories sent
+                through the denoiser at once.
+            seed (int): global proposal seed.
+            goal_dict (dict): optional goal observations.
+            rng_namespace (int): caller-controlled stream namespace, useful for
+                separating datasets that reuse the same integer row indices.
+
+        Returns:
+            Tensor ``[B, M, action_horizon, action_dim]`` in the policy's
+            normalized action space.
+
+        The deployed EMA weights are used when present. Observation RGB is
+        encoded once for the B states, after which only the compact condition is
+        repeated. Each row/candidate owns a private CPU generator; its complete
+        initial and DDPM transition-noise schedule is realized before denoising,
+        so proposal RNG does not depend on row order or candidate microbatching.
+        As with any neural-network inference, exact floating-point outputs can
+        still depend on the hardware and backend kernels. The method is opt-in
+        and leaves ``_get_action_trajectory`` unchanged.
+        """
+
+        for value, name in (
+            (num_candidates, "num_candidates"),
+            (candidate_batch_size, "candidate_batch_size"),
+        ):
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be a positive integer")
+            try:
+                normalized = operator.index(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{name} must be a positive integer") from exc
+            if normalized < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        num_candidates = int(num_candidates)
+        candidate_batch_size = int(candidate_batch_size)
+
+        raw_row_ids = torch.as_tensor(row_ids, device="cpu")
+        if raw_row_ids.ndim != 1:
+            raise ValueError(
+                f"row_ids must be one-dimensional, got {tuple(raw_row_ids.shape)}"
+            )
+        if raw_row_ids.dtype == torch.bool:
+            raise ValueError("row_ids must contain nonnegative integers")
+        if raw_row_ids.is_floating_point():
+            if not torch.isfinite(raw_row_ids).all() or not torch.all(
+                raw_row_ids == raw_row_ids.round()
+            ):
+                raise ValueError("row_ids must contain nonnegative integers")
+        row_ids_tensor = raw_row_ids.to(dtype=torch.long)
+        if torch.any(row_ids_tensor < 0):
+            raise ValueError("row_ids must contain nonnegative integers")
+
+        if self.nets.training:
+            raise RuntimeError(
+                "deterministic action proposals require the DP policy in eval mode"
+            )
+        observation_horizon = int(
+            self.algo_config.horizon.observation_horizon
+        )
+        prediction_horizon = int(self.algo_config.horizon.prediction_horizon)
+        action_horizon = int(self.algo_config.horizon.action_horizon)
+        action_start = observation_horizon - 1
+        action_end = action_start + action_horizon
+        if action_start < 0 or action_end > prediction_horizon:
+            raise ValueError(
+                "configured DP action slice is outside the prediction horizon: "
+                f"[{action_start}:{action_end}] versus {prediction_horizon}"
+            )
+
+        prepared_obs = {}
+        batch_size = None
+        for key, shape in self.obs_shapes.items():
+            if key not in obs_dict:
+                raise KeyError(f"proposal observations are missing key {key!r}")
+            value = obs_dict[key]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"proposal observation {key!r} must be a torch.Tensor"
+                )
+            expected_batched_ndim = len(shape) + 1
+            if value.ndim == expected_batched_ndim:
+                value = value.unsqueeze(1)
+            elif value.ndim != expected_batched_ndim + 1:
+                raise ValueError(
+                    f"proposal observation {key!r} has invalid shape "
+                    f"{tuple(value.shape)}"
+                )
+            if int(value.shape[1]) != observation_horizon:
+                raise ValueError(
+                    f"proposal observation {key!r} has history "
+                    f"{value.shape[1]}, expected {observation_horizon}"
+                )
+            if tuple(value.shape[2:]) != tuple(shape):
+                raise ValueError(
+                    f"proposal observation {key!r} has trailing shape "
+                    f"{tuple(value.shape[2:])}, expected {tuple(shape)}"
+                )
+            if batch_size is None:
+                batch_size = int(value.shape[0])
+            elif int(value.shape[0]) != batch_size:
+                raise ValueError("proposal observation keys have different batches")
+            prepared_obs[key] = value
+        if batch_size is None or batch_size < 1:
+            raise ValueError("proposal sampling requires at least one observation row")
+        if int(row_ids_tensor.numel()) != batch_size:
+            raise ValueError(
+                "row_ids batch does not match proposal observations: "
+                f"{row_ids_tensor.numel()} != {batch_size}"
+            )
+
+        # Match rollout deployment exactly: EMA when available, otherwise the
+        # ordinary policy nets. Labeling callers freeze both before invoking us.
+        nets = self.nets if self.ema is None else self.ema.averaged_model
+        inputs = {"obs": prepared_obs, "goal": goal_dict}
+        obs_cond = self._encode_obs(inputs, nets)
+        if int(obs_cond.shape[0]) != batch_size:
+            raise ValueError("DP observation encoder changed the proposal batch size")
+        obs_cond, _ = self._apply_success_condition(
+            obs_cond,
+            nets=nets,
+            success_condition=torch.full(
+                (batch_size,),
+                float(self.inference_success_condition),
+                device=self.device,
+            ),
+            condition_mask=torch.full(
+                (batch_size,),
+                float(self.inference_success_condition_mask),
+                device=self.device,
+            ),
+            validate=True,
+        )
+
+        if self.algo_config.ddpm.enabled is True:
+            if not isinstance(self.noise_scheduler, DDPMScheduler):
+                raise RuntimeError("DDPM config does not use DDPMScheduler")
+            scheduler_kind = "ddpm"
+            num_inference_timesteps = int(
+                self.algo_config.ddpm.num_inference_timesteps
+            )
+        elif self.algo_config.ddim.enabled is True:
+            if not isinstance(self.noise_scheduler, DDIMScheduler):
+                raise RuntimeError("DDIM config does not use DDIMScheduler")
+            scheduler_kind = "ddim"
+            num_inference_timesteps = int(
+                self.algo_config.ddim.num_inference_timesteps
+            )
+        else:
+            raise ValueError("DP policy enables neither DDPM nor DDIM")
+        if num_inference_timesteps < 1:
+            raise ValueError("DP inference timestep count must be positive")
+        self.noise_scheduler.set_timesteps(num_inference_timesteps)
+        timesteps = tuple(self.noise_scheduler.timesteps)
+        if not timesteps:
+            raise RuntimeError("DP scheduler produced no inference timesteps")
+
+        total_candidates = batch_size * num_candidates
+        flat_results = []
+        for flat_start in range(0, total_candidates, candidate_batch_size):
+            flat_end = min(flat_start + candidate_batch_size, total_candidates)
+            flat_positions = range(flat_start, flat_end)
+            row_offsets = [position // num_candidates for position in flat_positions]
+            candidate_offsets = [
+                position % num_candidates for position in range(flat_start, flat_end)
+            ]
+            condition_indices = torch.as_tensor(
+                row_offsets,
+                device=obs_cond.device,
+                dtype=torch.long,
+            )
+            candidate_condition = obs_cond.index_select(0, condition_indices)
+
+            # One private generator and one fixed-size draw per logical sample.
+            # Drawing the whole schedule in one operation is substantially
+            # faster than reseeding once per diffusion step.
+            draw_count = 1 + (len(timesteps) if scheduler_kind == "ddpm" else 0)
+            noise_schedules = []
+            for row_offset, candidate_offset in zip(
+                row_offsets, candidate_offsets
+            ):
+                private_generator = torch.Generator(device="cpu")
+                private_generator.manual_seed(
+                    deterministic_dp_proposal_seed(
+                        seed,
+                        rng_namespace,
+                        int(row_ids_tensor[row_offset]),
+                        candidate_offset,
+                    )
+                )
+                noise_schedules.append(
+                    torch.randn(
+                        (
+                            draw_count,
+                            prediction_horizon,
+                            int(self.ac_dim),
+                        ),
+                        generator=private_generator,
+                        device="cpu",
+                        dtype=torch.float32,
+                    )
+                )
+            schedule_noise = torch.stack(noise_schedules, dim=0).to(
+                device=self.device,
+                dtype=obs_cond.dtype,
+            )
+            trajectory = schedule_noise[:, 0]
+            transition_noise = schedule_noise[:, 1:]
+
+            for step_index, timestep in enumerate(timesteps):
+                noise_pred = nets["policy"]["noise_pred_net"](
+                    sample=trajectory,
+                    timestep=timestep,
+                    global_cond=candidate_condition,
+                )
+                if scheduler_kind == "ddpm":
+                    trajectory = _ddpm_step_with_variance_noise(
+                        self.noise_scheduler,
+                        model_output=noise_pred,
+                        timestep=timestep,
+                        sample=trajectory,
+                        variance_noise=transition_noise[:, step_index],
+                    )
+                else:
+                    # This exactly matches the deployed `_get_action_trajectory`
+                    # default: DDIM eta=0, hence no scheduler transition noise.
+                    trajectory = self.noise_scheduler.step(
+                        model_output=noise_pred,
+                        timestep=timestep,
+                        sample=trajectory,
+                        eta=0.0,
+                    ).prev_sample
+            flat_results.append(trajectory[:, action_start:action_end])
+
+        return torch.cat(flat_results, dim=0).reshape(
+            batch_size,
+            num_candidates,
+            action_horizon,
+            int(self.ac_dim),
+        )
         
     def _get_action_trajectory(self, obs_dict, goal_dict=None):
         assert not self.nets.training

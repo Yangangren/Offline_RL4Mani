@@ -28,6 +28,7 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.lines import Line2D
 from torch.utils.data import DataLoader
 
 import robomimic.utils.file_utils as FileUtils
@@ -1090,6 +1091,98 @@ def plot_histogram(
     return paths, display_range
 
 
+def plot_q_vs_v_scatter(
+    success_value: np.ndarray,
+    success_q: np.ndarray,
+    failure_value: np.ndarray,
+    failure_q: np.ndarray,
+    figure_dir: Path,
+    stem: str,
+) -> list[Path]:
+    """Plot every rollout chunk in Q-versus-V space."""
+    configure_plot_style()
+    fig, ax = plt.subplots(figsize=(4.8, 4.25), constrained_layout=True)
+
+    ax.scatter(
+        success_value,
+        success_q,
+        s=10.0,
+        marker="o",
+        facecolor=COLORS["success"],
+        edgecolor="none",
+        alpha=0.16,
+        rasterized=True,
+        zorder=2,
+    )
+    ax.scatter(
+        failure_value,
+        failure_q,
+        s=12.0,
+        marker="^",
+        facecolor=COLORS["failure"],
+        edgecolor="none",
+        alpha=0.19,
+        rasterized=True,
+        zorder=2.1,
+    )
+
+    pooled_values = np.concatenate((success_value, failure_value))
+    pooled_q = np.concatenate((success_q, failure_q))
+    lower = float(min(np.min(pooled_values), np.min(pooled_q)))
+    upper = float(max(np.max(pooled_values), np.max(pooled_q)))
+    margin = max(0.035 * (upper - lower), 1e-6)
+    lower -= margin
+    upper += margin
+    ax.plot(
+        (lower, upper),
+        (lower, upper),
+        color="#555555",
+        linestyle="--",
+        linewidth=1.1,
+        zorder=1,
+    )
+
+    ax.set_xlabel("Value function")
+    ax.set_ylabel("Q-function")
+    ax.set_xlim(lower, upper)
+    ax.set_ylim(lower, upper)
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(
+        handles=(
+            Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker="o",
+                markersize=7.0,
+                markerfacecolor=COLORS["success"],
+                markeredgecolor="none",
+                label="Success",
+            ),
+            Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker="^",
+                markersize=7.5,
+                markerfacecolor=COLORS["failure"],
+                markeredgecolor="none",
+                label="Failure",
+            ),
+        ),
+        frameon=False,
+        loc="upper left",
+    )
+    style_axis(ax)
+
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    paths = [figure_dir / f"{stem}.pdf", figure_dir / f"{stem}.png"]
+    fig.savefig(paths[0], bbox_inches="tight", pad_inches=0.01)
+    fig.savefig(paths[1], dpi=600, bbox_inches="tight", pad_inches=0.01)
+    plt.close(fig)
+    return paths
+
+
 def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
     arrays = load_cached_arrays(args.output_dir)
     success_mask = arrays["label"] == 1
@@ -1179,6 +1272,15 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
         show_sample_counts=False,
     )
     paths.extend(value_violin_paths)
+    q_vs_v_paths = plot_q_vs_v_scatter(
+        success_value,
+        success_q_min,
+        failure_value,
+        failure_q_min,
+        args.figure_dir,
+        f"{args.task}_chunk_q_vs_v_scatter",
+    )
+    paths.extend(q_vs_v_paths)
 
     metadata = None
     summary_path = args.output_dir / "summary.json"

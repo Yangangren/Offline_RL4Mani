@@ -361,8 +361,12 @@ case "$CHUNK_ACTOR_CONDITION_MODE" in
     DATASET_ACTOR_CONDITION_MODE=human_success
     ACTOR_CONDITION_DESCRIPTION="human=1 rollout=thresholded_min_Q middle=null"
     ;;
+  relative_q)
+    DATASET_ACTOR_CONDITION_MODE=human_success
+    ACTOR_CONDITION_DESCRIPTION="human=1 rollout=state_relative_Q_rank middle=null"
+    ;;
   *)
-    echo "Unsupported CHUNK_ACTOR_CONDITION_MODE=$CHUNK_ACTOR_CONDITION_MODE; use human_only, human_success, critic_advantage, or critic_q." >&2
+    echo "Unsupported CHUNK_ACTOR_CONDITION_MODE=$CHUNK_ACTOR_CONDITION_MODE; use human_only, human_success, critic_advantage, critic_q, or relative_q." >&2
     exit 2
     ;;
 esac
@@ -429,7 +433,7 @@ if [[ "$DATASET_ACTOR_CONDITION_MODE" == "human_success" ]]; then
   DEFAULT_CHUNK_EVAL_OUTPUT=${DEFAULT_CHUNK_EVAL_OUTPUT/human_condition/$condition_path_tag}
   DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT/human_condition/$condition_path_tag}
 fi
-if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "critic_advantage" || "$CHUNK_ACTOR_CONDITION_MODE" == "critic_q" ]]; then
+if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "critic_advantage" || "$CHUNK_ACTOR_CONDITION_MODE" == "critic_q" || "$CHUNK_ACTOR_CONDITION_MODE" == "relative_q" ]]; then
   condition_path_tag=${CHUNK_ACTOR_CONDITION_MODE}_condition
   DEFAULT_CHUNK_IDQL_OUTPUT_DIR=${DEFAULT_CHUNK_IDQL_OUTPUT_DIR/human_success_condition/$condition_path_tag}
   DEFAULT_CHUNK_EVAL_OUTPUT=${DEFAULT_CHUNK_EVAL_OUTPUT/human_success_condition/$condition_path_tag}
@@ -456,9 +460,30 @@ IDQL_CHECKPOINT=${IDQL_CHECKPOINT:-$IDQL_OUTPUT_DIR/last.pt}
 SOURCE_IDQL_CHECKPOINT=${SOURCE_IDQL_CHECKPOINT:-$IDQL_CHECKPOINT}
 SOURCE_CHUNK_IDQL_CHECKPOINT=${SOURCE_CHUNK_IDQL_CHECKPOINT:-$TASK_SOURCE_CHUNK_IDQL_CHECKPOINT}
 CHUNK_IDQL_OUTPUT_DIR=${CHUNK_IDQL_OUTPUT_DIR:-$DEFAULT_CHUNK_IDQL_OUTPUT_DIR}
-CHUNK_INITIALIZATION=${CHUNK_INITIALIZATION:-$TASK_CHUNK_INITIALIZATION}
 CHUNK_CONDITIONED_ACTOR=${CHUNK_CONDITIONED_ACTOR:-1}
-TRAIN_ACTOR_ONLY=${TRAIN_ACTOR_ONLY:-0}
+if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "relative_q" ]]; then
+  # Relative-Q labels are computed with the frozen base DP. Post-training must
+  # therefore start from that exact DP and update only its conditional actor.
+  CHUNK_INITIALIZATION=${CHUNK_INITIALIZATION:-pretrained_dp_joint}
+  TRAIN_ACTOR_ONLY=${TRAIN_ACTOR_ONLY:-1}
+else
+  CHUNK_INITIALIZATION=${CHUNK_INITIALIZATION:-$TASK_CHUNK_INITIALIZATION}
+  TRAIN_ACTOR_ONLY=${TRAIN_ACTOR_ONLY:-0}
+fi
+# The relative-Q stage has no trainable critic or dynamics model. Canonicalize
+# the otherwise task-default RISE-v2 auxiliary settings so ignored knobs cannot
+# reject or misleadingly tag an actor-only run.
+if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "relative_q" && "$CHUNK_CRITIC_ARCHITECTURE" == "rise_temporal_v2" ]]; then
+  CHUNK_DYNAMICS_OFFSETS_PRESET=off
+  CHUNK_DYNAMICS_OFFSET_SAMPLING=all
+  CHUNK_DYNAMICS_PREDICTION_OFFSETS=
+  CHUNK_RISE_V2_DENSE_DYNAMICS=0
+  DYNAMICS_WEIGHT=0
+  DYNAMICS_COSINE_WEIGHT=0
+  USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET=
+  USER_CHUNK_DYNAMICS_OFFSET_SAMPLING_SET=
+  USER_DYNAMICS_WEIGHT_SET=
+fi
 CHUNK_RISE_V2_FUSION_MODE=${CHUNK_RISE_V2_FUSION_MODE:-film}
 CHUNK_HORIZON=${CHUNK_HORIZON:-8}
 if [[ ! "$CHUNK_HORIZON" =~ ^[1-9][0-9]*$ ]]; then
@@ -681,7 +706,7 @@ if [[ "$CHUNK_DYNAMICS_OFFSETS_PRESET" == "custom" ]]; then
   chunk_dynamics_output_tag=offsets${CHUNK_DYNAMICS_PREDICTION_OFFSETS// /_}
 elif [[ "$CHUNK_DYNAMICS_OFFSETS_PRESET" == "random" ]]; then
   chunk_dynamics_output_tag=random
-elif [[ "$CHUNK_DYNAMICS_OFFSETS_PRESET" != "configured" ]]; then
+elif [[ "$CHUNK_DYNAMICS_OFFSETS_PRESET" != "configured" && "$CHUNK_ACTOR_CONDITION_MODE" != "relative_q" ]]; then
   chunk_dynamics_output_tag=${CHUNK_DYNAMICS_OFFSETS_PRESET/stride2/even}
 elif [[ -n "$USER_CHUNK_DYNAMICS_PREDICTION_OFFSETS_SET" ]]; then
   chunk_dynamics_output_tag=offsets${CHUNK_DYNAMICS_PREDICTION_OFFSETS// /_}
@@ -865,7 +890,7 @@ if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
     round2_output_base=${round2_output_base/human_condition/human_success_condition}
     round2_eval_base=${round2_eval_base/human_condition/human_success_condition}
   fi
-  if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "critic_advantage" || "$CHUNK_ACTOR_CONDITION_MODE" == "critic_q" ]]; then
+  if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "critic_advantage" || "$CHUNK_ACTOR_CONDITION_MODE" == "critic_q" || "$CHUNK_ACTOR_CONDITION_MODE" == "relative_q" ]]; then
     round2_condition_path_tag=${CHUNK_ACTOR_CONDITION_MODE}_condition
     round2_output_base=${round2_output_base/human_success_condition/$round2_condition_path_tag}
     round2_eval_base=${round2_eval_base/human_success_condition/$round2_condition_path_tag}
@@ -938,6 +963,10 @@ CHUNK_CONDITION_HIGH_QUANTILE=${CHUNK_CONDITION_HIGH_QUANTILE:-0.8}
 CHUNK_CONDITION_TARGET_PURITY=${CHUNK_CONDITION_TARGET_PURITY:-0.9}
 CHUNK_CONDITION_MIN_TAIL_COUNT=${CHUNK_CONDITION_MIN_TAIL_COUNT:-32}
 CHUNK_CONDITION_BATCH_SIZE=${CHUNK_CONDITION_BATCH_SIZE:-${CHUNK_BATCH_SIZE:-${BATCH_SIZE:-100}}}
+CHUNK_RELATIVE_Q_NUM_ALTERNATIVES=${CHUNK_RELATIVE_Q_NUM_ALTERNATIVES:-32}
+CHUNK_RELATIVE_Q_LOW_RANK=${CHUNK_RELATIVE_Q_LOW_RANK:-0.2}
+CHUNK_RELATIVE_Q_HIGH_RANK=${CHUNK_RELATIVE_Q_HIGH_RANK:-0.8}
+CHUNK_RELATIVE_Q_CANDIDATE_BATCH_SIZE=${CHUNK_RELATIVE_Q_CANDIDATE_BATCH_SIZE:-$CHUNK_CONDITION_BATCH_SIZE}
 CHUNK_CONDITION_NUM_WORKERS=${CHUNK_CONDITION_NUM_WORKERS:-${CHUNK_NUM_WORKERS:-${NUM_WORKERS:-6}}}
 CHUNK_CONDITION_PREFETCH_FACTOR=${CHUNK_CONDITION_PREFETCH_FACTOR:-${CHUNK_PREFETCH_FACTOR:-${PREFETCH_FACTOR:-2}}}
 CHUNK_CONDITION_HDF5_CACHE_MODE=${CHUNK_CONDITION_HDF5_CACHE_MODE:-low_dim}
@@ -1203,6 +1232,16 @@ case "${CHUNK_ALLOW_SINGLE_CONDITION_CLASS:-0}" in
     ;;
 esac
 TRAIN_ACTOR_ONLY_ARG=--no-actor-only
+if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "relative_q" ]]; then
+  if [[ "$TRAIN_ACTOR_ONLY" != "1" ]]; then
+    echo "CHUNK_ACTOR_CONDITION_MODE=relative_q requires TRAIN_ACTOR_ONLY=1." >&2
+    exit 2
+  fi
+  if [[ "$CHUNK_INITIALIZATION" != "pretrained_dp_joint" ]]; then
+    echo "CHUNK_ACTOR_CONDITION_MODE=relative_q requires CHUNK_INITIALIZATION=pretrained_dp_joint." >&2
+    exit 2
+  fi
+fi
 case "$TRAIN_ACTOR_ONLY" in
   0)
     ;;
@@ -1540,7 +1579,7 @@ ensure_dataset() {
 }
 
 is_critic_actor_condition_mode() {
-  [[ "$CHUNK_ACTOR_CONDITION_MODE" == "critic_advantage" || "$CHUNK_ACTOR_CONDITION_MODE" == "critic_q" ]]
+  [[ "$CHUNK_ACTOR_CONDITION_MODE" == "critic_advantage" || "$CHUNK_ACTOR_CONDITION_MODE" == "critic_q" || "$CHUNK_ACTOR_CONDITION_MODE" == "relative_q" ]]
 }
 
 require_chunk_actor_condition_labels() {
@@ -1566,7 +1605,7 @@ label_chunk_actor_conditions() {
   local labels_parent=${CHUNK_ACTOR_CONDITION_LABELS%/*}
   local validation_labels_parent=
   if ! is_critic_actor_condition_mode; then
-    echo "label_chunk_actor_conditions requires CHUNK_ACTOR_CONDITION_MODE=critic_advantage or critic_q." >&2
+    echo "label_chunk_actor_conditions requires CHUNK_ACTOR_CONDITION_MODE=critic_advantage, critic_q, or relative_q." >&2
     exit 2
   fi
   if [[ -z "$CHUNK_CONDITION_CRITIC_CHECKPOINT" ]]; then
@@ -1600,34 +1639,46 @@ label_chunk_actor_conditions() {
       --validation-output "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS"
     )
   fi
-  case "$CHUNK_CONDITION_THRESHOLD_MODE" in
-    fixed)
-      if [[ -z "$CHUNK_CONDITION_LOW_THRESHOLD" || -z "$CHUNK_CONDITION_HIGH_THRESHOLD" ]]; then
-        echo "CHUNK_CONDITION_THRESHOLD_MODE=fixed requires CHUNK_CONDITION_LOW_THRESHOLD and CHUNK_CONDITION_HIGH_THRESHOLD." >&2
+  if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "relative_q" ]]; then
+    threshold_args=(
+      --num-alternatives "$CHUNK_RELATIVE_Q_NUM_ALTERNATIVES"
+      --relative-q-low-rank "$CHUNK_RELATIVE_Q_LOW_RANK"
+      --relative-q-high-rank "$CHUNK_RELATIVE_Q_HIGH_RANK"
+      --candidate-batch-size "$CHUNK_RELATIVE_Q_CANDIDATE_BATCH_SIZE"
+    )
+  else
+    case "$CHUNK_CONDITION_THRESHOLD_MODE" in
+      fixed)
+        if [[ -z "$CHUNK_CONDITION_LOW_THRESHOLD" || -z "$CHUNK_CONDITION_HIGH_THRESHOLD" ]]; then
+          echo "CHUNK_CONDITION_THRESHOLD_MODE=fixed requires CHUNK_CONDITION_LOW_THRESHOLD and CHUNK_CONDITION_HIGH_THRESHOLD." >&2
+          exit 2
+        fi
+        threshold_args=(
+          --threshold-mode "$CHUNK_CONDITION_THRESHOLD_MODE"
+          --low-threshold "$CHUNK_CONDITION_LOW_THRESHOLD"
+          --high-threshold "$CHUNK_CONDITION_HIGH_THRESHOLD"
+        )
+        ;;
+      quantile)
+        threshold_args=(
+          --threshold-mode "$CHUNK_CONDITION_THRESHOLD_MODE"
+          --low-quantile "$CHUNK_CONDITION_LOW_QUANTILE"
+          --high-quantile "$CHUNK_CONDITION_HIGH_QUANTILE"
+        )
+        ;;
+      outcome_purity)
+        threshold_args=(
+          --threshold-mode "$CHUNK_CONDITION_THRESHOLD_MODE"
+          --target-purity "$CHUNK_CONDITION_TARGET_PURITY"
+          --min-tail-count "$CHUNK_CONDITION_MIN_TAIL_COUNT"
+        )
+        ;;
+      *)
+        echo "CHUNK_CONDITION_THRESHOLD_MODE must be fixed, quantile, or outcome_purity; got '$CHUNK_CONDITION_THRESHOLD_MODE'." >&2
         exit 2
-      fi
-      threshold_args=(
-        --low-threshold "$CHUNK_CONDITION_LOW_THRESHOLD"
-        --high-threshold "$CHUNK_CONDITION_HIGH_THRESHOLD"
-      )
-      ;;
-    quantile)
-      threshold_args=(
-        --low-quantile "$CHUNK_CONDITION_LOW_QUANTILE"
-        --high-quantile "$CHUNK_CONDITION_HIGH_QUANTILE"
-      )
-      ;;
-    outcome_purity)
-      threshold_args=(
-        --target-purity "$CHUNK_CONDITION_TARGET_PURITY"
-        --min-tail-count "$CHUNK_CONDITION_MIN_TAIL_COUNT"
-      )
-      ;;
-    *)
-      echo "CHUNK_CONDITION_THRESHOLD_MODE must be fixed, quantile, or outcome_purity; got '$CHUNK_CONDITION_THRESHOLD_MODE'." >&2
-      exit 2
-      ;;
-  esac
+        ;;
+    esac
+  fi
   case "$CHUNK_CONDITION_OVERWRITE" in
     0)
       ;;
@@ -1648,7 +1699,11 @@ label_chunk_actor_conditions() {
       mkdir -p "$validation_labels_parent"
     fi
   fi
-  echo "[rgb_dp_chunk_idql task=$TASK] labeling actor conditions: mode=$CHUNK_ACTOR_CONDITION_MODE critic=$CHUNK_CONDITION_CRITIC_CHECKPOINT source=$CHUNK_CONDITION_CRITIC_SOURCE thresholds=$CHUNK_CONDITION_THRESHOLD_MODE" >&2
+  if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "relative_q" ]]; then
+    echo "[rgb_dp_chunk_idql task=$TASK] labeling actor conditions: mode=$CHUNK_ACTOR_CONDITION_MODE critic=$CHUNK_CONDITION_CRITIC_CHECKPOINT source=$CHUNK_CONDITION_CRITIC_SOURCE thresholds=fixed_rank low_rank=$CHUNK_RELATIVE_Q_LOW_RANK high_rank=$CHUNK_RELATIVE_Q_HIGH_RANK alternatives=$CHUNK_RELATIVE_Q_NUM_ALTERNATIVES" >&2
+  else
+    echo "[rgb_dp_chunk_idql task=$TASK] labeling actor conditions: mode=$CHUNK_ACTOR_CONDITION_MODE critic=$CHUNK_CONDITION_CRITIC_CHECKPOINT source=$CHUNK_CONDITION_CRITIC_SOURCE thresholds=$CHUNK_CONDITION_THRESHOLD_MODE" >&2
+  fi
   "$PYTHON" -B scripts/label_rgb_dp_chunk_critic_conditions.py \
     --task "$TASK" \
     --dataset "$IDQL_DATASET" \
@@ -1658,7 +1713,6 @@ label_chunk_actor_conditions() {
     --critic-source "$CHUNK_CONDITION_CRITIC_SOURCE" \
     --condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
     --output "$CHUNK_ACTOR_CONDITION_LABELS" \
-    --threshold-mode "$CHUNK_CONDITION_THRESHOLD_MODE" \
     "${threshold_args[@]}" \
     --batch-size "$CHUNK_CONDITION_BATCH_SIZE" \
     --num-workers "$CHUNK_CONDITION_NUM_WORKERS" \
@@ -2186,7 +2240,17 @@ case "$STAGE" in
   eval_chunk_grid_resilient)
     require_simulation_stage_task "$STAGE"
     require_chunk_checkpoint
-    read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-4 8 12 16}"
+    if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "relative_q" ]]; then
+      read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-1}"
+      for candidate_count in "${candidate_args[@]}"; do
+        if [[ "$candidate_count" != "1" ]]; then
+          echo "relative_q actor-only checkpoints have no critic; EVAL_NUM_CANDIDATES must be 1." >&2
+          exit 2
+        fi
+      done
+    else
+      read -r -a candidate_args <<< "${EVAL_NUM_CANDIDATES:-4 8 12 16}"
+    fi
     read -r -a seed_args <<< "${EVAL_SEEDS:-0 1 2 3 4}"
     "$PYTHON" -B scripts/run_rgb_dp_idql_eval_grid.py \
       --idql-checkpoint "$CHUNK_IDQL_CHECKPOINT" \

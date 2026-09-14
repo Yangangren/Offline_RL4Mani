@@ -5,7 +5,7 @@ This script consumes the candidate cache written by
 ``visualize_chunk_candidate_selection.py``.  For every requested chunk
 boundary, it restores the recorded MuJoCo state, renders a sharp camera image,
 and projects all cumulative end-effector displacement proposals into the image.
-The conservative-Q argmax is emphasized and annotated.
+The conservative-Q argmax and argmin are emphasized and annotated.
 
 The projected curves are integrated OSC position commands. They visualize the
 actor's proposed action chunks; they are not simulated future trajectories.
@@ -41,6 +41,7 @@ from visualize_chunk_candidate_selection import (
 
 
 SELECTED_COLOR = "#E90A11"
+MINIMUM_COLOR = "#D97706"
 START_COLOR = "#2F2F2F"
 VIEW_LABEL_COLOR = "#0000FF"
 CANDIDATE_LINESTYLE = (0, (5.0, 3.0))
@@ -313,7 +314,13 @@ def choose_q_label_position(
     projected_paths: list[tuple[np.ndarray, np.ndarray]],
     selected: int,
     endpoint: np.ndarray,
-) -> tuple[tuple[float, float], str, str]:
+    reserved_rectangles: tuple[tuple[float, float, float, float], ...] = (),
+) -> tuple[
+    tuple[float, float],
+    str,
+    str,
+    tuple[float, float, float, float],
+]:
     """Choose a clear callout location for the Q label, away from action curves."""
     height, width = frame_shape[:2]
     endpoint_normalized = endpoint / np.asarray((width, height), dtype=np.float64)
@@ -323,8 +330,8 @@ def choose_q_label_position(
         horizontal_alignment: str,
         vertical_alignment: str,
     ) -> tuple[float, float, float, float]:
-        text_width = 0.270
-        text_height = 0.105
+        text_width = 0.380
+        text_height = 0.125
         x, y = anchor
         if horizontal_alignment == "left":
             left, right = x, x + text_width
@@ -344,34 +351,22 @@ def choose_q_label_position(
     # for unusually dense projections.
     endpoint_x, endpoint_y = endpoint_normalized
     candidate_specs = (
-        ((endpoint_x + 0.055, endpoint_y), "left", "center"),
-        ((endpoint_x - 0.055, endpoint_y), "right", "center"),
-        ((endpoint_x, endpoint_y - 0.070), "center", "bottom"),
-        ((endpoint_x, endpoint_y + 0.070), "center", "top"),
-        ((endpoint_x + 0.045, endpoint_y - 0.055), "left", "bottom"),
-        ((endpoint_x - 0.045, endpoint_y - 0.055), "right", "bottom"),
-        ((endpoint_x + 0.045, endpoint_y + 0.055), "left", "top"),
-        ((endpoint_x - 0.045, endpoint_y + 0.055), "right", "top"),
+        ((endpoint_x + 0.085, endpoint_y), "left", "center"),
+        ((endpoint_x - 0.085, endpoint_y), "right", "center"),
+        ((endpoint_x, endpoint_y - 0.105), "center", "bottom"),
+        ((endpoint_x, endpoint_y + 0.105), "center", "top"),
+        ((endpoint_x + 0.070, endpoint_y - 0.085), "left", "bottom"),
+        ((endpoint_x - 0.070, endpoint_y - 0.085), "right", "bottom"),
+        ((endpoint_x + 0.070, endpoint_y + 0.085), "left", "top"),
+        ((endpoint_x - 0.070, endpoint_y + 0.085), "right", "top"),
         ((0.965, 0.045), "right", "top"),
+        ((0.035, 0.045), "left", "top"),
         ((0.965, 0.955), "right", "bottom"),
         ((0.035, 0.955), "left", "bottom"),
         ((0.965, 0.520), "right", "center"),
         ((0.035, 0.570), "left", "center"),
         ((0.500, 0.955), "center", "bottom"),
     )
-    reserved_view_label = (0.015, 0.520, 0.020, 0.125)
-
-    def rectangles_overlap(
-        first: tuple[float, ...], second: tuple[float, ...]
-    ) -> bool:
-        left_a, right_a, top_a, bottom_a = first
-        left_b, right_b, top_b, bottom_b = second
-        return not (
-            right_a < left_b
-            or right_b < left_a
-            or bottom_a < top_b
-            or bottom_b < top_a
-        )
 
     candidates = []
     for anchor, horizontal_alignment, vertical_alignment in candidate_specs:
@@ -382,7 +377,6 @@ def choose_q_label_position(
             min(rectangle) < 0.015
             or rectangle[1] > 0.985
             or rectangle[3] > 0.985
-            or rectangles_overlap(rectangle, reserved_view_label)
         ):
             continue
         candidates.append(
@@ -412,6 +406,7 @@ def choose_q_label_position(
         if selected_samples
         else np.empty((0, 2), dtype=np.float64)
     )
+
     def rectangle_hits(points: np.ndarray, rectangle: tuple[float, ...]) -> int:
         if not len(points):
             return 0
@@ -441,8 +436,32 @@ def choose_q_label_position(
         )
         return float(np.min(np.hypot(dx, dy)))
 
+    def rectangles_overlap(
+        first: tuple[float, ...], second: tuple[float, ...]
+    ) -> bool:
+        left_a, right_a, top_a, bottom_a = first
+        left_b, right_b, top_b, bottom_b = second
+        padding = 0.018
+        return not (
+            right_a + padding < left_b
+            or right_b + padding < left_a
+            or bottom_a + padding < top_b
+            or bottom_b + padding < top_a
+        )
+
     def candidate_score(candidate: tuple[Any, ...]) -> tuple[float, ...]:
         anchor, _, _, rectangle = candidate
+        reserved_hits = sum(
+            rectangles_overlap(rectangle, reserved)
+            for reserved in reserved_rectangles
+        )
+        connector_points = np.linspace(
+            np.asarray(anchor), endpoint_normalized, num=64
+        )
+        connector_reserved_hits = sum(
+            rectangle_hits(connector_points, reserved) > 0
+            for reserved in reserved_rectangles
+        )
         selected_hits = rectangle_hits(selected_points, rectangle)
         all_hits = rectangle_hits(all_points, rectangle)
         selected_clearance = rectangle_clearance(selected_points, rectangle)
@@ -450,9 +469,12 @@ def choose_q_label_position(
         connector_length = float(
             np.linalg.norm(endpoint_normalized - np.asarray(anchor))
         )
-        # Lexicographic scoring first avoids the selected red curve, then all
-        # other chunks, then favors greater clearance and a shorter leader.
+        # Lexicographic scoring first avoids the other Q callout, then the
+        # highlighted curve and all other chunks, and finally favors a short
+        # leader with ample clearance.
         return (
+            float(reserved_hits),
+            float(connector_reserved_hits),
             float(selected_hits),
             float(all_hits),
             connector_length,
@@ -460,11 +482,54 @@ def choose_q_label_position(
             -all_clearance,
         )
 
-    anchor, horizontal_alignment, vertical_alignment, _ = min(
+    anchor, horizontal_alignment, vertical_alignment, rectangle = min(
         candidates, key=candidate_score
     )
     position = (anchor[0] * width, anchor[1] * height)
-    return position, horizontal_alignment, vertical_alignment
+    return position, horizontal_alignment, vertical_alignment, rectangle
+
+
+def annotate_q_value(
+    ax: plt.Axes,
+    frame: np.ndarray,
+    projected_paths: list[tuple[np.ndarray, np.ndarray]],
+    candidate: int,
+    endpoint: np.ndarray,
+    label: str,
+    color: str,
+    reserved_rectangles: tuple[tuple[float, float, float, float], ...],
+) -> tuple[float, float, float, float]:
+    label_position, horizontal_alignment, vertical_alignment, rectangle = (
+        choose_q_label_position(
+            frame_shape=frame.shape,
+            projected_paths=projected_paths,
+            selected=candidate,
+            endpoint=endpoint,
+            reserved_rectangles=reserved_rectangles,
+        )
+    )
+    annotation = ax.annotate(
+        label,
+        xy=endpoint,
+        xytext=label_position,
+        textcoords="data",
+        ha=horizontal_alignment,
+        va=vertical_alignment,
+        color=color,
+        fontsize=23.0,
+        fontweight="bold",
+        arrowprops={
+            "arrowstyle": "-",
+            "color": "#202020",
+            "lw": 1.8,
+            "shrinkA": 5,
+            "shrinkB": 9,
+        },
+        annotation_clip=True,
+        zorder=8.0,
+    )
+    annotation.set_clip_on(True)
+    return rectangle
 
 
 def draw_camera_panel(
@@ -481,9 +546,10 @@ def draw_camera_panel(
     ax.set_ylim(frame.shape[0] - 0.5, -0.5)
     ax.set_axis_off()
     colors = q_colors(q_values)
+    minimum = int(np.argmin(q_values))
 
     for candidate in np.argsort(q_values):
-        if int(candidate) == selected:
+        if int(candidate) in (selected, minimum):
             continue
         for pixels, valid in projected_paths:
             draw_projected_path(
@@ -497,6 +563,23 @@ def draw_camera_panel(
                 arrow_scale=12.0,
                 zorder=3.0 + float(candidate) * 0.001,
             )
+
+    minimum_endpoints = []
+    if minimum != selected:
+        for pixels, valid in projected_paths:
+            endpoint = draw_projected_path(
+                ax=ax,
+                pixels=pixels[minimum],
+                valid=valid[minimum],
+                color=MINIMUM_COLOR,
+                linewidth=3.2,
+                alpha=0.96,
+                linestyle=CANDIDATE_LINESTYLE,
+                arrow_scale=15.0,
+                zorder=5.0,
+            )
+            if endpoint is not None:
+                minimum_endpoints.append(endpoint)
 
     selected_endpoints = []
     for pixels, valid in projected_paths:
@@ -525,51 +608,48 @@ def draw_camera_panel(
         if endpoint is not None:
             selected_endpoints.append(endpoint)
 
-    if show_q_label and selected_endpoints:
-        endpoint = selected_endpoints[0]
-        label = f"Q={q_values[selected]:.3f}"
-        label_position, horizontal_alignment, vertical_alignment = (
-            choose_q_label_position(
-                frame_shape=frame.shape,
-                projected_paths=projected_paths,
-                selected=selected,
-                endpoint=endpoint,
-            )
-        )
-        annotation = ax.annotate(
-            label,
-            xy=endpoint,
-            xytext=label_position,
-            textcoords="data",
-            ha=horizontal_alignment,
-            va=vertical_alignment,
-            color=SELECTED_COLOR,
-            fontsize=19.0,
-            fontweight="bold",
-            arrowprops={
-                "arrowstyle": "-",
-                "color": "#202020",
-                "lw": 1.8,
-                "shrinkA": 2,
-                "shrinkB": 3,
-            },
-            annotation_clip=True,
-            zorder=8.0,
-        )
-        annotation.set_clip_on(True)
+    if minimum == selected:
+        minimum_endpoints = selected_endpoints
 
-    ax.text(
-        0.025,
-        0.965,
-        CAMERA_LABELS.get(camera_name, camera_name),
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        color=VIEW_LABEL_COLOR,
-        fontsize=19.0,
-        fontweight="bold",
-        zorder=8.0,
-    )
+    if show_q_label:
+        reserved_rectangles: list[tuple[float, float, float, float]] = []
+        if selected_endpoints:
+            rectangle = annotate_q_value(
+                ax=ax,
+                frame=frame,
+                projected_paths=projected_paths,
+                candidate=selected,
+                endpoint=selected_endpoints[0],
+                label=rf"$Q_{{\mathrm{{max}}}}={q_values[selected]:.3f}$",
+                color=SELECTED_COLOR,
+                reserved_rectangles=tuple(reserved_rectangles),
+            )
+            reserved_rectangles.append(rectangle)
+        if minimum_endpoints:
+            annotate_q_value(
+                ax=ax,
+                frame=frame,
+                projected_paths=projected_paths,
+                candidate=minimum,
+                endpoint=minimum_endpoints[0],
+                label=rf"$Q_{{\mathrm{{min}}}}={q_values[minimum]:.3f}$",
+                color=MINIMUM_COLOR,
+                reserved_rectangles=tuple(reserved_rectangles),
+            )
+
+    # Camera-view captions are intentionally hidden for the paper figures.
+    # ax.text(
+    #     0.025,
+    #     0.965,
+    #     CAMERA_LABELS.get(camera_name, camera_name),
+    #     transform=ax.transAxes,
+    #     ha="left",
+    #     va="top",
+    #     color=VIEW_LABEL_COLOR,
+    #     fontsize=19.0,
+    #     fontweight="bold",
+    #     zorder=8.0,
+    # )
 
 
 def plot_boundary(
@@ -769,6 +849,7 @@ def main() -> None:
                 )
                 q_values = np.asarray(arrays["q"][boundary_index])
                 selected = int(arrays["selected"][boundary_index])
+                minimum = int(np.argmin(q_values))
                 if selected != int(np.argmax(q_values)):
                     raise ValueError("cached selected index is not the Q argmax")
                 png_path, pdf_path = plot_boundary(
@@ -790,6 +871,8 @@ def main() -> None:
                         "timestep": timestep,
                         "selected_candidate": selected + 1,
                         "selected_q": float(q_values[selected]),
+                        "minimum_candidate": minimum + 1,
+                        "minimum_q": float(q_values[minimum]),
                         "png": str(png_path.resolve()),
                         "pdf": str(pdf_path.resolve()),
                     }
@@ -815,7 +898,9 @@ def main() -> None:
         "interpretation": (
             "Curves are cumulative OSC end-effector displacement commands projected "
             "into a high-resolution replay of the recorded state; they are not "
-            "simulated future trajectories. Q_min denotes min(Q1, Q2)."
+            "simulated future trajectories. Each candidate score is min(Q1, Q2); "
+            "Q_max and Q_min are the maximum and minimum scores across the sampled "
+            "candidate chunks."
         ),
         "figures": records,
     }
