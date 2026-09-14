@@ -1552,7 +1552,7 @@ require_chunk_actor_condition_labels() {
     echo "Run CHUNK_ACTOR_CONDITION_MODE=$CHUNK_ACTOR_CONDITION_MODE CHUNK_CONDITION_CRITIC_CHECKPOINT=... $0 $TASK label_chunk_actor_conditions first." >&2
     exit 1
   fi
-  if [[ -n "$CHUNK_CONDITION_VALIDATION_DATASET" && ( ! -f "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" || ! -s "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" ) ]]; then
+  if [[ "$TASK_REAL_ROBOT" == "1" && ( ! -f "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" || ! -s "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" ) ]]; then
     echo "[rgb_dp_chunk_idql] missing validation critic actor-condition labels: $CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" >&2
     echo "Run the label_chunk_actor_conditions stage before training." >&2
     exit 1
@@ -1690,16 +1690,10 @@ run_chunk_train() {
     )
   fi
   if is_critic_actor_condition_mode; then
-    if [[ -n "$CHUNK_CONDITION_VALIDATION_DATASET" ]]; then
-      heldout_args=(
-        --validation-dataset "$CHUNK_CONDITION_VALIDATION_DATASET"
-        --validation-seed "${CHUNK_VALIDATION_SEED:-10000}"
-      )
-    fi
     actor_condition_label_args=(
       --actor-condition-labels "$CHUNK_ACTOR_CONDITION_LABELS"
     )
-    if [[ -n "$CHUNK_CONDITION_VALIDATION_DATASET" ]]; then
+    if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
       actor_condition_label_args+=(
         --validation-actor-condition-labels "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS"
       )
@@ -2101,8 +2095,8 @@ case "$STAGE" in
     ;;
 
   train_chunk_idql|train_chunk_idql_round2)
-    require_chunk_actor_condition_labels
     ensure_dataset
+    require_chunk_actor_condition_labels
     if chunk_training_is_complete; then
       exit 0
     fi
@@ -2110,8 +2104,8 @@ case "$STAGE" in
     ;;
 
   train_chunk_idql_resilient|train_chunk_idql_round2_resilient)
-    require_chunk_actor_condition_labels
     ensure_dataset
+    require_chunk_actor_condition_labels
     max_restarts=${MAX_RESTARTS:-20}
     if chunk_training_is_complete; then
       exit 0
