@@ -3207,6 +3207,7 @@ def load_actor_condition_sidecar(
     *,
     expected_mode: str,
     expected_dataset_identity: dict[str, Any],
+    expected_critic_source: str | None = None,
     expected_task: str | None = None,
     expected_reward_mode: str | None = None,
     expected_chunk_horizon: int | None = None,
@@ -3344,6 +3345,15 @@ def load_actor_condition_sidecar(
     if str(config["condition_mode"]) != mode:
         raise ValueError(
             "critic condition sidecar config condition_mode does not match its mode"
+        )
+    if (
+        expected_critic_source is not None
+        and str(config["critic_source"]) != str(expected_critic_source)
+    ):
+        raise ValueError(
+            "critic condition sidecar critic_source="
+            f"{str(config['critic_source'])!r} does not match requested "
+            f"source={str(expected_critic_source)!r}; regenerate the sidecar"
         )
     expected_score_key = "advantage" if mode == "critic_advantage" else "q_min"
     if str(config["score_key"]) != expected_score_key:
@@ -7587,6 +7597,9 @@ def checkpoint_payload(
 
 
 def train(args: argparse.Namespace) -> dict[str, Any]:
+    args.actor_condition_critic_source = str(
+        getattr(args, "actor_condition_critic_source", "online")
+    )
     configure_critic_architecture_args(args)
     validate_training_mode(args)
     args.validation_dataset = getattr(args, "validation_dataset", None)
@@ -7638,6 +7651,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             args.actor_condition_labels,
             expected_mode=str(args.actor_condition_mode),
             expected_dataset_identity=args.dataset_identity,
+            expected_critic_source=str(args.actor_condition_critic_source),
             expected_task=str(args.task),
             expected_reward_mode=str(args.reward_mode),
             expected_chunk_horizon=int(args.chunk_horizon),
@@ -7657,6 +7671,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 args.validation_actor_condition_labels,
                 expected_mode=str(args.actor_condition_mode),
                 expected_dataset_identity=args.validation_dataset_identity,
+                expected_critic_source=str(args.actor_condition_critic_source),
                 expected_task=str(args.task),
                 expected_reward_mode=str(args.reward_mode),
                 expected_chunk_horizon=int(args.chunk_horizon),
@@ -10525,6 +10540,16 @@ def make_parser() -> argparse.ArgumentParser:
         help=(
             "Immutable rgb_dp_chunk_critic_conditions_v1 sidecar required by "
             "critic_advantage and critic_q actor conditioning."
+        ),
+    )
+    parser.add_argument(
+        "--actor-condition-critic-source",
+        choices=("online", "target"),
+        default="online",
+        help=(
+            "Required provenance of critic-derived actor-condition sidecars. "
+            "Defaults to the learned online critic; pass target explicitly only "
+            "for a target-critic labeling experiment."
         ),
     )
     parser.add_argument(

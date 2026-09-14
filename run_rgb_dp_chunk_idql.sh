@@ -929,7 +929,7 @@ fi
 # mixed HDF5. The mixed dataset deliberately keeps the human_success labeling
 # recipe so it can be reused across critic checkpoints and threshold sweeps.
 CHUNK_CONDITION_CRITIC_CHECKPOINT=${CHUNK_CONDITION_CRITIC_CHECKPOINT:-}
-CHUNK_CONDITION_CRITIC_SOURCE=${CHUNK_CONDITION_CRITIC_SOURCE:-target}
+CHUNK_CONDITION_CRITIC_SOURCE=${CHUNK_CONDITION_CRITIC_SOURCE:-online}
 CHUNK_CONDITION_THRESHOLD_MODE=${CHUNK_CONDITION_THRESHOLD_MODE:-quantile}
 CHUNK_CONDITION_LOW_THRESHOLD=${CHUNK_CONDITION_LOW_THRESHOLD:-}
 CHUNK_CONDITION_HIGH_THRESHOLD=${CHUNK_CONDITION_HIGH_THRESHOLD:-}
@@ -1692,6 +1692,7 @@ run_chunk_train() {
   if is_critic_actor_condition_mode; then
     actor_condition_label_args=(
       --actor-condition-labels "$CHUNK_ACTOR_CONDITION_LABELS"
+      --actor-condition-critic-source "$CHUNK_CONDITION_CRITIC_SOURCE"
     )
     if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
       actor_condition_label_args+=(

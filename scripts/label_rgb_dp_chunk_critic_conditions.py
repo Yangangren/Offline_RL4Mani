@@ -657,7 +657,14 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dp-checkpoint", type=Path, required=True)
     parser.add_argument("--critic-checkpoint", type=Path, required=True)
     parser.add_argument(
-        "--critic-source", choices=("online", "target"), default="target"
+        "--critic-source",
+        choices=("online", "target"),
+        default="online",
+        help=(
+            "Q network stored in the critic checkpoint: online selects critics / "
+            "chunk_value_system (default), while target selects critic_targets / "
+            "chunk_value_target. V always comes from the learned online value model."
+        ),
     )
     parser.add_argument(
         "--condition-mode",
