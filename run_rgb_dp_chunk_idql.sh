@@ -343,7 +343,8 @@ REAL_ROBOT_VALIDATION_DATASET=${REAL_ROBOT_VALIDATION_DATASET:-$TASK_REAL_ROBOT_
 REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS=${REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS:-$TASK_REAL_ROBOT_VALIDATION_HUMAN_TRANSITIONS}
 REAL_ROBOT_MAX_DYNAMICS_GAP_SEC=${REAL_ROBOT_MAX_DYNAMICS_GAP_SEC:-$TASK_REAL_ROBOT_MAX_DYNAMICS_GAP_SEC}
 IDQL_REWARD_MODE=${IDQL_REWARD_MODE:-$TASK_DEFAULT_IDQL_REWARD_MODE}
-CHUNK_ACTOR_CONDITION_MODE=${CHUNK_ACTOR_CONDITION_MODE:-human_success} # human_success
+CHUNK_ACTOR_CONDITION_MODE=${CHUNK_ACTOR_CONDITION_MODE:-human_success}
+DATASET_ACTOR_CONDITION_MODE=$CHUNK_ACTOR_CONDITION_MODE
 DEFAULT_IDQL_DISCOUNT=0.99
 case "$CHUNK_ACTOR_CONDITION_MODE" in
   human_only)
@@ -352,8 +353,16 @@ case "$CHUNK_ACTOR_CONDITION_MODE" in
   human_success)
     ACTOR_CONDITION_DESCRIPTION="human=1 success_rollout=1 failure_rollout=0"
     ;;
+  critic_advantage)
+    DATASET_ACTOR_CONDITION_MODE=human_success
+    ACTOR_CONDITION_DESCRIPTION="human=1 rollout=thresholded_Q_minus_V middle=null"
+    ;;
+  critic_q)
+    DATASET_ACTOR_CONDITION_MODE=human_success
+    ACTOR_CONDITION_DESCRIPTION="human=1 rollout=thresholded_min_Q middle=null"
+    ;;
   *)
-    echo "Unsupported CHUNK_ACTOR_CONDITION_MODE." >&2
+    echo "Unsupported CHUNK_ACTOR_CONDITION_MODE=$CHUNK_ACTOR_CONDITION_MODE; use human_only, human_success, critic_advantage, or critic_q." >&2
     exit 2
     ;;
 esac
@@ -399,7 +408,7 @@ if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
   DEFAULT_CHUNK_EVAL_OUTPUT=$TASK_CHUNK_EVAL_OUTPUT
   DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=$TASK_COMPOSED_CHUNK_EVAL_OUTPUT
 fi
-if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "human_success" ]]; then
+if [[ "$DATASET_ACTOR_CONDITION_MODE" == "human_success" ]]; then
   condition_path_tag=human_success_condition
   if [[ "$TASK_REAL_ROBOT" == "1" ]]; then
     # Real-robot base names already include their terminal-success reward tag.
@@ -419,6 +428,12 @@ if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "human_success" ]]; then
   DEFAULT_CHUNK_IDQL_OUTPUT_DIR=${DEFAULT_CHUNK_IDQL_OUTPUT_DIR/human_condition/$condition_path_tag}
   DEFAULT_CHUNK_EVAL_OUTPUT=${DEFAULT_CHUNK_EVAL_OUTPUT/human_condition/$condition_path_tag}
   DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT/human_condition/$condition_path_tag}
+fi
+if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "critic_advantage" || "$CHUNK_ACTOR_CONDITION_MODE" == "critic_q" ]]; then
+  condition_path_tag=${CHUNK_ACTOR_CONDITION_MODE}_condition
+  DEFAULT_CHUNK_IDQL_OUTPUT_DIR=${DEFAULT_CHUNK_IDQL_OUTPUT_DIR/human_success_condition/$condition_path_tag}
+  DEFAULT_CHUNK_EVAL_OUTPUT=${DEFAULT_CHUNK_EVAL_OUTPUT/human_success_condition/$condition_path_tag}
+  DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT=${DEFAULT_COMPOSED_CHUNK_EVAL_OUTPUT/human_success_condition/$condition_path_tag}
 fi
 CHUNK_CRITIC_ARCHITECTURE=${CHUNK_CRITIC_ARCHITECTURE:-rise_temporal_v2}
 if [[ "$TASK_REAL_ROBOT" == "1" && "$CHUNK_CRITIC_ARCHITECTURE" != "legacy" ]]; then
@@ -845,10 +860,15 @@ if [[ "$ROUND2_CHUNK_TRAINING" == "1" ]]; then
   round2_dataset_base=datasets/square/idql/square_rgb_dp_chunk_idql_${round2_lineage}_200demo_100success_50failure
   round2_output_base=trained_models/square_rgb_dp/chunk_idql/${round2_lineage}_200demo_100success_50failure_h8_dynamics_human_condition
   round2_eval_base=rollouts/square_rgb_dp/chunk_idql/${round2_lineage}_200demo_100success_50failure_h8_dynamics_human_condition
-  if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "human_success" ]]; then
+  if [[ "$DATASET_ACTOR_CONDITION_MODE" == "human_success" ]]; then
     round2_dataset_base=${round2_dataset_base}_human_success_condition
     round2_output_base=${round2_output_base/human_condition/human_success_condition}
     round2_eval_base=${round2_eval_base/human_condition/human_success_condition}
+  fi
+  if [[ "$CHUNK_ACTOR_CONDITION_MODE" == "critic_advantage" || "$CHUNK_ACTOR_CONDITION_MODE" == "critic_q" ]]; then
+    round2_condition_path_tag=${CHUNK_ACTOR_CONDITION_MODE}_condition
+    round2_output_base=${round2_output_base/human_success_condition/$round2_condition_path_tag}
+    round2_eval_base=${round2_eval_base/human_success_condition/$round2_condition_path_tag}
   fi
   if [[ "$IDQL_REWARD_MODE" == "task" ]]; then
     round2_dataset_default=${round2_dataset_base}_task_reward.hdf5
@@ -905,6 +925,33 @@ if [[ -n "$chunk_dynamics_output_tag" ]]; then
   fi
 fi
 
+# Critic-derived actor conditions live in immutable sidecars rather than in the
+# mixed HDF5. The mixed dataset deliberately keeps the human_success labeling
+# recipe so it can be reused across critic checkpoints and threshold sweeps.
+CHUNK_CONDITION_CRITIC_CHECKPOINT=${CHUNK_CONDITION_CRITIC_CHECKPOINT:-}
+CHUNK_CONDITION_CRITIC_SOURCE=${CHUNK_CONDITION_CRITIC_SOURCE:-target}
+CHUNK_CONDITION_THRESHOLD_MODE=${CHUNK_CONDITION_THRESHOLD_MODE:-quantile}
+CHUNK_CONDITION_LOW_THRESHOLD=${CHUNK_CONDITION_LOW_THRESHOLD:-}
+CHUNK_CONDITION_HIGH_THRESHOLD=${CHUNK_CONDITION_HIGH_THRESHOLD:-}
+CHUNK_CONDITION_LOW_QUANTILE=${CHUNK_CONDITION_LOW_QUANTILE:-0.2}
+CHUNK_CONDITION_HIGH_QUANTILE=${CHUNK_CONDITION_HIGH_QUANTILE:-0.8}
+CHUNK_CONDITION_TARGET_PURITY=${CHUNK_CONDITION_TARGET_PURITY:-0.9}
+CHUNK_CONDITION_MIN_TAIL_COUNT=${CHUNK_CONDITION_MIN_TAIL_COUNT:-32}
+CHUNK_CONDITION_BATCH_SIZE=${CHUNK_CONDITION_BATCH_SIZE:-${CHUNK_BATCH_SIZE:-${BATCH_SIZE:-100}}}
+CHUNK_CONDITION_NUM_WORKERS=${CHUNK_CONDITION_NUM_WORKERS:-${CHUNK_NUM_WORKERS:-${NUM_WORKERS:-6}}}
+CHUNK_CONDITION_PREFETCH_FACTOR=${CHUNK_CONDITION_PREFETCH_FACTOR:-${CHUNK_PREFETCH_FACTOR:-${PREFETCH_FACTOR:-2}}}
+CHUNK_CONDITION_HDF5_CACHE_MODE=${CHUNK_CONDITION_HDF5_CACHE_MODE:-low_dim}
+CHUNK_CONDITION_SEED=${CHUNK_CONDITION_SEED:-${CHUNK_SEED:-${SEED:-0}}}
+CHUNK_CONDITION_OVERWRITE=${CHUNK_CONDITION_OVERWRITE:-0}
+CHUNK_CONDITION_VALIDATION_DATASET=${CHUNK_CONDITION_VALIDATION_DATASET:-}
+if [[ "$TASK_REAL_ROBOT" == "1" && -z "$CHUNK_CONDITION_VALIDATION_DATASET" ]]; then
+  CHUNK_CONDITION_VALIDATION_DATASET=$REAL_ROBOT_VALIDATION_DATASET
+fi
+CHUNK_ACTOR_CONDITION_LABELS=${CHUNK_ACTOR_CONDITION_LABELS:-${IDQL_DATASET%.hdf5}_${CHUNK_ACTOR_CONDITION_MODE}_conditions.pt}
+CHUNK_ACTOR_VALIDATION_CONDITION_LABELS=${CHUNK_ACTOR_VALIDATION_CONDITION_LABELS:-}
+if [[ -n "$CHUNK_CONDITION_VALIDATION_DATASET" && -z "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" ]]; then
+  CHUNK_ACTOR_VALIDATION_CONDITION_LABELS=${CHUNK_CONDITION_VALIDATION_DATASET%.hdf5}_${CHUNK_ACTOR_CONDITION_MODE}_conditions.pt
+fi
 # RECAP uses immutable sidecars and isolated model outputs. Derive the lineage
 # only after all task and round-2 overrides have resolved the final mixed HDF5.
 recap_dataset_name=${IDQL_DATASET##*/}
@@ -1323,7 +1370,7 @@ run_real_robot_mixed_builder() {
   local -a human_datasets=()
   local -a human_args=()
   local -a mode_args=()
-  echo "[rgb_dp_chunk_idql task=$TASK] actor condition: mode=$CHUNK_ACTOR_CONDITION_MODE ($ACTOR_CONDITION_DESCRIPTION)" >&2
+  echo "[rgb_dp_chunk_idql task=$TASK] actor condition: mode=$CHUNK_ACTOR_CONDITION_MODE ($ACTOR_CONDITION_DESCRIPTION); dataset_mode=$DATASET_ACTOR_CONDITION_MODE" >&2
   read -r -a human_datasets <<< "$REAL_ROBOT_HUMAN_DATASETS"
   if (( ${#human_datasets[@]} == 0 )); then
     echo "REAL_ROBOT_HUMAN_DATASETS must contain at least one human HDF5 path." >&2
@@ -1356,7 +1403,7 @@ run_real_robot_mixed_builder() {
     --failure-mask "$FAILURE_MASK" \
     --failure-count "$FAILURE_COUNT" \
     --reward-mode "$IDQL_REWARD_MODE" \
-    --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+    --actor-condition-mode "$DATASET_ACTOR_CONDITION_MODE" \
     --seed "${DATASET_SEED:-0}" \
     "${mode_args[@]}"
 }
@@ -1405,7 +1452,7 @@ run_real_robot_validation_builder() {
     --failure-mask failure_valid \
     --failure-count -1 \
     --reward-mode "$IDQL_REWARD_MODE" \
-    --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+    --actor-condition-mode "$DATASET_ACTOR_CONDITION_MODE" \
     --seed "${DATASET_SEED:-0}" \
     "${mode_args[@]}"
 }
@@ -1441,7 +1488,7 @@ build_dataset() {
     --failure-mask "$FAILURE_MASK" \
     --failure-count "$FAILURE_COUNT" \
     --reward-mode "$IDQL_REWARD_MODE" \
-    --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+    --actor-condition-mode "$DATASET_ACTOR_CONDITION_MODE" \
     --seed "${DATASET_SEED:-0}" \
     "${overwrite_args[@]}"
 }
@@ -1485,11 +1532,144 @@ ensure_dataset() {
           --failure-mask "$FAILURE_MASK" \
           --failure-count "$FAILURE_COUNT" \
           --reward-mode "$IDQL_REWARD_MODE" \
-          --actor-condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+          --actor-condition-mode "$DATASET_ACTOR_CONDITION_MODE" \
           --seed "${DATASET_SEED:-0}" \
         --validate-only
     fi
   fi
+}
+
+is_critic_actor_condition_mode() {
+  [[ "$CHUNK_ACTOR_CONDITION_MODE" == "critic_advantage" || "$CHUNK_ACTOR_CONDITION_MODE" == "critic_q" ]]
+}
+
+require_chunk_actor_condition_labels() {
+  if ! is_critic_actor_condition_mode; then
+    return
+  fi
+  if [[ ! -f "$CHUNK_ACTOR_CONDITION_LABELS" || ! -s "$CHUNK_ACTOR_CONDITION_LABELS" ]]; then
+    echo "[rgb_dp_chunk_idql] missing critic actor-condition labels: $CHUNK_ACTOR_CONDITION_LABELS" >&2
+    echo "Run CHUNK_ACTOR_CONDITION_MODE=$CHUNK_ACTOR_CONDITION_MODE CHUNK_CONDITION_CRITIC_CHECKPOINT=... $0 $TASK label_chunk_actor_conditions first." >&2
+    exit 1
+  fi
+  if [[ -n "$CHUNK_CONDITION_VALIDATION_DATASET" && ( ! -f "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" || ! -s "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" ) ]]; then
+    echo "[rgb_dp_chunk_idql] missing validation critic actor-condition labels: $CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" >&2
+    echo "Run the label_chunk_actor_conditions stage before training." >&2
+    exit 1
+  fi
+}
+
+label_chunk_actor_conditions() {
+  local -a validation_args=()
+  local -a threshold_args=()
+  local -a overwrite_args=()
+  local labels_parent=${CHUNK_ACTOR_CONDITION_LABELS%/*}
+  local validation_labels_parent=
+  if ! is_critic_actor_condition_mode; then
+    echo "label_chunk_actor_conditions requires CHUNK_ACTOR_CONDITION_MODE=critic_advantage or critic_q." >&2
+    exit 2
+  fi
+  if [[ -z "$CHUNK_CONDITION_CRITIC_CHECKPOINT" ]]; then
+    echo "label_chunk_actor_conditions requires an explicit CHUNK_CONDITION_CRITIC_CHECKPOINT." >&2
+    exit 2
+  fi
+  if [[ ! -f "$CHUNK_CONDITION_CRITIC_CHECKPOINT" || ! -s "$CHUNK_CONDITION_CRITIC_CHECKPOINT" ]]; then
+    echo "[rgb_dp_chunk_idql] condition critic checkpoint does not exist or is empty: $CHUNK_CONDITION_CRITIC_CHECKPOINT" >&2
+    exit 1
+  fi
+  case "$CHUNK_CONDITION_CRITIC_SOURCE" in
+    online|target)
+      ;;
+    *)
+      echo "CHUNK_CONDITION_CRITIC_SOURCE must be online or target; got '$CHUNK_CONDITION_CRITIC_SOURCE'." >&2
+      exit 2
+      ;;
+  esac
+  ensure_dataset
+  if [[ -n "$CHUNK_CONDITION_VALIDATION_DATASET" ]]; then
+    if [[ ! -f "$CHUNK_CONDITION_VALIDATION_DATASET" || ! -s "$CHUNK_CONDITION_VALIDATION_DATASET" ]]; then
+      echo "[rgb_dp_chunk_idql] condition calibration dataset does not exist or is empty: $CHUNK_CONDITION_VALIDATION_DATASET" >&2
+      exit 1
+    fi
+    if [[ -z "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" ]]; then
+      echo "CHUNK_CONDITION_VALIDATION_DATASET requires CHUNK_ACTOR_VALIDATION_CONDITION_LABELS." >&2
+      exit 2
+    fi
+    validation_args=(
+      --validation-dataset "$CHUNK_CONDITION_VALIDATION_DATASET"
+      --validation-output "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS"
+    )
+  fi
+  case "$CHUNK_CONDITION_THRESHOLD_MODE" in
+    fixed)
+      if [[ -z "$CHUNK_CONDITION_LOW_THRESHOLD" || -z "$CHUNK_CONDITION_HIGH_THRESHOLD" ]]; then
+        echo "CHUNK_CONDITION_THRESHOLD_MODE=fixed requires CHUNK_CONDITION_LOW_THRESHOLD and CHUNK_CONDITION_HIGH_THRESHOLD." >&2
+        exit 2
+      fi
+      threshold_args=(
+        --low-threshold "$CHUNK_CONDITION_LOW_THRESHOLD"
+        --high-threshold "$CHUNK_CONDITION_HIGH_THRESHOLD"
+      )
+      ;;
+    quantile)
+      threshold_args=(
+        --low-quantile "$CHUNK_CONDITION_LOW_QUANTILE"
+        --high-quantile "$CHUNK_CONDITION_HIGH_QUANTILE"
+      )
+      ;;
+    outcome_purity)
+      threshold_args=(
+        --target-purity "$CHUNK_CONDITION_TARGET_PURITY"
+        --min-tail-count "$CHUNK_CONDITION_MIN_TAIL_COUNT"
+      )
+      ;;
+    *)
+      echo "CHUNK_CONDITION_THRESHOLD_MODE must be fixed, quantile, or outcome_purity; got '$CHUNK_CONDITION_THRESHOLD_MODE'." >&2
+      exit 2
+      ;;
+  esac
+  case "$CHUNK_CONDITION_OVERWRITE" in
+    0)
+      ;;
+    1)
+      overwrite_args=(--overwrite)
+      ;;
+    *)
+      echo "CHUNK_CONDITION_OVERWRITE must be 0 or 1; got '$CHUNK_CONDITION_OVERWRITE'." >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$labels_parent" != "$CHUNK_ACTOR_CONDITION_LABELS" ]]; then
+    mkdir -p "$labels_parent"
+  fi
+  if [[ -n "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" ]]; then
+    validation_labels_parent=${CHUNK_ACTOR_VALIDATION_CONDITION_LABELS%/*}
+    if [[ "$validation_labels_parent" != "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS" ]]; then
+      mkdir -p "$validation_labels_parent"
+    fi
+  fi
+  echo "[rgb_dp_chunk_idql task=$TASK] labeling actor conditions: mode=$CHUNK_ACTOR_CONDITION_MODE critic=$CHUNK_CONDITION_CRITIC_CHECKPOINT source=$CHUNK_CONDITION_CRITIC_SOURCE thresholds=$CHUNK_CONDITION_THRESHOLD_MODE" >&2
+  "$PYTHON" -B scripts/label_rgb_dp_chunk_critic_conditions.py \
+    --task "$TASK" \
+    --dataset "$IDQL_DATASET" \
+    "${validation_args[@]}" \
+    --dp-checkpoint "$DP_CHECKPOINT" \
+    --critic-checkpoint "$CHUNK_CONDITION_CRITIC_CHECKPOINT" \
+    --critic-source "$CHUNK_CONDITION_CRITIC_SOURCE" \
+    --condition-mode "$CHUNK_ACTOR_CONDITION_MODE" \
+    --output "$CHUNK_ACTOR_CONDITION_LABELS" \
+    --threshold-mode "$CHUNK_CONDITION_THRESHOLD_MODE" \
+    "${threshold_args[@]}" \
+    --batch-size "$CHUNK_CONDITION_BATCH_SIZE" \
+    --num-workers "$CHUNK_CONDITION_NUM_WORKERS" \
+    --prefetch-factor "$CHUNK_CONDITION_PREFETCH_FACTOR" \
+    "$PIN_MEMORY_ARG" \
+    "$PERSISTENT_WORKERS_ARG" \
+    --hdf5-cache-mode "$CHUNK_CONDITION_HDF5_CACHE_MODE" \
+    "$SPARSE_CHUNK_LOADER_ARG" \
+    "${overwrite_args[@]}" \
+    --device "${DEVICE:-cuda}" \
+    --seed "$CHUNK_CONDITION_SEED"
 }
 
 run_chunk_train() {
@@ -1499,6 +1679,7 @@ run_chunk_train() {
   local distributed_args=()
   local validation_args=()
   local heldout_args=()
+  local actor_condition_label_args=()
   if [[ "${CHUNK_VALIDATE_RESUME_ONLY:-0}" == "1" ]]; then
     validation_args=(--validate-resume-only)
   fi
@@ -1507,6 +1688,22 @@ run_chunk_train() {
       --validation-dataset "$REAL_ROBOT_VALIDATION_DATASET"
       --validation-seed "${CHUNK_VALIDATION_SEED:-10000}"
     )
+  fi
+  if is_critic_actor_condition_mode; then
+    if [[ -n "$CHUNK_CONDITION_VALIDATION_DATASET" ]]; then
+      heldout_args=(
+        --validation-dataset "$CHUNK_CONDITION_VALIDATION_DATASET"
+        --validation-seed "${CHUNK_VALIDATION_SEED:-10000}"
+      )
+    fi
+    actor_condition_label_args=(
+      --actor-condition-labels "$CHUNK_ACTOR_CONDITION_LABELS"
+    )
+    if [[ -n "$CHUNK_CONDITION_VALIDATION_DATASET" ]]; then
+      actor_condition_label_args+=(
+        --validation-actor-condition-labels "$CHUNK_ACTOR_VALIDATION_CONDITION_LABELS"
+      )
+    fi
   fi
   local train_launcher=("$PYTHON" -B)
   if [[ -n "$resume_path" ]]; then
@@ -1571,6 +1768,7 @@ run_chunk_train() {
     "${initialization_args[@]}" \
     --dataset "$IDQL_DATASET" \
     "${heldout_args[@]}" \
+    "${actor_condition_label_args[@]}" \
     --output-dir "$CHUNK_IDQL_OUTPUT_DIR" \
     "${resume_args[@]}" \
     "${validation_args[@]}" \
@@ -1898,7 +2096,12 @@ case "$STAGE" in
     build_dataset
     ;;
 
+  label_chunk_actor_conditions)
+    label_chunk_actor_conditions
+    ;;
+
   train_chunk_idql|train_chunk_idql_round2)
+    require_chunk_actor_condition_labels
     ensure_dataset
     if chunk_training_is_complete; then
       exit 0
@@ -1907,6 +2110,7 @@ case "$STAGE" in
     ;;
 
   train_chunk_idql_resilient|train_chunk_idql_round2_resilient)
+    require_chunk_actor_condition_labels
     ensure_dataset
     max_restarts=${MAX_RESTARTS:-20}
     if chunk_training_is_complete; then
@@ -2119,7 +2323,7 @@ case "$STAGE" in
     ;;
 
   *)
-    echo "Usage: $0 [square|can|transport|tool_hang|pick_cup|stack_cup|move_spoon] {build_dataset|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_recap_actor_grid_resilient|eval_recap_condition_ablation_grid_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
+    echo "Usage: $0 [square|can|transport|tool_hang|pick_cup|stack_cup|move_spoon] {build_dataset|label_chunk_actor_conditions|train_chunk_idql|train_chunk_idql_resilient|train_chunk_idql_round2|train_chunk_idql_round2_resilient|prepare_recap_targets|train_recap_value|label_recap|train_recap_actor|train_recap_all|eval_recap_actor_grid_resilient|eval_recap_condition_ablation_grid_resilient|eval_chunk_grid_resilient|collect_chunk_idql_rollouts_resilient|eval_composed_chunk_grid_resilient}" >&2
     exit 2
     ;;
 esac

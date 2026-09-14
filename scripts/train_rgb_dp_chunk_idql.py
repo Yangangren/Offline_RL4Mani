@@ -83,7 +83,16 @@ DEFAULT_OUTPUT = (
 ACTOR_CONDITION_DEFINITIONS = {
     "human_only": "human_demo=1; success_rollout=0; failure_rollout=0",
     "human_success": "human_demo=1; success_rollout=1; failure_rollout=0",
+    "critic_advantage": (
+        "human_demo=1; rollout_advantage>high=1; "
+        "rollout_advantage<low=0; otherwise=null"
+    ),
+    "critic_q": (
+        "human_demo=1; rollout_min_q>high=1; rollout_min_q<low=0; otherwise=null"
+    ),
 }
+CRITIC_ACTOR_CONDITION_MODES = frozenset(("critic_advantage", "critic_q"))
+CRITIC_ACTOR_CONDITION_SIDECAR_KIND = "rgb_dp_chunk_critic_conditions_v1"
 DYNAMICS_PREDICTION_MODE = "actor_encoder_direct"
 RISE_V2_DYNAMICS_PREDICTION_MODE = (
     "actor_visual_encoder_multi_offset_causal_action_prefix"
@@ -185,8 +194,18 @@ def build_single_loader(
     drop_last: bool | None = None,
 ):
     """Build the mixed-data loader without checkpoint-era split filters."""
+    loader_args = args
+    if (
+        bool(getattr(args, "conditioned_actor", False))
+        and str(getattr(args, "actor_condition_mode", "human_only"))
+        in CRITIC_ACTOR_CONDITION_MODES
+    ):
+        # Critic-derived labels are indexed immutable sidecar rows. Do not make
+        # these modes depend on the HDF5's legacy actor_condition field.
+        loader_args = copy.copy(args)
+        loader_args.conditioned_actor = False
     return _build_single_loader(
-        args,
+        loader_args,
         actor_policy,
         checkpoint_for_unfiltered_mixed_dataset(dp_checkpoint),
         sequence_length=sequence_length,
@@ -448,15 +467,27 @@ def actor_condition_definition(mode: str) -> str:
     return ACTOR_CONDITION_DEFINITIONS[str(mode)]
 
 
+def actor_condition_uses_critic_sidecar(mode: str) -> bool:
+    return str(mode) in CRITIC_ACTOR_CONDITION_MODES
+
+
 def actor_condition_sources(mode: str) -> tuple[list[str], list[str]]:
     if mode == "human_only":
         return ["human_demo"], ["success_rollout", "failure_rollout"]
     if mode == "human_success":
         return ["human_demo", "success_rollout"], ["failure_rollout"]
+    if actor_condition_uses_critic_sidecar(mode):
+        return ["human_demo", "critic_high_rollout"], ["critic_low_rollout"]
     raise ValueError(f"unsupported actor condition mode: {mode}")
 
 
-def actor_condition_labels(mode: str) -> dict[str, float]:
+def actor_condition_labels(mode: str) -> dict[str, float | str]:
+    if actor_condition_uses_critic_sidecar(mode):
+        return {
+            "human_demo": 1.0,
+            "success_rollout": "critic_thresholded",
+            "failure_rollout": "critic_thresholded",
+        }
     positive, _ = actor_condition_sources(mode)
     return {
         source: float(source in positive)
@@ -1080,6 +1111,40 @@ def validate_training_mode(args: argparse.Namespace) -> None:
     """Keep actor-only training explicit and impossible to misconfigure."""
     actor_only = bool(getattr(args, "actor_only", False))
     initialization = str(args.initialization)
+    condition_mode = str(getattr(args, "actor_condition_mode", "human_only"))
+    if condition_mode not in ACTOR_CONDITION_DEFINITIONS:
+        raise ValueError(f"unsupported actor condition mode: {condition_mode!r}")
+    condition_labels = getattr(args, "actor_condition_labels", None)
+    validation_condition_labels = getattr(
+        args, "validation_actor_condition_labels", None
+    )
+    validation_dataset = getattr(args, "validation_dataset", None)
+    if actor_condition_uses_critic_sidecar(condition_mode):
+        if not bool(args.conditioned_actor):
+            raise ValueError(
+                f"actor condition mode {condition_mode!r} requires "
+                "--conditioned-actor"
+            )
+        if condition_labels is None:
+            raise ValueError(
+                f"actor condition mode {condition_mode!r} requires "
+                "--actor-condition-labels"
+            )
+        if validation_dataset is not None and validation_condition_labels is None:
+            raise ValueError(
+                f"actor condition mode {condition_mode!r} with a validation "
+                "dataset requires --validation-actor-condition-labels"
+            )
+        if validation_dataset is None and validation_condition_labels is not None:
+            raise ValueError(
+                "--validation-actor-condition-labels requires "
+                "--validation-dataset"
+            )
+    elif condition_labels is not None or validation_condition_labels is not None:
+        raise ValueError(
+            "actor-condition label sidecars are only valid for "
+            "critic_advantage or critic_q modes"
+        )
     if int(getattr(args, "reranking_min_post_warmup_steps", 0)) < 0:
         raise ValueError("reranking_min_post_warmup_steps must be non-negative")
     actor_loss_degradation = float(
@@ -3112,6 +3177,485 @@ def validate_mixed_dataset_source_identity(identity: dict[str, Any]) -> None:
         )
 
 
+def _binary_sidecar_vector(
+    value: Any,
+    *,
+    name: str,
+    num_samples: int,
+) -> torch.Tensor:
+    tensor = torch.as_tensor(value, device="cpu")
+    if tensor.ndim != 1 or int(tensor.shape[0]) != int(num_samples):
+        raise ValueError(
+            f"critic condition sidecar field {name!r} must have shape "
+            f"({num_samples},), got {tuple(tensor.shape)}"
+        )
+    if tensor.is_floating_point() and not torch.isfinite(tensor).all():
+        raise ValueError(
+            f"critic condition sidecar field {name!r} contains non-finite values"
+        )
+    if not torch.all((tensor == 0) | (tensor == 1)):
+        invalid = tensor[(tensor != 0) & (tensor != 1)][:8].tolist()
+        raise ValueError(
+            f"critic condition sidecar field {name!r} must be binary; "
+            f"invalid values={invalid}"
+        )
+    return tensor.to(dtype=torch.uint8).contiguous()
+
+
+def load_actor_condition_sidecar(
+    path: Path,
+    *,
+    expected_mode: str,
+    expected_dataset_identity: dict[str, Any],
+    expected_task: str | None = None,
+    expected_reward_mode: str | None = None,
+    expected_chunk_horizon: int | None = None,
+    expected_sparse_chunk_loader: bool | None = None,
+    expected_calibration_dataset_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load and validate one immutable critic-derived actor-label sidecar."""
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(resolved)
+    sidecar = torch.load(resolved, map_location="cpu", weights_only=False)
+    if not isinstance(sidecar, dict):
+        raise TypeError(f"critic condition sidecar {resolved} must be a dictionary")
+    if sidecar.get("kind") != CRITIC_ACTOR_CONDITION_SIDECAR_KIND:
+        raise ValueError(
+            f"{resolved} is not a {CRITIC_ACTOR_CONDITION_SIDECAR_KIND!r} "
+            f"sidecar; kind={sidecar.get('kind')!r}"
+        )
+    if sidecar.get("version") != 1:
+        raise ValueError(
+            f"critic condition sidecar {resolved} has unsupported "
+            f"version={sidecar.get('version')!r}; expected 1"
+        )
+    mode = str(sidecar.get("mode", ""))
+    if mode != str(expected_mode):
+        raise ValueError(
+            f"critic condition sidecar mode={mode!r} does not match requested "
+            f"mode={str(expected_mode)!r}"
+        )
+    if sidecar.get("dataset_identity") != expected_dataset_identity:
+        raise ValueError(
+            "critic condition sidecar was prepared for a different or modified "
+            "mixed dataset; regenerate it"
+        )
+    try:
+        num_samples = int(sidecar["num_samples"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "critic condition sidecar has no valid num_samples"
+        ) from exc
+    if num_samples < 1:
+        raise ValueError("critic condition sidecar num_samples must be positive")
+    fields = sidecar.get("fields")
+    if not isinstance(fields, dict):
+        raise ValueError("critic condition sidecar has no fields mapping")
+    required_fields = {
+        "actor_condition",
+        "actor_condition_mask",
+        "source_is_expert",
+        "scored",
+        "q_min",
+        "value",
+        "advantage",
+        "twin_gap",
+        "rollout_success",
+    }
+    missing_fields = sorted(required_fields.difference(fields))
+    if missing_fields:
+        raise ValueError(
+            "critic condition sidecar is missing required fields: "
+            f"{missing_fields}"
+        )
+    normalized_fields = dict(fields)
+    for name in (
+        "actor_condition",
+        "actor_condition_mask",
+        "source_is_expert",
+        "scored",
+        "rollout_success",
+    ):
+        normalized_fields[name] = _binary_sidecar_vector(
+            fields[name], name=name, num_samples=num_samples
+        )
+    for name, value in fields.items():
+        tensor = torch.as_tensor(value, device="cpu")
+        if tensor.ndim < 1 or int(tensor.shape[0]) != num_samples:
+            raise ValueError(
+                f"critic condition sidecar field {name!r} must have leading "
+                f"size {num_samples}, got {tuple(tensor.shape)}"
+            )
+        if name not in {
+            "actor_condition",
+            "actor_condition_mask",
+            "source_is_expert",
+            "scored",
+            "rollout_success",
+        }:
+            normalized_fields[name] = tensor.contiguous()
+
+    labels = normalized_fields["actor_condition"]
+    masks = normalized_fields["actor_condition_mask"]
+    humans = normalized_fields["source_is_expert"].bool()
+    if torch.any((masks == 0) & (labels != 0)):
+        raise ValueError(
+            "critic condition sidecar null rows must use condition=0 and mask=0"
+        )
+    unscored_rows = ~normalized_fields["scored"].bool()
+    if torch.any((labels[unscored_rows] != 0) | (masks[unscored_rows] != 0)):
+        raise ValueError(
+            "critic condition sidecar unscored rows must use condition=0 and mask=0"
+        )
+    if not torch.all((labels[humans] == 1) & (masks[humans] == 1)):
+        raise ValueError(
+            "critic condition sidecar must mark every human row positive and active"
+        )
+
+    config = sidecar.get("config")
+    if not isinstance(config, dict):
+        raise ValueError("critic condition sidecar has no provenance config")
+    required_config = {
+        "task",
+        "condition_mode",
+        "score_key",
+        "threshold_mode",
+        "low_threshold",
+        "high_threshold",
+        "critic_source",
+        "critic_checkpoint_identity",
+        "dp_checkpoint_identity",
+        "calibration_dataset_identity",
+        "sparse_chunk_loader",
+        "architecture",
+        "chunk_horizon",
+        "critic_observation_horizon",
+        "reward_mode",
+        "num_critics",
+        "normalization",
+    }
+    missing_config = sorted(required_config.difference(config))
+    if missing_config:
+        raise ValueError(
+            "critic condition sidecar lacks immutable provenance fields: "
+            f"{missing_config}"
+        )
+    if str(config["condition_mode"]) != mode:
+        raise ValueError(
+            "critic condition sidecar config condition_mode does not match its mode"
+        )
+    expected_score_key = "advantage" if mode == "critic_advantage" else "q_min"
+    if str(config["score_key"]) != expected_score_key:
+        raise ValueError(
+            f"critic condition sidecar mode={mode!r} requires "
+            f"score_key={expected_score_key!r}"
+        )
+    try:
+        low_threshold = float(config["low_threshold"])
+        high_threshold = float(config["high_threshold"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("critic condition thresholds must be numeric") from exc
+    if not (
+        np.isfinite(low_threshold)
+        and np.isfinite(high_threshold)
+        and low_threshold < high_threshold
+    ):
+        raise ValueError(
+            "critic condition sidecar requires finite low_threshold < "
+            "high_threshold"
+        )
+    scored_rows = normalized_fields["scored"].bool()
+    scalar_scores: dict[str, torch.Tensor] = {}
+    for name in ("q_min", "value", "advantage", "twin_gap"):
+        values = torch.as_tensor(
+            normalized_fields[name], dtype=torch.float64
+        ).reshape(num_samples, -1)
+        if int(values.shape[1]) != 1:
+            raise ValueError(
+                f"critic condition score field {name!r} must be a scalar per "
+                "dataset row"
+            )
+        values = values[:, 0]
+        if not torch.isfinite(values[scored_rows]).all():
+            raise ValueError(
+                f"critic condition sidecar field {name!r} has non-finite "
+                "values on scored rows"
+            )
+        scalar_scores[name] = values
+    expected_advantage = scalar_scores["q_min"] - scalar_scores["value"]
+    consistent_advantage = torch.isclose(
+        scalar_scores["advantage"],
+        expected_advantage,
+        atol=1e-5,
+        rtol=1e-4,
+    )
+    if not torch.all(consistent_advantage[scored_rows]):
+        invalid = torch.nonzero(
+            scored_rows & ~consistent_advantage, as_tuple=False
+        ).reshape(-1)[:8].tolist()
+        raise ValueError(
+            "critic condition sidecar advantage must equal q_min - value on "
+            f"scored rows; invalid indices={invalid}"
+        )
+    twin_gap_tolerance = 1e-6
+    invalid_twin_gap = scored_rows & (
+        scalar_scores["twin_gap"] < -twin_gap_tolerance
+    )
+    if torch.any(invalid_twin_gap):
+        invalid = torch.nonzero(
+            invalid_twin_gap, as_tuple=False
+        ).reshape(-1)[:8].tolist()
+        raise ValueError(
+            "critic condition sidecar twin_gap must be nonnegative on scored "
+            f"rows (tolerance={twin_gap_tolerance}); invalid indices={invalid}"
+        )
+    scores = scalar_scores[expected_score_key]
+    rollout_rows = scored_rows & ~humans
+    expected_positive = rollout_rows & (scores > high_threshold)
+    expected_negative = rollout_rows & (scores < low_threshold)
+    expected_null = rollout_rows & ~(expected_positive | expected_negative)
+    if not torch.all((labels[expected_positive] == 1) & (masks[expected_positive] == 1)):
+        raise ValueError(
+            "critic condition sidecar high-score rollout labels are inconsistent "
+            "with its threshold provenance"
+        )
+    if not torch.all((labels[expected_negative] == 0) & (masks[expected_negative] == 1)):
+        raise ValueError(
+            "critic condition sidecar low-score rollout labels are inconsistent "
+            "with its threshold provenance"
+        )
+    if not torch.all((labels[expected_null] == 0) & (masks[expected_null] == 0)):
+        raise ValueError(
+            "critic condition sidecar middle-band rollout labels must be null"
+        )
+    for identity_name in (
+        "critic_checkpoint_identity",
+        "dp_checkpoint_identity",
+        "calibration_dataset_identity",
+    ):
+        if not isinstance(config[identity_name], dict) or not config[identity_name]:
+            raise ValueError(
+                f"critic condition sidecar provenance {identity_name!r} is invalid"
+            )
+    sparse_loader_value = config["sparse_chunk_loader"]
+    if not isinstance(sparse_loader_value, (bool, np.bool_)):
+        raise ValueError(
+            "critic condition sidecar sparse_chunk_loader provenance must be "
+            "boolean"
+        )
+    if (
+        expected_sparse_chunk_loader is not None
+        and bool(sparse_loader_value) != bool(expected_sparse_chunk_loader)
+    ):
+        raise ValueError(
+            "critic condition sidecar sparse_chunk_loader provenance does not "
+            "match the requested training loader semantics"
+        )
+    if (
+        expected_calibration_dataset_identity is not None
+        and config["calibration_dataset_identity"]
+        != expected_calibration_dataset_identity
+    ):
+        raise ValueError(
+            "critic condition sidecar calibration dataset identity does not "
+            "match the required calibration dataset"
+        )
+    if expected_task is not None and str(config["task"]) != str(expected_task):
+        raise ValueError(
+            f"critic condition sidecar task={config['task']!r} does not match "
+            f"requested task={expected_task!r}"
+        )
+    if (
+        expected_reward_mode is not None
+        and str(config["reward_mode"]) != str(expected_reward_mode)
+    ):
+        raise ValueError(
+            "critic condition sidecar reward_mode does not match the requested "
+            f"critic reward: {config['reward_mode']!r} != "
+            f"{expected_reward_mode!r}"
+        )
+    if (
+        expected_chunk_horizon is not None
+        and int(config["chunk_horizon"]) != int(expected_chunk_horizon)
+    ):
+        raise ValueError(
+            "critic condition sidecar chunk_horizon does not match requested "
+            f"training horizon: {config['chunk_horizon']!r} != "
+            f"{expected_chunk_horizon!r}"
+        )
+
+    loaded = dict(sidecar)
+    loaded["path"] = str(resolved)
+    loaded["identity"] = file_stat_identity(resolved)
+    loaded["fields"] = normalized_fields
+    loaded["num_samples"] = num_samples
+    return loaded
+
+
+def validate_actor_condition_sidecar_pair(
+    training_sidecar: dict[str, Any],
+    validation_sidecar: dict[str, Any],
+    *,
+    validation_dataset_identity: dict[str, Any],
+) -> None:
+    """Require train/validation labels to share critic and calibration state."""
+    training_config = training_sidecar["config"]
+    validation_config = validation_sidecar["config"]
+    shared_fields = (
+        "task",
+        "condition_mode",
+        "score_key",
+        "threshold_mode",
+        "low_threshold",
+        "high_threshold",
+        "low_quantile",
+        "high_quantile",
+        "target_purity",
+        "min_tail_count",
+        "critic_source",
+        "critic_checkpoint_identity",
+        "dp_checkpoint_identity",
+        "calibration_dataset_identity",
+        "sparse_chunk_loader",
+        "architecture",
+        "chunk_horizon",
+        "critic_observation_horizon",
+        "reward_mode",
+        "num_critics",
+        "normalization",
+    )
+    mismatched = [
+        field
+        for field in shared_fields
+        if training_config.get(field) != validation_config.get(field)
+    ]
+    if mismatched:
+        raise ValueError(
+            "training and validation critic condition sidecars have different "
+            f"provenance: {mismatched}"
+        )
+    if training_config["calibration_dataset_identity"] != (
+        validation_dataset_identity
+    ):
+        raise ValueError(
+            "critic condition thresholds were not calibrated on the requested "
+            "held-out validation dataset"
+        )
+
+
+def actor_condition_sidecar_rows(
+    sidecar: dict[str, Any],
+    raw_batch: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather critic-derived condition and null mask by stable dataset index."""
+    if "index" not in raw_batch:
+        raise KeyError("critic-conditioned actor batch is missing dataset index")
+    raw_indices = torch.as_tensor(raw_batch["index"], device="cpu")
+    if raw_indices.is_floating_point() and not torch.all(raw_indices == raw_indices.round()):
+        raise ValueError("critic condition sidecar indices must be integers")
+    indices = raw_indices.to(dtype=torch.long).reshape(-1)
+    batch_size = int(raw_batch["actions"].shape[0])
+    if int(indices.numel()) != batch_size:
+        raise ValueError(
+            "critic condition sidecar index batch mismatch: "
+            f"indices={indices.numel()}, batch_size={batch_size}"
+        )
+    if indices.numel() and (
+        int(indices.min()) < 0
+        or int(indices.max()) >= int(sidecar["num_samples"])
+    ):
+        raise IndexError("batch sample index is outside the critic condition sidecar")
+    fields = sidecar["fields"]
+    scored = fields["scored"].index_select(0, indices).bool()
+    if not torch.all(scored):
+        unscored = indices[~scored][:8].tolist()
+        raise ValueError(
+            "critic condition sidecar has unscored rows admitted by the loader: "
+            f"indices={unscored}"
+        )
+    labels = fields["actor_condition"].index_select(0, indices).float()
+    masks = fields["actor_condition_mask"].index_select(0, indices).float()
+    humans = fields["source_is_expert"].index_select(0, indices).bool()
+    if not torch.all((labels[humans] == 1) & (masks[humans] == 1)):
+        raise RuntimeError("human condition invariant failed in actor batch")
+    return labels, masks
+
+
+def audit_critic_actor_conditions(
+    sidecar: dict[str, Any],
+    dataset,
+    *,
+    allow_single_condition_class: bool = False,
+) -> dict[str, Any]:
+    """Audit the exact sidecar rows admitted by a dense or sparse loader."""
+    expected_size = int(getattr(dataset, "unfiltered_size", len(dataset)))
+    if int(sidecar["num_samples"]) != expected_size:
+        raise ValueError(
+            "critic condition sidecar num_samples does not match the underlying "
+            f"SequenceDataset: {sidecar['num_samples']} != {expected_size}"
+        )
+    valid_indices = getattr(dataset, "valid_indices", None)
+    admitted = torch.as_tensor(
+        (
+            np.arange(expected_size, dtype=np.int64)
+            if valid_indices is None
+            else valid_indices
+        ),
+        dtype=torch.long,
+    ).reshape(-1)
+    fields = sidecar["fields"]
+    scored = fields["scored"].index_select(0, admitted).bool()
+    if not torch.all(scored):
+        unscored = admitted[~scored][:8].tolist()
+        raise ValueError(
+            "critic condition sidecar does not score every loader-admitted row: "
+            f"indices={unscored}"
+        )
+    labels = fields["actor_condition"].index_select(0, admitted).bool()
+    masks = fields["actor_condition_mask"].index_select(0, admitted).bool()
+    humans = fields["source_is_expert"].index_select(0, admitted).bool()
+    positive_count = int((labels & masks).sum())
+    negative_count = int((~labels & masks).sum())
+    null_count = int((~masks).sum())
+    single_class = positive_count == 0 or negative_count == 0
+    if single_class and not bool(allow_single_condition_class):
+        raise ValueError(
+            "conditioned actor sidecar must contain active condition 0 and "
+            "condition 1 rows; pass --allow-single-condition-class only for "
+            "an explicit ablation"
+        )
+    config = sidecar["config"]
+    return {
+        "mode": str(sidecar["mode"]),
+        "definition": actor_condition_definition(str(sidecar["mode"])),
+        "source": "immutable_critic_condition_sidecar_by_dataset_index",
+        "sidecar": str(sidecar["path"]),
+        "sidecar_identity": copy.deepcopy(sidecar["identity"]),
+        "num_samples": int(sidecar["num_samples"]),
+        "admitted_rows": int(admitted.numel()),
+        "scored_admitted_rows": int(scored.sum()),
+        "active_positive_rows": positive_count,
+        "active_negative_rows": negative_count,
+        "null_rows": null_count,
+        "human_rows": int(humans.sum()),
+        "rollout_rows": int((~humans).sum()),
+        "condition_mask": "sidecar_binary_1=explicit_0=null",
+        "observed_condition_classes": [
+            value
+            for value, count in ((0.0, negative_count), (1.0, positive_count))
+            if count > 0
+        ],
+        "allow_single_condition_class_requested": bool(
+            allow_single_condition_class
+        ),
+        "single_condition_class_override_used": bool(single_class),
+        "config": copy.deepcopy(config),
+        "threshold_audit": copy.deepcopy(sidecar.get("threshold_audit")),
+        "label_summary": copy.deepcopy(sidecar.get("summary")),
+    }
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -3196,6 +3740,57 @@ def validate_resume_semantics(
 ) -> None:
     """Reject resumes that would silently change the task or objective."""
     saved_args = resume_state.get("args", {})
+    requested_condition_mode = str(
+        getattr(args, "actor_condition_mode", "human_only")
+    )
+    if (
+        bool(getattr(args, "conditioned_actor", False))
+        and actor_condition_uses_critic_sidecar(requested_condition_mode)
+    ):
+        sidecar_fields = (
+            (
+                "actor_condition_labels",
+                "actor_condition_labels_identity",
+                "actor_condition_sidecar_config",
+            ),
+            (
+                "validation_actor_condition_labels",
+                "validation_actor_condition_labels_identity",
+                "validation_actor_condition_sidecar_config",
+            ),
+        )
+        for path_field, identity_field, config_field in sidecar_fields:
+            requested_path = getattr(args, path_field, None)
+            saved_path = saved_args.get(path_field)
+            if requested_path is None:
+                if saved_path is not None:
+                    raise ValueError(
+                        f"resume checkpoint used {path_field}, but none was requested"
+                    )
+                continue
+            if saved_path is None or (
+                Path(saved_path).expanduser().resolve()
+                != Path(requested_path).expanduser().resolve()
+            ):
+                raise ValueError(
+                    f"resume {path_field} path does not match the requested "
+                    "immutable critic condition sidecar"
+                )
+            saved_identity = resume_state.get(
+                identity_field, saved_args.get(identity_field)
+            )
+            requested_identity = getattr(args, identity_field, None)
+            if saved_identity != requested_identity:
+                raise ValueError(
+                    f"resume {path_field} identity does not match the current "
+                    "critic condition sidecar"
+                )
+            saved_config = resume_state.get(config_field, saved_args.get(config_field))
+            requested_config = getattr(args, config_field, None)
+            if saved_config != requested_config:
+                raise ValueError(
+                    f"resume {path_field} critic provenance does not match"
+                )
     requested_validation = getattr(args, "validation_dataset", None)
     saved_validation = saved_args.get("validation_dataset")
     if requested_validation is None:
@@ -3858,6 +4453,7 @@ def source_expert_labels(
 def add_actor_condition(
     actor_batch: dict,
     condition_labels: torch.Tensor,
+    condition_masks: torch.Tensor | None = None,
 ) -> dict:
     """Attach explicit condition and mask tensors consumed by DiffusionPolicy."""
     batch_size = int(actor_batch["actions"].shape[0])
@@ -3867,10 +4463,68 @@ def add_actor_condition(
             "actor condition batch mismatch: "
             f"labels={tuple(labels.shape)}, batch_size={batch_size}"
         )
+    masks = (
+        torch.ones_like(labels)
+        if condition_masks is None
+        else condition_masks.reshape(-1).to(
+            device=labels.device,
+            dtype=torch.float32,
+        )
+    )
+    if int(masks.shape[0]) != batch_size:
+        raise ValueError(
+            "actor condition mask batch mismatch: "
+            f"masks={tuple(masks.shape)}, batch_size={batch_size}"
+        )
+    for name, values in (("labels", labels), ("masks", masks)):
+        is_binary = torch.isclose(
+            values, torch.zeros_like(values), atol=1e-6, rtol=0.0
+        ) | torch.isclose(
+            values, torch.ones_like(values), atol=1e-6, rtol=0.0
+        )
+        if not torch.all(is_binary):
+            raise ValueError(f"actor condition {name} must be binary")
+    if torch.any((masks < 0.5) & (labels >= 0.5)):
+        raise ValueError("null actor conditions must use label=0 and mask=0")
     conditioned_batch = dict(actor_batch)
     conditioned_batch["success_condition"] = labels
-    conditioned_batch["success_condition_mask"] = torch.ones_like(labels)
+    conditioned_batch["success_condition_mask"] = masks
     return conditioned_batch
+
+
+def actor_condition_batch_values(
+    raw_batch: dict[str, Any],
+    *,
+    current_index: int,
+    sidecar: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resolve legacy HDF5 labels or critic-sidecar labels uniformly."""
+    if sidecar is not None:
+        return actor_condition_sidecar_rows(sidecar, raw_batch)
+    labels = source_condition_labels(raw_batch, current_index=current_index)
+    return labels, torch.ones_like(labels)
+
+
+def actor_condition_metrics(
+    labels: torch.Tensor,
+    masks: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Return stable monitoring for explicit positive, negative, and null rows."""
+    active = masks >= 0.5
+    return {
+        "actor/condition_mean": labels.mean(),
+        # Retain the historical metric while making its null-row ambiguity
+        # explicit through the additional mask metrics below.
+        "actor/zero_condition_fraction": (labels < 0.5).float().mean(),
+        "actor/condition_mask_mean": masks.mean(),
+        "actor/null_condition_fraction": (~active).float().mean(),
+        "actor/explicit_negative_fraction": (
+            active & (labels < 0.5)
+        ).float().mean(),
+        "actor/explicit_positive_fraction": (
+            active & (labels >= 0.5)
+        ).float().mean(),
+    }
 
 
 def audit_actor_conditions(
@@ -5598,6 +6252,7 @@ def evaluate_validation_epoch(
     wcm_dynamics_target_encoder: WCMFrameTargetEncoder | None,
     device: torch.device,
     global_step: int,
+    actor_condition_sidecar: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     """Run deterministic, full-coverage held-out evaluation on rank zero."""
     accumulator = WeightedScalarMetricAccumulator(device)
@@ -5648,12 +6303,14 @@ def evaluate_validation_epoch(
                 rows = int(raw_batch["actions"].shape[0])
                 metrics: dict[str, Any] = {}
                 condition_labels = None
+                condition_masks = None
                 source_expert = None
                 if args.conditioned_actor:
                     current_index = int(args.observation_horizon) - 1
-                    condition_labels = source_condition_labels(
+                    condition_labels, condition_masks = actor_condition_batch_values(
                         raw_batch,
                         current_index=current_index,
+                        sidecar=actor_condition_sidecar,
                     )
                     if reranking_accumulator is not None:
                         source_expert = source_expert_labels(
@@ -5666,14 +6323,13 @@ def evaluate_validation_epoch(
                         actor_batch = add_actor_condition(
                             actor_batch,
                             condition_labels,
+                            condition_masks,
                         )
                         metrics.update(
-                            {
-                                "actor/condition_mean": condition_labels.mean(),
-                                "actor/zero_condition_fraction": (
-                                    (condition_labels < 0.5).float().mean()
-                                ),
-                            }
+                            actor_condition_metrics(
+                                condition_labels,
+                                condition_masks,
+                            )
                         )
                     metrics.update(
                         actor_validation_step(
@@ -6640,6 +7296,29 @@ def checkpoint_payload(
         "validation_dataset_identity": copy.deepcopy(
             getattr(args, "validation_dataset_identity", None)
         ),
+        "actor_condition_labels": (
+            str(args.actor_condition_labels)
+            if getattr(args, "actor_condition_labels", None) is not None
+            else None
+        ),
+        "actor_condition_labels_identity": copy.deepcopy(
+            getattr(args, "actor_condition_labels_identity", None)
+        ),
+        "actor_condition_sidecar_config": copy.deepcopy(
+            getattr(args, "actor_condition_sidecar_config", None)
+        ),
+        "validation_actor_condition_labels": (
+            str(args.validation_actor_condition_labels)
+            if getattr(args, "validation_actor_condition_labels", None)
+            is not None
+            else None
+        ),
+        "validation_actor_condition_labels_identity": copy.deepcopy(
+            getattr(args, "validation_actor_condition_labels_identity", None)
+        ),
+        "validation_actor_condition_sidecar_config": copy.deepcopy(
+            getattr(args, "validation_actor_condition_sidecar_config", None)
+        ),
         "single_dataloader": distributed_world_size == 1,
         "sampling": (
             "distributed_shuffled_"
@@ -6718,12 +7397,18 @@ def checkpoint_payload(
             else None
         ),
         "actor_condition_source": (
-            "actor_condition_at_current_transition"
+            "immutable_critic_condition_sidecar_by_dataset_index"
+            if args.conditioned_actor
+            and actor_condition_uses_critic_sidecar(args.actor_condition_mode)
+            else "actor_condition_at_current_transition"
             if args.conditioned_actor
             else None
         ),
         "actor_condition_mask": (
-            "1_for_every_actor_training_row"
+            "binary_sidecar_mask_1=explicit_condition_0=null"
+            if args.conditioned_actor
+            and actor_condition_uses_critic_sidecar(args.actor_condition_mode)
+            else "1_for_every_actor_training_row"
             if args.conditioned_actor
             else None
         ),
@@ -6906,6 +7591,17 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     validate_training_mode(args)
     args.validation_dataset = getattr(args, "validation_dataset", None)
     args.validation_seed = int(getattr(args, "validation_seed", 10_000))
+    args.actor_condition_labels = getattr(args, "actor_condition_labels", None)
+    args.validation_actor_condition_labels = getattr(
+        args, "validation_actor_condition_labels", None
+    )
+    for field in (
+        "actor_condition_labels",
+        "validation_actor_condition_labels",
+    ):
+        value = getattr(args, field)
+        if value is not None:
+            setattr(args, field, Path(value).expanduser().resolve())
     actor_only = bool(args.actor_only)
     distributed = initialize_distributed(args)
     args.distributed = bool(distributed.enabled)
@@ -6923,6 +7619,63 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         validate_mixed_dataset_source_identity(
             args.validation_dataset_identity
         )
+    actor_condition_sidecar = None
+    validation_actor_condition_sidecar = None
+    args.actor_condition_labels_identity = None
+    args.validation_actor_condition_labels_identity = None
+    args.actor_condition_sidecar_config = None
+    args.validation_actor_condition_sidecar_config = None
+    if (
+        bool(args.conditioned_actor)
+        and actor_condition_uses_critic_sidecar(args.actor_condition_mode)
+    ):
+        required_calibration_identity = (
+            args.validation_dataset_identity
+            if args.validation_dataset is not None
+            else args.dataset_identity
+        )
+        actor_condition_sidecar = load_actor_condition_sidecar(
+            args.actor_condition_labels,
+            expected_mode=str(args.actor_condition_mode),
+            expected_dataset_identity=args.dataset_identity,
+            expected_task=str(args.task),
+            expected_reward_mode=str(args.reward_mode),
+            expected_chunk_horizon=int(args.chunk_horizon),
+            expected_sparse_chunk_loader=bool(args.sparse_chunk_loader),
+            expected_calibration_dataset_identity=(
+                required_calibration_identity
+            ),
+        )
+        args.actor_condition_labels_identity = copy.deepcopy(
+            actor_condition_sidecar["identity"]
+        )
+        args.actor_condition_sidecar_config = copy.deepcopy(
+            actor_condition_sidecar["config"]
+        )
+        if args.validation_dataset is not None:
+            validation_actor_condition_sidecar = load_actor_condition_sidecar(
+                args.validation_actor_condition_labels,
+                expected_mode=str(args.actor_condition_mode),
+                expected_dataset_identity=args.validation_dataset_identity,
+                expected_task=str(args.task),
+                expected_reward_mode=str(args.reward_mode),
+                expected_chunk_horizon=int(args.chunk_horizon),
+                expected_sparse_chunk_loader=bool(args.sparse_chunk_loader),
+                expected_calibration_dataset_identity=(
+                    required_calibration_identity
+                ),
+            )
+            validate_actor_condition_sidecar_pair(
+                actor_condition_sidecar,
+                validation_actor_condition_sidecar,
+                validation_dataset_identity=args.validation_dataset_identity,
+            )
+            args.validation_actor_condition_labels_identity = copy.deepcopy(
+                validation_actor_condition_sidecar["identity"]
+            )
+            args.validation_actor_condition_sidecar_config = copy.deepcopy(
+                validation_actor_condition_sidecar["config"]
+            )
     if distributed.is_main_process:
         if args.resume_checkpoint is None:
             cleaned_temporaries = prepare_fresh_output_directory(
@@ -7216,6 +7969,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         raise FileNotFoundError(
             f"pretrained DP checkpoint does not exist: {pretrained_dp_checkpoint}"
         )
+    for sidecar_name, sidecar in (
+        ("training", actor_condition_sidecar),
+        ("validation", validation_actor_condition_sidecar),
+    ):
+        if (
+            sidecar is not None
+            and sidecar["config"]["dp_checkpoint_identity"]
+            != current_dp_identity
+        ):
+            raise ValueError(
+                f"{sidecar_name} critic condition sidecar was scored with a "
+                "different or modified pretrained DP checkpoint"
+            )
     if resume_state is not None:
         saved_dp_identity = resume_state.get("pretrained_dp_identity")
         if saved_dp_identity is None:
@@ -7441,6 +8207,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             ),
         )
         if args.conditioned_actor
+        and not actor_condition_uses_critic_sidecar(args.actor_condition_mode)
         else None
     )
     loader_args = args
@@ -7456,6 +8223,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         dp_checkpoint,
         sequence_length=sequence_length,
     )
+    if actor_condition_sidecar is not None:
+        condition_audit = audit_critic_actor_conditions(
+            actor_condition_sidecar,
+            dataset,
+            allow_single_condition_class=bool(
+                args.allow_single_condition_class
+            ),
+        )
     validation_dataset = None
     validation_loader = None
     validation_audit = None
@@ -7497,11 +8272,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             args.dataset,
             args.validation_dataset,
         )
-        if args.conditioned_actor:
+        if args.conditioned_actor and validation_actor_condition_sidecar is None:
             validation_condition_audit = audit_actor_conditions(
                 args.validation_dataset,
                 reward_mode=str(args.reward_mode),
                 actor_condition_mode=str(args.actor_condition_mode),
+                allow_single_condition_class=bool(
+                    args.allow_single_condition_class
+                ),
+            )
+        elif validation_actor_condition_sidecar is not None:
+            validation_condition_audit = audit_critic_actor_conditions(
+                validation_actor_condition_sidecar,
+                validation_dataset,
                 allow_single_condition_class=bool(
                     args.allow_single_condition_class
                 ),
@@ -8660,6 +9443,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 else None
             ),
             "actor_condition_masks": (
+                "binary_sidecar_mask_1=explicit_condition_0=null"
+                if actor_condition_uses_critic_sidecar(
+                    args.actor_condition_mode
+                )
+                else
                 {
                     "human_demo": 1.0,
                     "success_rollout": 1.0,
@@ -8909,22 +9697,26 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                         distributed,
                     )
                 current_index = int(args.observation_horizon) - 1
-                condition_labels = source_condition_labels(
+                condition_labels, condition_masks = actor_condition_batch_values(
                     raw_batch,
                     current_index=current_index,
+                    sidecar=actor_condition_sidecar,
                 )
-                actor_batch = add_actor_condition(raw_batch, condition_labels)
+                actor_batch = add_actor_condition(
+                    raw_batch,
+                    condition_labels,
+                    condition_masks,
+                )
                 actor_info: dict[str, Any] = {
                     "actor/data_rows": float(raw_batch["actions"].shape[0]),
                     "actor/conditioned": 1.0,
                     "actor/obs_encoder_trainable": float(
                         actor_obs_encoder_trainable
                     ),
-                    "actor/condition_mean": condition_labels.mean(),
-                    "actor/zero_condition_fraction": (
-                        (condition_labels < 0.5).float().mean()
-                    ),
                 }
+                actor_info.update(
+                    actor_condition_metrics(condition_labels, condition_masks)
+                )
                 actor_info.update(
                     actor_train_step(
                         actor_algo,
@@ -8974,7 +9766,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                             ),
                             flush=True,
                         )
-                del actor_batch, condition_labels
+                del actor_batch, condition_labels, condition_masks
                 continue
             batch = process_chunk_batch(
                 raw_batch,
@@ -9104,13 +9896,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 actor_batch = raw_batch
                 if args.conditioned_actor:
                     current_index = int(args.observation_horizon) - 1
-                    condition_labels = source_condition_labels(
+                    condition_labels, condition_masks = actor_condition_batch_values(
                         raw_batch,
                         current_index=current_index,
+                        sidecar=actor_condition_sidecar,
                     )
                     actor_batch = add_actor_condition(
                         actor_batch,
                         condition_labels,
+                        condition_masks,
                     )
                 actor_row_count = int(raw_batch["actions"].shape[0])
                 actor_info = {
@@ -9122,12 +9916,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 }
                 if args.conditioned_actor:
                     actor_info.update(
-                        {
-                            "actor/condition_mean": condition_labels.mean(),
-                            "actor/zero_condition_fraction": (
-                                (condition_labels < 0.5).float().mean()
-                            ),
-                        }
+                        actor_condition_metrics(
+                            condition_labels,
+                            condition_masks,
+                        )
                     )
                 actor_info.update(
                     actor_train_step(
@@ -9140,7 +9932,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 del actor_batch
                 if args.conditioned_actor:
-                    del condition_labels
+                    del condition_labels, condition_masks
             if is_wcm:
                 if wcm_lr_scheduler is not None:
                     wcm_lr_scheduler.step()
@@ -9302,6 +10094,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 device=device,
                 global_step=global_step,
+                actor_condition_sidecar=(
+                    validation_actor_condition_sidecar
+                ),
             )
             selection_loss = validation_metrics.get(
                 "validation/actor/Loss"
@@ -9700,7 +10495,7 @@ def make_parser() -> argparse.ArgumentParser:
         default=True,
         help=(
             "Train the joint diffusion actor with explicit binary conditions "
-            "from the dataset's actor_condition key."
+            "from the dataset's actor_condition key or a critic-label sidecar."
         ),
     )
     parser.add_argument(
@@ -9718,7 +10513,27 @@ def make_parser() -> argparse.ArgumentParser:
         default="human_only",
         help=(
             "human_only uses human=1 and all rollouts=0; human_success uses "
-            "human and successful rollouts=1 and failure rollouts=0"
+            "human and successful rollouts=1 and failure rollouts=0; "
+            "critic_advantage and critic_q gather thresholded labels and null "
+            "masks from --actor-condition-labels by stable dataset index"
+        ),
+    )
+    parser.add_argument(
+        "--actor-condition-labels",
+        type=Path,
+        default=None,
+        help=(
+            "Immutable rgb_dp_chunk_critic_conditions_v1 sidecar required by "
+            "critic_advantage and critic_q actor conditioning."
+        ),
+    )
+    parser.add_argument(
+        "--validation-actor-condition-labels",
+        type=Path,
+        default=None,
+        help=(
+            "Critic-condition sidecar for --validation-dataset, calibrated "
+            "with the same critic and thresholds as the training sidecar."
         ),
     )
     parser.add_argument(
@@ -9871,6 +10686,8 @@ def main() -> None:
         "source_chunk_idql_checkpoint",
         "dataset",
         "validation_dataset",
+        "actor_condition_labels",
+        "validation_actor_condition_labels",
         "output_dir",
         "resume_checkpoint",
     ):
@@ -9902,6 +10719,16 @@ def main() -> None:
             )
     if not args.dataset.is_file():
         parser.error(f"dataset does not exist: {args.dataset}")
+    for sidecar_name in (
+        "actor_condition_labels",
+        "validation_actor_condition_labels",
+    ):
+        sidecar_path = getattr(args, sidecar_name)
+        if sidecar_path is not None and not sidecar_path.is_file():
+            parser.error(
+                f"{sidecar_name.replace('_', '-')} does not exist: "
+                f"{sidecar_path}"
+            )
     if (
         args.resume_checkpoint is not None
         and not args.resume_checkpoint.is_file()
