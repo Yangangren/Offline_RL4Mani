@@ -939,6 +939,7 @@ def plot_violin(
     tail_quantile: float,
     ylabel: str = r"Critic advantage  $\min(Q_1,Q_2)-V$",
     reference_value: float | None = 0.0,
+    quantile_lines: tuple[tuple[float, str], ...] | None = None,
     show_sample_counts: bool = True,
 ) -> tuple[list[Path], tuple[float, float]]:
     configure_plot_style()
@@ -986,6 +987,34 @@ def plot_violin(
             linestyle="--",
             linewidth=0.9,
             zorder=0,
+        )
+    if quantile_lines:
+        line_colors = ("#009E73", "#CC79A7")
+        for (value, label), color in zip(quantile_lines, line_colors):
+            ax.axhline(
+                value,
+                color=color,
+                linestyle="--",
+                linewidth=1.4,
+                zorder=3,
+                label=label,
+            )
+            ax.text(
+                0.985,
+                value,
+                f"{value:.3f}",
+                transform=ax.get_yaxis_transform(),
+                ha="right",
+                va="bottom",
+                fontsize=13,
+                color=color,
+                zorder=5,
+            )
+        ax.legend(
+            frameon=False,
+            loc="upper right",
+            fontsize=12,
+            handlelength=2.6,
         )
     ax.set_ylabel(ylabel)
     if show_sample_counts:
@@ -1101,16 +1130,18 @@ def plot_q_vs_v_scatter(
 ) -> list[Path]:
     """Plot every rollout chunk in Q-versus-V space."""
     configure_plot_style()
-    fig, ax = plt.subplots(figsize=(4.8, 4.25), constrained_layout=True)
+    # Match the Q-min violin canvas so the two panels align in a paper row.
+    fig, ax = plt.subplots(figsize=(4.8, 3.65), constrained_layout=True)
+    scatter_colors = {"success": "#3E6E9E", "failure": "#B7772C"}
 
     ax.scatter(
         success_value,
         success_q,
         s=10.0,
         marker="o",
-        facecolor=COLORS["success"],
+        facecolor=scatter_colors["success"],
         edgecolor="none",
-        alpha=0.16,
+        alpha=0.20,
         rasterized=True,
         zorder=2,
     )
@@ -1119,15 +1150,26 @@ def plot_q_vs_v_scatter(
         failure_q,
         s=12.0,
         marker="^",
-        facecolor=COLORS["failure"],
+        facecolor=scatter_colors["failure"],
         edgecolor="none",
-        alpha=0.19,
+        alpha=0.23,
         rasterized=True,
         zorder=2.1,
     )
 
     pooled_values = np.concatenate((success_value, failure_value))
     pooled_q = np.concatenate((success_q, failure_q))
+
+    def pearson_correlation(values: np.ndarray, q_values: np.ndarray) -> float:
+        finite = np.isfinite(values) & np.isfinite(q_values)
+        if np.count_nonzero(finite) < 2:
+            raise ValueError(
+                "Q-versus-V correlation requires at least two finite points"
+            )
+        return float(np.corrcoef(values[finite], q_values[finite])[0, 1])
+
+    success_r = pearson_correlation(success_value, success_q)
+    failure_r = pearson_correlation(failure_value, failure_q)
     lower = float(min(np.min(pooled_values), np.min(pooled_q)))
     upper = float(max(np.max(pooled_values), np.max(pooled_q)))
     margin = max(0.035 * (upper - lower), 1e-6)
@@ -1146,7 +1188,8 @@ def plot_q_vs_v_scatter(
     ax.set_ylabel("Q-function")
     ax.set_xlim(lower, upper)
     ax.set_ylim(lower, upper)
-    ax.set_aspect("equal", adjustable="box")
+    # Fill the same landscape canvas as the violin panel after tight cropping.
+    ax.set_aspect("auto")
     ax.legend(
         handles=(
             Line2D(
@@ -1154,8 +1197,8 @@ def plot_q_vs_v_scatter(
                 [],
                 linestyle="none",
                 marker="o",
-                markersize=7.0,
-                markerfacecolor=COLORS["success"],
+                markersize=9.0,
+                markerfacecolor=scatter_colors["success"],
                 markeredgecolor="none",
                 label="Success",
             ),
@@ -1164,14 +1207,37 @@ def plot_q_vs_v_scatter(
                 [],
                 linestyle="none",
                 marker="^",
-                markersize=7.5,
-                markerfacecolor=COLORS["failure"],
+                markersize=9.5,
+                markerfacecolor=scatter_colors["failure"],
                 markeredgecolor="none",
                 label="Failure",
             ),
         ),
         frameon=False,
         loc="upper left",
+        fontsize=13.5,
+        handletextpad=0.7,
+        labelspacing=0.55,
+    )
+    ax.text(
+        0.965,
+        0.095,
+        rf"Success: $r={success_r:.3f}$",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=13.5,
+        color=scatter_colors["success"],
+    )
+    ax.text(
+        0.965,
+        0.045,
+        rf"Failure: $r={failure_r:.3f}$",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=13.5,
+        color=scatter_colors["failure"],
     )
     style_axis(ax)
 
@@ -1235,6 +1301,10 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
         np.concatenate((success_q_min, failure_q_min)),
         [0.4, 0.6],
     )
+    q_quantile_lines = (
+        (float(pooled_q_min_quantiles[0]), "40th percentile"),
+        (float(pooled_q_min_quantiles[1]), "60th percentile"),
+    )
     q_violin_paths, q_min_range = plot_violin(
         success_q_min,
         failure_q_min,
@@ -1243,6 +1313,7 @@ def plot_results(args: argparse.Namespace) -> tuple[dict[str, Any], list[Path]]:
         tail_quantile=0.0,
         ylabel="Q-function",
         reference_value=None,
+        quantile_lines=q_quantile_lines,
         show_sample_counts=False,
     )
     paths.extend(q_violin_paths)
